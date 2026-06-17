@@ -8,9 +8,11 @@ realistic costs — or is it an artifact?
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import pandas as pd
 
+from .backtest import daily_long_only_excess, daily_long_short
 from .signals import assign_quantile_buckets
 
 
@@ -89,3 +91,77 @@ def per_symbol_contribution(
         for code in high_codes:
             contrib[code] = contrib.get(code, 0.0) - float(fwd_of[code]) / n_high
     return pd.Series(contrib)
+
+
+@dataclass
+class GauntletReport:
+    """The gauntlet's verdict and the numbers behind it."""
+
+    n_decisions: int
+    long_short_sharpe: float
+    long_only_excess_sharpe: float
+    oos: pd.DataFrame
+    top_symbol: object
+    top_symbol_share: float
+    verdict: str
+    reasons: list[str] = field(default_factory=list)
+
+
+def run_gauntlet(
+    panel: pd.DataFrame,
+    n_buckets: int = 10,
+    low: int = 0,
+    high: int | None = None,
+    periods_per_year: float = 50.0,
+    cut_fractions: Sequence[float] = (0.3, 0.5, 0.7),
+    min_excess_sharpe: float = 0.3,
+    max_top_share: float = 0.5,
+) -> GauntletReport:
+    """Run the falsification steps on a tidy panel and return a GO/NO_GO verdict.
+
+    The verdict is driven by the demeaned long-only *excess* return (buying the
+    loser bucket vs. just holding the universe) — the apple-to-apple "does
+    selection add alpha" question. GO requires all of: positive demeaned-excess
+    Sharpe above ``min_excess_sharpe``; that excess staying positive across every
+    OOS cut; and no single symbol carrying more than ``max_top_share`` of the
+    gross long-short attribution (the single-symbol-disguise guard).
+
+    Thresholds are deliberate placeholders to be recalibrated against real data.
+    """
+    if high is None:
+        high = n_buckets - 1
+
+    long_short = daily_long_short(panel, n_buckets, low, high)
+    excess = daily_long_only_excess(panel, n_buckets, low)
+    ls_sharpe = annualized_sharpe(long_short, periods_per_year)
+    excess_sharpe = annualized_sharpe(excess, periods_per_year)
+    oos = oos_split(excess, periods_per_year, cut_fractions)
+
+    contrib = per_symbol_contribution(panel, n_buckets, low, high)
+    gross = float(contrib.abs().sum())
+    top_symbol = contrib.abs().idxmax() if len(contrib) else None
+    top_share = float(contrib.abs().max() / gross) if gross > 0 else math.nan
+
+    reasons: list[str] = []
+    if not (excess_sharpe > min_excess_sharpe):
+        reasons.append(
+            f"demeaned-excess Sharpe {excess_sharpe:.2f} is not > {min_excess_sharpe}"
+        )
+    oos_sharpes = [float(s) for s in oos["oos_sharpe"]]
+    if not all(s > 0 for s in oos_sharpes):
+        reasons.append("demeaned-excess OOS Sharpe is not positive across all cuts")
+    if not (top_share < max_top_share):
+        reasons.append(
+            f"top symbol carries {top_share:.0%} of gross attribution (>= {max_top_share:.0%})"
+        )
+
+    return GauntletReport(
+        n_decisions=int(panel["trade_date"].nunique()),
+        long_short_sharpe=ls_sharpe,
+        long_only_excess_sharpe=excess_sharpe,
+        oos=oos,
+        top_symbol=top_symbol,
+        top_symbol_share=top_share,
+        verdict="GO" if not reasons else "NO_GO",
+        reasons=reasons,
+    )

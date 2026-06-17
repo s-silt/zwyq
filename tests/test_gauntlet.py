@@ -10,7 +10,52 @@ from ashare_gauntlet.gauntlet import (
     annualized_sharpe,
     oos_split,
     per_symbol_contribution,
+    run_gauntlet,
 )
+
+
+def _planted_reversal_panel(n_days: int = 40, n_names: int = 10) -> pd.DataFrame:
+    # fwd = -beta_d * signal: the lowest-signal names (losers) get the highest
+    # forward return, so buying bucket 0 beats the universe. beta_d varies by day
+    # so the demeaned excess has dispersion (a finite, large, positive Sharpe).
+    rows = []
+    for d in range(n_days):
+        beta = 1.0 + (d % 4) * 0.25
+        for i in range(n_names):
+            sig = (i - (n_names - 1) / 2) * 0.01  # symmetric around 0
+            rows.append(
+                {"trade_date": f"d{d:03d}", "ts_code": f"S{i}", "signal": sig, "fwd_ret": -beta * sig}
+            )
+    return pd.DataFrame(rows)
+
+
+def _noise_panel(n_days: int = 40, n_names: int = 10) -> pd.DataFrame:
+    # Forward return is a common per-day move with no relation to the signal, so
+    # the demeaned selection excess is exactly zero — no edge.
+    rows = []
+    for d in range(n_days):
+        common = 0.001 * (d % 3)
+        for i in range(n_names):
+            sig = (i - (n_names - 1) / 2) * 0.01
+            rows.append(
+                {"trade_date": f"d{d:03d}", "ts_code": f"S{i}", "signal": sig, "fwd_ret": common}
+            )
+    return pd.DataFrame(rows)
+
+
+def test_run_gauntlet_passes_a_planted_reversal_edge():
+    rep = run_gauntlet(_planted_reversal_panel(), n_buckets=2, periods_per_year=50)
+
+    assert rep.long_only_excess_sharpe > 0
+    assert rep.verdict == "GO"
+    assert rep.reasons == []
+
+
+def test_run_gauntlet_rejects_a_no_edge_noise_panel():
+    rep = run_gauntlet(_noise_panel(), n_buckets=2, periods_per_year=50)
+
+    assert rep.verdict == "NO_GO"
+    assert rep.reasons  # non-empty: it must say why
 
 
 def _two_day_panel() -> pd.DataFrame:

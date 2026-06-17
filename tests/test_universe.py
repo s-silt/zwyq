@@ -8,7 +8,32 @@ TSMOM long-scale post-mortem identified as the killer for stock-like universes.
 
 import datetime as dt
 
-from ashare_gauntlet.universe import is_listed_on
+import pandas as pd
+
+from ashare_gauntlet.universe import build_universe, is_listed_on
+
+
+def test_build_universe_parses_dates_and_treats_empty_delist_as_still_listed():
+    # Tushare returns list_date/delist_date as 'YYYYMMDD' strings; a still-listed
+    # name has an empty (or None) delist_date.
+    raw = pd.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000002.SZ", "000003.SZ"],
+            "name": ["平安银行", "万科A", "国农科技"],
+            "list_date": ["19910403", "19910129", "19910114"],
+            "delist_date": ["", None, "20230815"],
+            "list_status": ["L", "L", "D"],
+            "market": ["主板", "主板", "主板"],
+        }
+    )
+
+    uni = build_universe(raw).set_index("ts_code")
+
+    assert uni.loc["000001.SZ", "list_date"] == dt.date(1991, 4, 3)
+    # Empty string delist -> still listed (None), not a parse error or epoch.
+    assert uni.loc["000001.SZ", "delist_date"] is None
+    assert uni.loc["000002.SZ", "delist_date"] is None  # None delist -> None
+    assert uni.loc["000003.SZ", "delist_date"] == dt.date(2023, 8, 15)
 
 
 def test_delisted_stock_drops_out_on_and_after_delist_date():

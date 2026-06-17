@@ -17,13 +17,18 @@ import pandas as pd
 from ashare_gauntlet.data.fetch import fetch_symbol_history, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.fundamentals import (
+    balance_facts,
+    cashflow_facts,
     index_changes,
     latest_quarter,
     pledge_ratio,
+    recent_holder_trades,
+    st_status,
     upcoming_unlocks,
 )
 
-SYMBOL_TABLES = ("income", "fina_indicator", "share_float", "pledge_stat")
+SYMBOL_TABLES = ("income", "fina_indicator", "balancesheet", "cashflow",
+                 "share_float", "pledge_stat", "stk_holdertrade", "namechange")
 INDEXES = (("000001.SH", "上证"), ("399001.SZ", "深成"), ("399006.SZ", "创业板"), ("000688.SH", "科创50"))
 
 
@@ -63,6 +68,19 @@ def main(codes: list[str], cache_dir: str = "data/cache") -> None:
                   f"| 毛利率{gm} | {'盈利' if q['profitable'] else '亏损'}")
         else:
             print("  无利润表数据(接口)")
+        bf = balance_facts(tabs["balancesheet"])
+        cf = cashflow_facts(tabs["cashflow"])
+        bc = []
+        if bf.get("accounts_receiv_yi") is not None:
+            bc.append(f"应收{bf['accounts_receiv_yi']:.1f}亿")
+        if bf.get("goodwill_yi") is not None:
+            bc.append(f"商誉{bf['goodwill_yi']:.2f}亿")
+        if bf.get("money_cap_yi") is not None:
+            bc.append(f"货币资金{bf['money_cap_yi']:.0f}亿")
+        if cf.get("op_cashflow_yi") is not None:
+            bc.append(f"经营现金流{cf['op_cashflow_yi']:+.0f}亿")
+        if bc:
+            print("  " + " | ".join(bc))
         pr = pledge_ratio(tabs["pledge_stat"], as_of)
         print(f"  控股体系质押比例: {pr:.2f}%" if pr is not None else "  控股体系质押比例: 无数据")
         unlocks = upcoming_unlocks(tabs["share_float"], as_of, 180) if as_of else []
@@ -73,6 +91,20 @@ def main(codes: list[str], cache_dir: str = "data/cache") -> None:
                 print(f"  ⚠️ 即将解禁 {u['float_date']}: {sh}{fr} {u['holder_name'][:18]}")
         else:
             print("  未来180日无限售解禁(接口)")
+        trades = recent_holder_trades(tabs["stk_holdertrade"], as_of, 365) if as_of else []
+        reductions = [t for t in trades if t["direction"] == "减持"]
+        if reductions:
+            for t in reductions[:2]:
+                vol = f"{t['change_vol'] / 1e4:.0f}万股" if t["change_vol"] is not None else "?"
+                rt = f"占{t['change_ratio']:.2f}%" if t["change_ratio"] is not None else ""
+                print(f"  ⚠️ 近一年减持 {t['ann_date']}: {t['holder_name'][:14]} {vol}{rt}")
+        else:
+            print("  近一年无股东减持(接口)")
+        st = st_status(tabs["namechange"])
+        if st.get("is_st"):
+            print(f"  ⛔ 当前 ST: {st['current_name']}")
+        elif st.get("ever_st"):
+            print(f"  ⚠️ 曾 ST/摘帽: 现名 {st['current_name']}, 最近改名 {st['last_change_date']}({st['last_change_reason']})")
         print("  —— 数字=接口确定口径;叙事/消息面(重组/澄清/业绩说明会)用 named workflow `factcheck` 补 ——")
         print()
 

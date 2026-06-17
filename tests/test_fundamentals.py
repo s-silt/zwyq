@@ -9,9 +9,13 @@ import pandas as pd
 import pytest
 
 from ashare_gauntlet.fundamentals import (
+    balance_facts,
+    cashflow_facts,
     index_changes,
     latest_quarter,
     pledge_ratio,
+    recent_holder_trades,
+    st_status,
     upcoming_unlocks,
 )
 
@@ -63,6 +67,51 @@ def test_upcoming_unlocks_keeps_only_future_within_window():
     )
     out = upcoming_unlocks(sf, as_of="20260617", within_days=180)
     assert [u["float_date"] for u in out] == ["20260630"]  # 过去/太远的都排除
+
+
+def test_balance_facts_to_yi_filters_report_type():
+    bs = pd.DataFrame(
+        [
+            {"end_date": "20260331", "report_type": "1", "accounts_receiv": 1.025e11, "goodwill": 3.28e8, "money_cap": 1.02e11},
+            {"end_date": "20260331", "report_type": "2", "accounts_receiv": 1.0, "goodwill": 1.0, "money_cap": 1.0},  # 母公司,过滤
+        ]
+    )
+    b = balance_facts(bs)
+    assert b["accounts_receiv_yi"] == pytest.approx(1025.0, abs=1)
+    assert b["goodwill_yi"] == pytest.approx(3.28, abs=0.01)
+    assert b["money_cap_yi"] == pytest.approx(1020.0, abs=2)
+
+
+def test_cashflow_facts_to_yi():
+    cf = pd.DataFrame([{"end_date": "20260331", "report_type": "1", "n_cashflow_act": 2.5e10}])
+    assert cashflow_facts(cf)["op_cashflow_yi"] == pytest.approx(250.0, abs=1)
+
+
+def test_recent_holder_trades_flags_reductions_in_window():
+    ht = pd.DataFrame(
+        [
+            {"ann_date": "20260430", "holder_name": "薛革文", "in_de": "DE", "change_vol": 8.66e6, "change_ratio": 1.94, "avg_price": 17.4},
+            {"ann_date": "20240101", "holder_name": "老增持", "in_de": "IN", "change_vol": 1e6, "change_ratio": 0.2, "avg_price": 10.0},  # 太久,排除
+        ]
+    )
+    out = recent_holder_trades(ht, as_of="20260617", within_days=365)
+    assert len(out) == 1
+    assert out[0]["holder_name"] == "薛革文"
+    assert out[0]["direction"] == "减持"
+
+
+def test_st_status_detects_current_and_history():
+    nc = pd.DataFrame(
+        [
+            {"name": "*ST华微", "start_date": "20240501", "change_reason": "实施退市风险警示"},
+            {"name": "华微电子", "start_date": "20260520", "change_reason": "撤销退市风险警示"},
+        ]
+    )
+    s = st_status(nc)
+    assert s["current_name"] == "华微电子"
+    assert s["is_st"] is False
+    assert s["ever_st"] is True  # 曾是 *ST
+    assert s["last_change_date"] == "20260520"
 
 
 def test_index_changes_picks_the_as_of_row():

@@ -14,21 +14,25 @@ import sys
 
 import pandas as pd
 
-from ashare_gauntlet.data.fetch import fetch_symbol_history, fetch_symbol_table
+from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_history, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.fundamentals import (
     balance_facts,
     cashflow_facts,
     index_changes,
+    latest_express,
+    latest_forecast,
     latest_quarter,
+    peg,
     pledge_ratio,
+    receivables_ratio,
     recent_holder_trades,
     st_status,
     upcoming_unlocks,
 )
 
-SYMBOL_TABLES = ("income", "fina_indicator", "balancesheet", "cashflow",
-                 "share_float", "pledge_stat", "stk_holdertrade", "namechange")
+SYMBOL_TABLES = ("income", "fina_indicator", "balancesheet", "cashflow", "share_float",
+                 "pledge_stat", "stk_holdertrade", "namechange", "forecast", "express")
 INDEXES = (("000001.SH", "上证"), ("399001.SZ", "深成"), ("399006.SZ", "创业板"), ("000688.SH", "科创50"))
 
 
@@ -58,14 +62,22 @@ def main(codes: list[str], cache_dir: str = "data/cache") -> None:
     for code in codes:
         tabs = {t: fetch_symbol_table(pro, t, code, cache_dir) for t in SYMBOL_TABLES}
         q = latest_quarter(tabs["income"], tabs["fina_indicator"])
+        db = call_with_retry(lambda: pro.daily_basic(ts_code=code, trade_date=as_of, fields="ts_code,pe_ttm"))
+        pe_ttm = None
+        if db is not None and not db.empty:
+            v = db.iloc[0].get("pe_ttm")
+            pe_ttm = float(v) if v is not None and str(v) != "nan" else None
         print(f"=== {code} 基本面 (接口口径,确定) ===")
         if q and q.get("net_profit_yi") is not None:
             gm = f"{q['gross_margin_pct']:.1f}%" if q.get("gross_margin_pct") is not None else "-"
             ry = f"{q['revenue_yoy_pct']:+.1f}%" if q.get("revenue_yoy_pct") is not None else "-"
             ny = f"{q['net_profit_yoy_pct']:+.1f}%" if q.get("net_profit_yoy_pct") is not None else "-"
             rev = f"{q['revenue_yi']:.2f}亿" if q.get("revenue_yi") is not None else "-"
+            pg = peg(pe_ttm, q.get("net_profit_yoy_pct"))
+            pgs = f" | PE_TTM{pe_ttm:.0f}/PEG{pg:.2f}" if pg is not None else (
+                f" | PE_TTM{pe_ttm:.0f}" if pe_ttm is not None else "")
             print(f"  {q['end_date']}: 营收 {rev}(同比{ry}) | 归母净利 {q['net_profit_yi']:.2f}亿(同比{ny}) "
-                  f"| 毛利率{gm} | {'盈利' if q['profitable'] else '亏损'}")
+                  f"| 毛利率{gm}{pgs} | {'盈利' if q['profitable'] else '亏损'}")
         else:
             print("  无利润表数据(接口)")
         bf = balance_facts(tabs["balancesheet"])
@@ -79,8 +91,19 @@ def main(codes: list[str], cache_dir: str = "data/cache") -> None:
             bc.append(f"货币资金{bf['money_cap_yi']:.0f}亿")
         if cf.get("op_cashflow_yi") is not None:
             bc.append(f"经营现金流{cf['op_cashflow_yi']:+.0f}亿")
+        rr = receivables_ratio(tabs["balancesheet"], tabs["income"])
+        if rr is not None:
+            bc.append(f"应收/年净利{rr:.0f}%")
         if bc:
             print("  " + " | ".join(bc))
+        fc = latest_forecast(tabs["forecast"])
+        ex = latest_express(tabs["express"])
+        q_end = q.get("end_date", "") if q else ""
+        if fc and fc["end_date"] > q_end and fc.get("p_change_min") is not None:
+            print(f"  📅 业绩预告 {fc['end_date']}: {fc['type']} 净利同比 {fc['p_change_min']:.0f}~{fc['p_change_max']:.0f}%")
+        elif ex and ex["end_date"] > q_end and ex.get("net_profit_yi") is not None:
+            yo = f"{ex['yoy_net_profit_pct']:+.0f}%" if ex.get("yoy_net_profit_pct") is not None else "-"
+            print(f"  📅 业绩快报 {ex['end_date']}: 营收{ex['revenue_yi']:.1f}亿 净利{ex['net_profit_yi']:.2f}亿(同比{yo})")
         pr = pledge_ratio(tabs["pledge_stat"], as_of)
         print(f"  控股体系质押比例: {pr:.2f}%" if pr is not None else "  控股体系质押比例: 无数据")
         unlocks = upcoming_unlocks(tabs["share_float"], as_of, 180) if as_of else []

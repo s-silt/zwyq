@@ -81,6 +81,67 @@ def latest_quarter(income: pd.DataFrame, fina: pd.DataFrame | None) -> dict[str,
     return out
 
 
+def _latest_annual_net(income: pd.DataFrame) -> float | None:
+    """Latest full-year (end_date …1231) 归母净利 (亿元) from ``income``."""
+    if income is None or income.empty:
+        return None
+    d = income.copy()
+    d["end_date"] = d["end_date"].astype(str)
+    d = cast(pd.DataFrame, d[d["end_date"].str.endswith("1231")])
+    r = _period_row(d)
+    return _yi(r.get("n_income_attr_p")) if r is not None else None
+
+
+def receivables_ratio(balancesheet: pd.DataFrame, income: pd.DataFrame) -> float | None:
+    """应收账款 / 最近年报归母净利 (%) — 回款风险(>~300% 偏高)。"""
+    ar = balance_facts(balancesheet).get("accounts_receiv_yi")
+    annual = _latest_annual_net(income)
+    if ar is None or annual is None or annual <= 0:
+        return None
+    return ar / annual * 100
+
+
+def peg(pe_ttm: Any, net_profit_yoy_pct: Any) -> float | None:
+    """PEG = PE_TTM / 净利增速。增速≤0 或 PE 缺失(亏损)时返回 None。"""
+    pe = _num(pe_ttm)
+    g = _num(net_profit_yoy_pct)
+    if pe is None or g is None or g <= 0:
+        return None
+    return pe / g
+
+
+def latest_forecast(forecast: pd.DataFrame) -> dict[str, Any]:
+    """Newest-period 业绩预告 {end_date, type, p_change_min/max} from ``forecast``."""
+    if forecast is None or forecast.empty:
+        return {}
+    d = forecast.copy()
+    d["end_date"] = d["end_date"].astype(str)
+    d = cast(pd.DataFrame, d).sort_values("end_date").drop_duplicates("end_date", keep="last")
+    r = d.iloc[-1]
+    return {
+        "end_date": str(r["end_date"]),
+        "type": str(r.get("type") or ""),
+        "p_change_min": _num(r.get("p_change_min")),
+        "p_change_max": _num(r.get("p_change_max")),
+    }
+
+
+def latest_express(express: pd.DataFrame) -> dict[str, Any]:
+    """Newest-period 业绩快报 {end_date, revenue_yi, net_profit_yi, yoy_net_profit_pct}."""
+    if express is None or express.empty:
+        return {}
+    d = express.copy()
+    d["end_date"] = d["end_date"].astype(str)
+    d = cast(pd.DataFrame, d).sort_values("end_date").drop_duplicates("end_date", keep="last")
+    r = d.iloc[-1]
+    return {
+        "end_date": str(r["end_date"]),
+        "revenue_yi": _yi(r.get("revenue")),
+        "net_profit_yi": _yi(r.get("n_income")),
+        "yoy_net_profit_pct": _num(r.get("yoy_net_profit")),
+    }
+
+
 def balance_facts(balancesheet: pd.DataFrame, end_date: str | None = None) -> dict[str, Any]:
     """应收账款 / 商誉 / 货币资金 (亿元) for ``end_date`` (or latest) from ``balancesheet``."""
     r = _period_row(balancesheet, end_date)

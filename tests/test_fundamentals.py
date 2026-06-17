@@ -12,8 +12,12 @@ from ashare_gauntlet.fundamentals import (
     balance_facts,
     cashflow_facts,
     index_changes,
+    latest_express,
+    latest_forecast,
     latest_quarter,
+    peg,
     pledge_ratio,
+    receivables_ratio,
     recent_holder_trades,
     st_status,
     upcoming_unlocks,
@@ -112,6 +116,46 @@ def test_st_status_detects_current_and_history():
     assert s["is_st"] is False
     assert s["ever_st"] is True  # 曾是 *ST
     assert s["last_change_date"] == "20260520"
+
+
+def test_receivables_ratio_against_latest_annual_profit():
+    bs = pd.DataFrame([{"end_date": "20260331", "report_type": "1", "accounts_receiv": 1.0e11}])  # 100亿
+    income = pd.DataFrame(
+        [
+            {"end_date": "20251231", "report_type": "1", "n_income_attr_p": 2.5e10},  # 年报净利25亿
+            {"end_date": "20260331", "report_type": "1", "n_income_attr_p": 5.0e9},   # Q1单季,不作分母
+        ]
+    )
+    assert receivables_ratio(bs, income) == pytest.approx(400.0, abs=1)  # 100/25
+
+
+def test_peg_divides_pe_by_growth():
+    assert peg(35.0, 102.55) == pytest.approx(0.34, abs=0.01)
+    assert peg(167.0, 8.73) == pytest.approx(19.1, abs=0.2)
+    assert peg(50.0, 0) is None      # 增速≤0 无意义
+    assert peg(None, 50) is None     # 亏损股 PE 缺失
+
+
+def test_latest_forecast_picks_newest_period():
+    fc = pd.DataFrame(
+        [
+            {"end_date": "20251231", "type": "预增", "p_change_min": 51.0, "p_change_max": 54.0},
+            {"end_date": "20260630", "type": "略增", "p_change_min": 10.0, "p_change_max": 15.0},
+        ]
+    )
+    f = latest_forecast(fc)
+    assert f["end_date"] == "20260630"
+    assert f["type"] == "略增"
+    assert f["p_change_min"] == pytest.approx(10.0)
+
+
+def test_latest_express_to_yi():
+    ex = pd.DataFrame([{"end_date": "20260630", "revenue": 5.0e10, "n_income": 2.0e9, "yoy_net_profit": 30.0}])
+    e = latest_express(ex)
+    assert e["end_date"] == "20260630"
+    assert e["revenue_yi"] == pytest.approx(500.0, abs=1)
+    assert e["net_profit_yi"] == pytest.approx(20.0, abs=0.1)
+    assert e["yoy_net_profit_pct"] == pytest.approx(30.0)
 
 
 def test_index_changes_picks_the_as_of_row():

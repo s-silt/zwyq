@@ -10,6 +10,7 @@ Usage: python scripts/pull_symbols.py <start YYYYMMDD> <end YYYYMMDD> [cache_dir
 import datetime as dt
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -17,9 +18,21 @@ from ashare_gauntlet.data.fetch import fetch_symbol_history
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.universe import build_universe
 
+MAX_WORKERS = 16
+
 
 def _d(s: str) -> dt.date:
     return dt.datetime.strptime(s, "%Y%m%d").date()
+
+
+def _pull_one(pro: object, code: str, start: str, end: str, cache_dir: str) -> list[str]:
+    errs: list[str] = []
+    for endpoint in ("daily", "adj_factor"):
+        try:
+            fetch_symbol_history(pro, endpoint, code, start, end, cache_dir)
+        except Exception as exc:  # noqa: BLE001 — record + continue for max progress
+            errs.append(f"{code}/{endpoint}:{type(exc).__name__}")
+    return errs
 
 
 def main(start: str, end: str, cache_dir: str = "data/bystock") -> None:
@@ -38,16 +51,16 @@ def main(start: str, end: str, cache_dir: str = "data/bystock") -> None:
         codes.append(ts_code)
     print(f"universe={len(uni)} -> in-window codes={len(codes)} ({start}..{end})", flush=True)
 
-    failed: list[tuple[str, str]] = []
-    for i, code in enumerate(codes, 1):
-        for endpoint in ("daily", "adj_factor"):
-            try:
-                fetch_symbol_history(pro, endpoint, code, start, end, cache_dir)
-            except Exception as exc:  # noqa: BLE001 — record + continue for max progress
-                failed.append((code, f"{endpoint}:{type(exc).__name__}"))
-        if i % 200 == 0 or i == len(codes):
-            print(f"  [{i}/{len(codes)}] failed={len(failed)}", flush=True)
-    print(f"PULL DONE codes={len(codes)} failed={len(failed)}", flush=True)
+    failed: list[str] = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [pool.submit(_pull_one, pro, code, start, end, cache_dir) for code in codes]
+        for future in as_completed(futures):
+            failed.extend(future.result())
+            done += 1
+            if done % 200 == 0 or done == len(codes):
+                print(f"  [{done}/{len(codes)}] failed_calls={len(failed)}", flush=True)
+    print(f"PULL DONE codes={len(codes)} failed_calls={len(failed)}", flush=True)
     if failed:
         print("failed sample:", failed[:10], flush=True)
 

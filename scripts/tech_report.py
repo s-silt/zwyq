@@ -26,6 +26,11 @@ from ashare_gauntlet.factsheet import (
     north_flow_disclosure,
     north_turnover,
 )
+from ashare_gauntlet.fundamentals import index_changes
+
+# Macro indices shown in the report header (from cached index_daily; pull via
+# scripts/fundamentals.py). 宏观叙事仍走 web,但指数点位现在接口直出。
+INDEX_HEADER = (("000001.SH", "上证"), ("399001.SZ", "深成"), ("399006.SZ", "创业板"), ("000688.SH", "科创50"))
 
 # Default tech watchlist (头部 large-cap leaders + 中部 mid-cap), labelled tier·theme.
 DEFAULT_WATCH: dict[str, str] = {
@@ -53,6 +58,7 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
     daily = _load(cache_dir, "daily")
     adj = _load(cache_dir, "adj_factor")
     mf = _load(cache_dir, "moneyflow_hsgt")
+    idx = _load(cache_dir, "index_daily")
     if daily.empty:
         print(f"no cached data in {cache_dir}")
         return
@@ -65,6 +71,12 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
     dn = int((last["pct_chg"] < 0).sum()) if "pct_chg" in last.columns else -1
 
     print(f"=== 科技股事实报告 (截至 {as_of};前复权,分位=全市场横截面) ===")
+    ich = index_changes(idx, as_of) if not idx.empty else {}
+    parts = [f"{name}{c['close']:.0f}({c['pct_chg']:+.2f}%)"
+             for code, name in INDEX_HEADER
+             if (c := ich.get(code)) and c["close"] is not None]
+    if parts:
+        print("宏观指数(接口): " + " | ".join(parts))
     print(f"市场广度(当日): 涨 {up} / 跌 {dn}   | 宏观叙事为 live web 层,交付时附(带 source)")
     print(north_flow_disclosure())
     # The one official daily aggregate that survived: 北向总成交额 (NOT net flow).

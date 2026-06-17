@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets — never commit the Tushare token / endpoint
+.env.local
+.env
+
+# Data cache (raw Tushare pulls, parquet) — large, regenerable, not for git
+data/
+*.parquet
+
+# Scratch / smoke scripts
+_scratch*
+_smoke*

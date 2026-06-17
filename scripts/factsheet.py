@@ -31,12 +31,18 @@ def main(ts_code: str, cache_dir: str = "data/cache") -> None:
 
     fs = build_factsheet(ts_code, daily, adj, hk if not hk.empty else None)
     lo, mid, up = fs["boll"]  # type: ignore[misc]
-    print(f"=== {ts_code} 事实层 (截至 {fs['as_of']};指标后复权,现价未复权) ===")
+    print(f"=== {ts_code} 事实层 (截至 {fs['as_of']};价格/指标前复权,与现价同标度) ===")
     print(f"  现价 {fs['close_raw']:.2f}  日涨跌 {fs['pct_chg_1d_pct']:+.2f}%  成交额 {fs['amount']:.0f} 千元")
-    print(f"  区间(后复权): 20日 {fs['low_20d']:.2f}~{fs['high_20d']:.2f} | 60日 {fs['low_60d']:.2f}~{fs['high_60d']:.2f}")
+    print(f"  区间: 20日 {fs['low_20d']:.2f}~{fs['high_20d']:.2f} | 60日 {fs['low_60d']:.2f}~{fs['high_60d']:.2f}")
     print(f"  EMA5 {fs['ema_short']:.2f}  EMA20 {fs['ema_long']:.2f}  RSI14 {fs['rsi']:.1f}  布林[下 {lo:.2f}/中 {mid:.2f}/上 {up:.2f}]")
-    if "north_ratio" in fs:
-        print(f"  北向持股占比 {fs['north_ratio']:.2f}%  近5日变化 {fs['north_ratio_chg_5']:+.3f}pp  (真实数据,非臆测)")
+    nr = fs.get("north_ratio")
+    chg = fs.get("north_ratio_chg_5")
+    if nr is not None and chg == chg:  # chg==chg is False only when NaN
+        print(f"  北向持股占比 {nr:.2f}%  近5日变化 {chg:+.3f}pp  (真实数据)")
+    elif nr is not None:
+        print(f"  北向持股占比 {nr:.2f}%(快照)  日频变化不可得 —— 个股北向自 2024-08-19 改季度披露")
+    else:
+        print("  北向持股: 无日频数据(2024-08-19 起个股北向改季度披露)")
     print("  —— 描述现状,非预测、非买卖建议;相关新闻需 web 搜索核实后再附。")
 
 

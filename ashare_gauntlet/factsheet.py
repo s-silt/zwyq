@@ -46,10 +46,11 @@ def build_factsheet(
 ) -> dict[str, object]:
     """Assemble the factual layer for one A-share from cached full-market data.
 
-    Price/indicators are computed on the back-adjusted (后复权) close so splits
-    and dividends don't create phantom moves; ``close_raw`` is the actual last
-    quote. Northbound holding (北向持股占比) is included as a *real* data point
-    (current level + recent change) — never invented "whale positioning".
+    Price/indicators use the FORWARD-adjusted (前复权) close so the levels sit on
+    the same scale as the current quote (latest 前复权 == raw last price) while
+    splits/dividends still don't create phantom moves — the right basis for a
+    descriptive level display (the gauntlet uses 后复权 for returns). Northbound
+    holding (北向持股占比), if present, is a *real* data point — never invented.
     """
     one = daily_all[daily_all["ts_code"] == ts_code].merge(
         adj_all[["ts_code", "trade_date", "adj_factor"]],
@@ -57,9 +58,10 @@ def build_factsheet(
         how="left",
     )
     one = one.sort_values("trade_date")
-    hfq = one["close"].to_numpy() * one["adj_factor"].to_numpy()
-    close = pd.Series(hfq, index=one["trade_date"].to_numpy())
+    adj = one["adj_factor"].to_numpy()
     raw = one["close"].to_numpy()
+    qfq = raw * adj / adj[-1]  # 前复权: latest == raw quote, history dividend-adjusted
+    close = pd.Series(qfq, index=one["trade_date"].to_numpy())
 
     lower, mid, upper = bollinger(close, boll_n)
     fs: dict[str, object] = {

@@ -34,6 +34,22 @@ def universe_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def north_flow_signal(hk_hold: pd.DataFrame, k: int) -> pd.DataFrame:
+    """Northbound-flow signal from per-stock 北向持股 ratio.
+
+    ``signal = -(ratio(t) - ratio(t-k))`` per symbol: 增持 (ratio rising) is the
+    smart-money-buy hypothesis and the gauntlet's buy leg is bucket 0 (lowest
+    signal), so the change is negated to put 增持 names in bucket 0. Returns
+    columns ``ts_code``, ``trade_date``, ``signal``.
+    """
+    out = hk_hold.sort_values(["ts_code", "trade_date"]).copy()
+    delta = out.groupby("ts_code", group_keys=False)["ratio"].transform(
+        lambda s: s - s.shift(k)
+    )
+    out["signal"] = -delta
+    return cast(pd.DataFrame, out[["ts_code", "trade_date", "signal"]].reset_index(drop=True))
+
+
 def add_adjusted_prices(daily: pd.DataFrame, adj: pd.DataFrame) -> pd.DataFrame:
     """Merge daily OHLC with adjustment factors and add back-adjusted
     ``hfq_open`` / ``hfq_close`` (raw price x adj_factor)."""
@@ -142,3 +158,33 @@ def assemble_panel(
     all_dates = sorted(enriched["trade_date"].unique())
     decision_dates = set(all_dates[::rebalance])
     return build_gauntlet_panel(enriched, universe, decision_dates, min_amount, min_list_days)
+
+
+def assemble_flow_panel(
+    daily: pd.DataFrame,
+    adj: pd.DataFrame,
+    hk_hold: pd.DataFrame,
+    universe: pd.DataFrame,
+    k: int,
+    h: int,
+    rebalance: int,
+    min_amount: float,
+    min_list_days: int,
+) -> pd.DataFrame:
+    """Northbound-flow panel: ``signal`` is the 北向 flow signal, ``fwd_ret`` is
+    the same T+1 price forward return used by the reversal gauntlet.
+
+    The inner join on (ts_code, trade_date) naturally restricts the universe to
+    北向-eligible names (only those have hk_hold rows) — the correct universe for
+    a northbound-flow signal. Runs through the same ``run_gauntlet``.
+    """
+    priced = add_adjusted_prices(daily, adj)
+    priced = add_signal_and_forward(priced, k=1, h=h)  # only fwd_ret is used here
+    priced = priced.drop(columns=["signal"])
+    flow = north_flow_signal(hk_hold, k)
+
+    merged = priced.merge(flow, on=["ts_code", "trade_date"], how="inner")
+    merged["entry_locked"] = False
+    all_dates = sorted(merged["trade_date"].unique())
+    decision_dates = set(all_dates[::rebalance])
+    return build_gauntlet_panel(merged, universe, decision_dates, min_amount, min_list_days)

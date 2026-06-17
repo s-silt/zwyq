@@ -15,6 +15,8 @@ from ashare_gauntlet.panel import (
     assemble_panel,
     build_gauntlet_panel,
     mark_entry_locked,
+    assemble_flow_panel,
+    north_flow_signal,
     universe_from_daily,
 )
 
@@ -178,3 +180,54 @@ def test_universe_from_daily_derives_codes_without_stock_basic():
     assert sorted(uni["ts_code"]) == ["A", "B", "C"]
     assert all(d == dt.date(1990, 1, 1) for d in uni["list_date"])
     assert all(d is None for d in uni["delist_date"])
+
+
+def test_north_flow_signal_is_negative_change_in_holding_ratio():
+    # hk_hold.ratio = 北向持股占流通股比例. 增持 (ratio up) is the smart-money-buy
+    # hypothesis, and the gauntlet's buy leg is bucket 0 (lowest signal), so the
+    # signal must be the NEGATED change: 增持 -> low signal -> buy leg.
+    hk = pd.DataFrame(
+        {
+            "ts_code": ["A", "A", "A", "B", "B", "B"],
+            "trade_date": ["20250102", "20250103", "20250104"] * 2,
+            "ratio": [1.0, 1.5, 2.0, 3.0, 2.0, 1.0],  # A 增持, B 减持
+        }
+    )
+
+    out = north_flow_signal(hk, k=1).set_index(["ts_code", "trade_date"])
+
+    # A 0103: +0.5 增持 -> signal -0.5 (buy leg); B 0103: -1.0 减持 -> signal +1.0
+    assert out.loc[("A", "20250103"), "signal"] == pytest.approx(-0.5)
+    assert out.loc[("B", "20250103"), "signal"] == pytest.approx(1.0)
+    # No prior day -> no signal.
+    assert pd.isna(out.loc[("A", "20250102"), "signal"])
+
+
+def test_assemble_flow_panel_uses_flow_signal_with_price_forward_return():
+    days = [f"2024010{i}" for i in range(1, 10)] + ["20240110"]
+    codes = ["A", "B"]
+    daily = pd.DataFrame(
+        [
+            {"ts_code": c, "trade_date": d, "open": 10.0 + j, "close": 10.0 + j, "amount": 1e6}
+            for c in codes
+            for j, d in enumerate(days)
+        ]
+    )
+    adj = pd.DataFrame(
+        [{"ts_code": c, "trade_date": d, "adj_factor": 1.0} for c in codes for d in days]
+    )
+    # A 北向增持 (ratio j+1 rising), B 减持 (falling).
+    hk = pd.DataFrame(
+        [{"ts_code": "A", "trade_date": d, "ratio": float(j + 1)} for j, d in enumerate(days)]
+        + [{"ts_code": "B", "trade_date": d, "ratio": float(10 - j)} for j, d in enumerate(days)]
+    )
+    universe = universe_from_daily(daily)
+
+    out = assemble_flow_panel(
+        daily, adj, hk, universe, k=1, h=2, rebalance=3, min_amount=0.0, min_list_days=0
+    ).set_index(["ts_code", "trade_date"])
+
+    assert list(out.columns) == ["signal", "fwd_ret"]
+    # Decision date 20240104 (idx3): A 增持 -> signal = -(4-3) = -1 (flow, not reversal).
+    assert out.loc[("A", "20240104"), "signal"] == pytest.approx(-1.0)
+    assert out.loc[("B", "20240104"), "signal"] == pytest.approx(1.0)

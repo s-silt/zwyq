@@ -28,3 +28,14 @@ def test_make_pro_api_bypasses_proxy_for_mirror_host_and_pins_url(monkeypatch):
     assert "8.148.76.181" in os.environ.get("no_proxy", "")
     # http_url override applied to the name-mangled attribute.
     assert pro._DataApi__http_url == "http://8.148.76.181:8686/"
+
+
+def test_make_pro_api_sets_generous_timeout_for_full_market_pulls(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "")
+    # The default 30s timeout is too short for a full-market single-day pull
+    # (~5000 rows) on a cold call — it must default to something generous.
+    pro_default = make_pro_api("tok", "http://1.2.3.4:8080")
+    assert pro_default._DataApi__timeout >= 120
+
+    pro_explicit = make_pro_api("tok", "http://1.2.3.4:8080", timeout=200)
+    assert pro_explicit._DataApi__timeout == 200

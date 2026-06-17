@@ -12,6 +12,7 @@ import pytest
 from ashare_gauntlet.panel import (
     add_adjusted_prices,
     add_signal_and_forward,
+    assemble_panel,
     build_gauntlet_panel,
     mark_entry_locked,
 )
@@ -117,4 +118,43 @@ def test_build_gauntlet_panel_keeps_only_tradable_decision_rows():
     # Only GOOD survives: NANSIG (no signal), LOCKED (一字板), ILLIQ (amount),
     # NEW (次新 <90d), OFFDATE (not a decision date) all filtered.
     assert set(out["ts_code"]) == {"GOOD"}
+    assert list(out.columns) == ["trade_date", "ts_code", "signal", "fwd_ret"]
+
+
+def test_assemble_panel_composes_pipeline_and_spaces_decision_dates():
+    days = [f"2024010{i}" for i in range(1, 10)] + ["20240110"]  # 10 ordered days
+    codes = ["A", "B"]
+    daily = pd.DataFrame(
+        [
+            {
+                "ts_code": c,
+                "trade_date": d,
+                "open": 10.0 + j,
+                "close": 10.0 + j,
+                "amount": 1e6,
+            }
+            for c in codes
+            for j, d in enumerate(days)
+        ]
+    )
+    adj = pd.DataFrame(
+        [{"ts_code": c, "trade_date": d, "adj_factor": 1.0} for c in codes for d in days]
+    )
+    universe = pd.DataFrame(
+        {
+            "ts_code": codes,
+            "list_date": [dt.date(2000, 1, 1)] * 2,
+            "delist_date": [None] * 2,
+            "market": ["主板"] * 2,
+        }
+    )
+
+    out = assemble_panel(
+        daily, adj, universe, k=2, h=2, rebalance=3, min_amount=0.0, min_list_days=0
+    )
+
+    # Decision dates = every 3rd day (idx 0,3,6,9). idx0 has no past-k signal and
+    # idx9 has no forward window, so only 20240104 and 20240107 yield rows.
+    assert set(out["trade_date"]) == {"20240104", "20240107"}
+    assert set(out["ts_code"]) == {"A", "B"}
     assert list(out.columns) == ["trade_date", "ts_code", "signal", "fwd_ret"]

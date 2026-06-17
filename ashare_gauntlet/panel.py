@@ -96,3 +96,29 @@ def build_gauntlet_panel(
     rows = cast(pd.DataFrame, rows[pd.Series(seasoned, index=rows.index)])
     tidy = rows[["trade_date", "ts_code", "signal", "fwd_ret"]].reset_index(drop=True)
     return cast(pd.DataFrame, tidy)
+
+
+def assemble_panel(
+    daily: pd.DataFrame,
+    adj: pd.DataFrame,
+    universe: pd.DataFrame,
+    k: int,
+    h: int,
+    rebalance: int,
+    min_amount: float,
+    min_list_days: int,
+) -> pd.DataFrame:
+    """Full pipeline: raw daily + adj -> tidy gauntlet panel.
+
+    Back-adjusts, derives signal/forward returns, spaces decision dates every
+    ``rebalance``-th trading day (non-overlapping holds), and applies the
+    tradability filters. v1 has no ``stk_limit`` feed, so the 一字板 entry filter
+    is a no-op (``entry_locked = False``) — a documented refinement, not silent.
+    """
+    priced = add_adjusted_prices(daily, adj)
+    enriched = add_signal_and_forward(priced, k, h)
+    enriched["entry_locked"] = False  # v1: no stk_limit; 一字板 filter pending
+
+    all_dates = sorted(enriched["trade_date"].unique())
+    decision_dates = set(all_dates[::rebalance])
+    return build_gauntlet_panel(enriched, universe, decision_dates, min_amount, min_list_days)

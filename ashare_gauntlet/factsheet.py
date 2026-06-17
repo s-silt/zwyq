@@ -36,6 +36,40 @@ def bollinger(close: pd.Series, n: int = 20, k: float = 2.0) -> tuple[float, flo
     return mid - k * sd, mid, mid + k * sd
 
 
+# LANDMINE: tushare's ``moneyflow_hsgt`` REUSES the columns hgt/sgt/north_money
+# for two different quantities. BEFORE this date they are daily NET inflow (百万元,
+# signed); ON/AFTER it the exchanges stopped disclosing net flow and the same
+# columns silently became gross TURNOVER (成交额). Same names, ~50x scale jump,
+# never negative. Reading north_money as net flow post-cutoff is a catastrophic
+# ~50x fabrication — every reader of this field must respect the cutoff.
+NORTH_FLOW_SEMANTICS_CUTOFF = "20240819"
+
+
+def north_turnover(moneyflow_hsgt: pd.DataFrame, as_of: str) -> dict[str, float]:
+    """北向(沪股通+深股通)当日**总成交额**(亿元) from a cached ``moneyflow_hsgt`` pull.
+
+    Returns TURNOVER only, and refuses dates before
+    :data:`NORTH_FLOW_SEMANTICS_CUTOFF` so the pre-cutoff NET-inflow semantics can
+    never be misread as turnover (see the landmine note above). ``hgt``/``sgt``/
+    ``north_money`` arrive as strings in 百万元; converted to 亿元 (``/100``).
+    Cross-verified: 2026-06-04 ``north_money`` == 东财「共成交 3651.69 亿」exactly.
+    """
+    if as_of < NORTH_FLOW_SEMANTICS_CUTOFF:
+        raise ValueError(
+            f"north_money 在 {as_of} 是'净流入'语义(< {NORTH_FLOW_SEMANTICS_CUTOFF}),"
+            "非成交额;本函数只返回成交额,拒绝换义前的日期以防 ~50x 误报"
+        )
+    row = moneyflow_hsgt[moneyflow_hsgt["trade_date"] == as_of]
+    if row.empty:
+        raise KeyError(f"moneyflow_hsgt 无 {as_of} 数据")
+    r = row.iloc[0]
+    return {
+        "hgt_yi": float(r["hgt"]) / 100.0,
+        "sgt_yi": float(r["sgt"]) / 100.0,
+        "total_yi": float(r["north_money"]) / 100.0,
+    }
+
+
 def north_flow_disclosure() -> str:
     """The standing, honest fact about northbound daily-flow availability.
 

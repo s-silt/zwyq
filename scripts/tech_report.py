@@ -19,10 +19,12 @@ import sys
 import pandas as pd
 
 from ashare_gauntlet.factsheet import (
+    NORTH_FLOW_SEMANTICS_CUTOFF,
     daily_tech_facts,
     entry_rank,
     market_returns,
     north_flow_disclosure,
+    north_turnover,
 )
 
 # Default tech watchlist (头部 large-cap leaders + 中部 mid-cap), labelled tier·theme.
@@ -50,11 +52,12 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
     watch = watch or DEFAULT_WATCH
     daily = _load(cache_dir, "daily")
     adj = _load(cache_dir, "adj_factor")
+    mf = _load(cache_dir, "moneyflow_hsgt")
     if daily.empty:
         print(f"no cached data in {cache_dir}")
         return
 
-    as_of = daily["trade_date"].max()
+    as_of = str(daily["trade_date"].max())
     mret = market_returns(daily, adj, (5, 20))
     # Market breadth on the latest session (a real market-state fact).
     last = daily[daily["trade_date"] == as_of]
@@ -64,6 +67,15 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
     print(f"=== 科技股事实报告 (截至 {as_of};前复权,分位=全市场横截面) ===")
     print(f"市场广度(当日): 涨 {up} / 跌 {dn}   | 宏观叙事为 live web 层,交付时附(带 source)")
     print(north_flow_disclosure())
+    # The one official daily aggregate that survived: 北向总成交额 (NOT net flow).
+    if not mf.empty and (mf["trade_date"] == as_of).any() and as_of >= NORTH_FLOW_SEMANTICS_CUTOFF:
+        nt = north_turnover(mf, as_of)
+        two_mkt_yi = float(last["amount"].sum()) / 1e5  # cache amount 千元 -> 亿元
+        pct = nt["total_yi"] / two_mkt_yi * 100 if two_mkt_yi else float("nan")
+        print(
+            f"北向总成交额(官方,成交额非净额): {nt['total_yi']:.0f} 亿"
+            f"(沪{nt['hgt_yi']:.0f}+深{nt['sgt_yi']:.0f}) | 占两市A股成交 {pct:.1f}%"
+        )
     print("排序=入场纪律分(强势+趋势确认,惩罚追高/接刀);这是组织信息的镜头,非预测会涨。")
     print("—— 描述现状,非预测/非买卖建议 ——")
 

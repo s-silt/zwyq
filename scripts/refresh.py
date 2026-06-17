@@ -15,7 +15,10 @@ from pathlib import Path
 from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day, trading_days_from_cal
 from ashare_gauntlet.data.tushare_source import make_pro_api
 
-ENDPOINTS = ("daily", "adj_factor", "hk_hold")
+# moneyflow_hsgt is market-level (1 row/day): 北向总成交额(沪/深股通). Post
+# 2024-08-19 its north_money column is TURNOVER, not net flow — see
+# factsheet.NORTH_FLOW_SEMANTICS_CUTOFF. Cheap (1 row) so cached every refresh.
+ENDPOINTS = ("daily", "adj_factor", "hk_hold", "moneyflow_hsgt")
 
 
 def main(lookback_days: int = 10, cache_dir: str = "data/cache") -> None:

@@ -15,6 +15,7 @@ from ashare_gauntlet.factsheet import (
     entry_rank,
     market_returns,
     north_flow_disclosure,
+    north_turnover,
     rsi,
 )
 
@@ -111,6 +112,31 @@ def test_north_flow_disclosure_states_the_standing_facts():
     assert "停披露" in note
     assert "季度" in note
     assert "净" in note  # explicitly disclaims a net figure
+
+
+def test_north_turnover_returns_turnover_in_yi_after_cutoff():
+    # On/after 2024-08-19, moneyflow_hsgt's hgt/sgt/north_money carry TURNOVER
+    # (成交额, 百万元). Convert to 亿元; north_money == hgt + sgt.
+    mf = pd.DataFrame(
+        [{"trade_date": "20260617", "hgt": "174913.28", "sgt": "210142.56",
+          "north_money": "385055.84"}]
+    )
+    nt = north_turnover(mf, "20260617")
+    assert nt["hgt_yi"] == pytest.approx(1749.13, abs=0.01)
+    assert nt["sgt_yi"] == pytest.approx(2101.43, abs=0.01)
+    assert nt["total_yi"] == pytest.approx(3850.56, abs=0.01)
+
+
+def test_north_turnover_refuses_pre_cutoff_dates_to_avoid_semantic_drift():
+    # LANDMINE: before 2024-08-19 the SAME columns are daily NET inflow (signed,
+    # ~50x smaller), not turnover. Returning that as turnover would be a silent
+    # ~50x fabrication, so the guard must refuse pre-cutoff dates outright.
+    mf = pd.DataFrame(
+        [{"trade_date": "20240815", "hgt": "8865.01", "sgt": "3340.83",
+          "north_money": "12205.84"}]
+    )
+    with pytest.raises(ValueError):
+        north_turnover(mf, "20240815")
 
 
 def test_entry_rank_prefers_uptrend_penalizes_falling_knife_and_overbought():

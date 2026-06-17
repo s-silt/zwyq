@@ -52,6 +52,17 @@ def test_quantile_buckets_put_lowest_returns_in_bucket_zero():
     assert buckets["D"] == 1
 
 
+def test_quantile_buckets_return_nan_when_too_few_names_for_buckets():
+    # A decision date with fewer tradable names than buckets can't form the
+    # quantiles (qcut would raise "Bin edges must be unique"). Such a thin
+    # cross-section must come back all-NaN so that date drops out, not crash.
+    section = pd.Series({"A": 0.01, "B": -0.02, "C": 0.03})
+
+    out = assign_quantile_buckets(section, n_buckets=10)
+
+    assert out.isna().all()
+
+
 def test_quantile_buckets_leave_nan_unbucketed():
     # Suspended / missing names must not be assigned a bucket (they are not
     # tradable that day and must not silently land in the long or short leg).

@@ -25,6 +25,9 @@ def assign_quantile_buckets(section: pd.Series, n_buckets: int) -> pd.Series:
     collapse the quantile edges. NaN inputs stay unbucketed (NaN out): a
     suspended/missing name is not tradable and must not silently land in a leg.
     """
+    if int(section.notna().sum()) < n_buckets:
+        # Too few tradable names to form n_buckets quantiles -> drop this date.
+        return pd.Series(float("nan"), index=section.index, name=section.name)
     ranks = section.rank(method="first")
     buckets = pd.qcut(ranks, n_buckets, labels=False)
     return pd.Series(buckets, index=section.index, name=section.name)

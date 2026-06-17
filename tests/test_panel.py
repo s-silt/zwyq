@@ -15,6 +15,7 @@ from ashare_gauntlet.panel import (
     assemble_panel,
     build_gauntlet_panel,
     mark_entry_locked,
+    universe_from_daily,
 )
 
 
@@ -158,3 +159,22 @@ def test_assemble_panel_composes_pipeline_and_spaces_decision_dates():
     assert set(out["trade_date"]) == {"20240104", "20240107"}
     assert set(out["ts_code"]) == {"A", "B"}
     assert list(out.columns) == ["trade_date", "ts_code", "signal", "fwd_ret"]
+
+
+def test_universe_from_daily_derives_codes_without_stock_basic():
+    # When stock_basic is unavailable (token exhausted), the cached daily data is
+    # itself the survivorship-free PIT universe: each code appears only on the
+    # days it actually traded. We can't recover list_date, so 次新 filtering is
+    # disabled (list_date set far in the past) — a documented limitation.
+    daily = pd.DataFrame(
+        {
+            "ts_code": ["A", "B", "A", "C"],
+            "trade_date": ["20250102", "20250102", "20250103", "20250103"],
+        }
+    )
+
+    uni = universe_from_daily(daily)
+
+    assert sorted(uni["ts_code"]) == ["A", "B", "C"]
+    assert all(d == dt.date(1990, 1, 1) for d in uni["list_date"])
+    assert all(d is None for d in uni["delist_date"])

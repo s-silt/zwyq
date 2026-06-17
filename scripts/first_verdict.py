@@ -9,15 +9,12 @@ Usage: python scripts/first_verdict.py [cache_dir]
 """
 
 import glob
-import os
 import sys
 
 import pandas as pd
 
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.gauntlet import run_gauntlet
-from ashare_gauntlet.panel import assemble_panel
-from ashare_gauntlet.universe import build_universe
+from ashare_gauntlet.panel import assemble_panel, universe_from_daily
 
 
 def load_cached(cache_dir: str, endpoint: str) -> pd.DataFrame:
@@ -26,22 +23,21 @@ def load_cached(cache_dir: str, endpoint: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def main(cache_dir: str = "data/bystock") -> None:
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
-    fields = "ts_code,name,list_date,delist_date,list_status,market"
-    universe = build_universe(
-        pd.concat(
-            [pro.stock_basic(exchange="", list_status=st, fields=fields) for st in ("L", "D")],
-            ignore_index=True,
-        )
-    )
-
+def main(cache_dir: str = "data/cache") -> None:
     daily = load_cached(cache_dir, "daily")
     adj = load_cached(cache_dir, "adj_factor")
-    print(f"daily rows={len(daily)} codes={daily['ts_code'].nunique()} | adj rows={len(adj)}", flush=True)
+    print(
+        f"daily rows={len(daily)} codes={daily['ts_code'].nunique()} "
+        f"dates={daily['trade_date'].nunique()} ({daily['trade_date'].min()}..{daily['trade_date'].max()}) "
+        f"| adj rows={len(adj)}",
+        flush=True,
+    )
 
+    # Universe derived from cached prices (token exhausted). 次新 filter off
+    # (min_list_days=0) since list_date is unavailable — preliminary.
+    universe = universe_from_daily(daily)
     panel = assemble_panel(
-        daily, adj, universe, k=5, h=5, rebalance=5, min_amount=50000.0, min_list_days=90
+        daily, adj, universe, k=5, h=5, rebalance=5, min_amount=50000.0, min_list_days=0
     )
     print(
         f"panel: {len(panel)} decision-rows over {panel['trade_date'].nunique()} dates, "
@@ -66,4 +62,4 @@ def main(cache_dir: str = "data/bystock") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "data/bystock")
+    main(sys.argv[1] if len(sys.argv) > 1 else "data/cache")

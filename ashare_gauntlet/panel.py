@@ -14,6 +14,26 @@ from typing import cast
 import pandas as pd
 
 
+def universe_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    """Derive a universe table from cached daily data when ``stock_basic`` is
+    unavailable (e.g. token exhausted).
+
+    The daily data is already the survivorship-free PIT universe — a code only
+    has bars on days it traded. ``list_date`` is unknown here, so it is set far
+    in the past, which makes the 次新 (min_list_days) filter a no-op: a
+    documented limitation of running purely off cached prices.
+    """
+    codes = sorted(daily["ts_code"].unique())
+    return pd.DataFrame(
+        {
+            "ts_code": codes,
+            "list_date": [dt.date(1990, 1, 1)] * len(codes),
+            "delist_date": [None] * len(codes),
+            "market": [""] * len(codes),
+        }
+    )
+
+
 def add_adjusted_prices(daily: pd.DataFrame, adj: pd.DataFrame) -> pd.DataFrame:
     """Merge daily OHLC with adjustment factors and add back-adjusted
     ``hfq_open`` / ``hfq_close`` (raw price x adj_factor)."""

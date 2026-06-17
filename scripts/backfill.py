@@ -18,12 +18,11 @@ from ashare_gauntlet.data.fetch import (
 )
 from ashare_gauntlet.data.tushare_source import make_pro_api
 
-# v1 pulls only what the reversal gauntlet needs. Per-day full-market pulls are
-# credit-efficient: one call = the whole market for a day (~480 calls/year for
-# daily+adj), vs ~10k for per-stock. Modest concurrency speeds it up without a
-# credit burst — the mirror drops the large daily response sometimes and retry
-# recovers it.
-V1_ENDPOINTS: tuple[str, ...] = ("daily", "adj_factor")
+# Co-pull all three per date together so price and 北向 are time-aligned even if
+# the pull is aborted mid-way (1-hour token / credit cap): newest-first means the
+# most-recent contiguous block — exactly what the verdict needs — fills first,
+# and each date gets daily+adj+hk_hold atomically before moving on.
+V1_ENDPOINTS: tuple[str, ...] = ("daily", "adj_factor", "hk_hold")
 MAX_WORKERS = 8
 
 

@@ -7,7 +7,14 @@ computed from real closes, never quoted from an unverified source.
 import pandas as pd
 import pytest
 
-from ashare_gauntlet.factsheet import bollinger, build_factsheet, ema, rsi
+from ashare_gauntlet.factsheet import (
+    bollinger,
+    build_factsheet,
+    daily_tech_facts,
+    ema,
+    market_returns,
+    rsi,
+)
 
 
 def test_ema_of_constant_series_is_constant():
@@ -54,3 +61,39 @@ def test_build_factsheet_assembles_facts_for_one_stock_incl_northbound():
     # northbound: latest ratio rising over the window (real data point, not invented)
     assert fs["north_ratio"] == pytest.approx(1.0 + 24 * 0.1)
     assert fs["north_ratio_chg_5"] == pytest.approx(0.5)
+
+
+def _two_stock_market():
+    days = [f"202506{d:02d}" for d in range(1, 26)]
+    # WINNER rises steadily, LOSER falls steadily.
+    daily = pd.DataFrame(
+        [{"ts_code": "WIN.SZ", "trade_date": d, "open": 10 + j, "close": 10 + j, "amount": 1e6}
+         for j, d in enumerate(days)]
+        + [{"ts_code": "LOS.SH", "trade_date": d, "open": 50 - j, "close": 50 - j, "amount": 1e6}
+           for j, d in enumerate(days)]
+    )
+    adj = pd.DataFrame([{"ts_code": c, "trade_date": d, "adj_factor": 1.0}
+                        for c in ("WIN.SZ", "LOS.SH") for d in days])
+    return daily, adj
+
+
+def test_market_returns_gives_each_stock_horizon_return():
+    daily, adj = _two_stock_market()
+    mr = market_returns(daily, adj, horizons=(5,))
+    # WIN last=34, 5 sessions ago=29 -> +5/29; LOS last=26, 5 ago=31 -> -5/31
+    assert mr[5]["WIN.SZ"] == pytest.approx(34 / 29 - 1)
+    assert mr[5]["LOS.SH"] == pytest.approx(26 / 31 - 1)
+
+
+def test_daily_tech_facts_labels_trend_and_cross_sectional_percentile():
+    daily, adj = _two_stock_market()
+    mr = market_returns(daily, adj, horizons=(5, 20))
+
+    win = daily_tech_facts("WIN.SZ", daily, adj, mr)
+    los = daily_tech_facts("LOS.SH", daily, adj, mr)
+
+    assert win["trend"] == "多头"  # price > EMA5 > EMA20 (steady rise)
+    assert los["trend"] == "空头"
+    # WIN beats LOS cross-sectionally, so its 5d percentile is the higher one.
+    assert win["pct5"] > los["pct5"]
+    assert set(["close", "rsi", "ret5_pct", "vol_ratio", "dist_60d_high_pct"]).issubset(win)

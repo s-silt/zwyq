@@ -5,6 +5,8 @@ or a trade call. EMA/RSI/Bollinger are the tested versions of the numbers a TA
 report quotes; we compute them ourselves rather than trust an unverified source.
 """
 
+import math
+from collections.abc import Sequence
 from typing import cast
 
 import pandas as pd
@@ -88,4 +90,83 @@ def build_factsheet(
             ratios = h["ratio"].to_numpy()
             fs["north_ratio"] = float(ratios[-1])
             fs["north_ratio_chg_5"] = float(ratios[-1] - ratios[-6]) if len(ratios) > 5 else float("nan")
+    return fs
+
+
+def market_returns(
+    daily_all: pd.DataFrame,
+    adj_all: pd.DataFrame,
+    horizons: Sequence[int] = (5, 20),
+) -> dict[int, pd.Series]:
+    """Latest h-session back-adjusted return for every stock, per horizon.
+
+    Used to rank one stock cross-sectionally against the whole market (returns
+    are scale-invariant, so 后复权 is fine here)."""
+    piv = daily_all.merge(
+        adj_all[["ts_code", "trade_date", "adj_factor"]], on=["ts_code", "trade_date"], how="left"
+    )
+    piv["hfq"] = piv["close"] * piv["adj_factor"]
+    wide = piv.pivot_table(index="trade_date", columns="ts_code", values="hfq").sort_index()
+    out: dict[int, pd.Series] = {}
+    for h in horizons:
+        if len(wide) > h:
+            out[h] = (wide.iloc[-1] / wide.iloc[-(h + 1)] - 1).dropna()
+    return out
+
+
+def daily_tech_facts(
+    ts_code: str,
+    daily_all: pd.DataFrame,
+    adj_all: pd.DataFrame,
+    market_rets: dict[int, pd.Series] | None = None,
+    ema_short: int = 5,
+    ema_long: int = 20,
+    rsi_n: int = 14,
+) -> dict[str, object]:
+    """Richer per-stock factual analysis: trend label, momentum + direction,
+    Bollinger position, distance from the 60-session high, recent returns and —
+    if ``market_rets`` is given — the cross-sectional percentile vs the whole
+    market. Descriptive only.
+    """
+    one = daily_all[daily_all["ts_code"] == ts_code].merge(
+        adj_all[["ts_code", "trade_date", "adj_factor"]], on=["ts_code", "trade_date"], how="left"
+    )
+    one = one.sort_values("trade_date")
+    adj = one["adj_factor"].to_numpy()
+    raw = one["close"].to_numpy()
+    q = pd.Series(raw * adj / adj[-1], index=one["trade_date"].to_numpy())  # 前复权
+
+    cur = float(q.iloc[-1])
+    e_s = float(ema(q, ema_short).iloc[-1])
+    e_l = float(ema(q, ema_long).iloc[-1])
+    rsi_series = rsi(q, rsi_n)
+    lo, mid, up = bollinger(q, 20)
+    high60 = float(q.iloc[-60:].max())
+    amt = one["amount"].to_numpy()
+
+    def ret(h: int) -> float:
+        return float(q.iloc[-1] / q.iloc[-(h + 1)] - 1) if len(q) > h else math.nan
+
+    ret5, ret20 = ret(5), ret(20)
+    trend = "多头" if cur > e_s > e_l else ("空头" if cur < e_s < e_l else "纠缠")
+    fs: dict[str, object] = {
+        "ts_code": ts_code,
+        "as_of": str(one["trade_date"].iloc[-1]),
+        "close": cur,
+        "trend": trend,
+        "ema_short": e_s,
+        "ema_long": e_l,
+        "rsi": float(rsi_series.iloc[-1]),
+        "rsi_dir": "↑" if rsi_series.iloc[-1] >= rsi_series.iloc[-6] else "↓",
+        "boll": (lo, mid, up),
+        "dist_60d_high_pct": (cur / high60 - 1) * 100,
+        "ret5_pct": ret5 * 100,
+        "ret20_pct": ret20 * 100,
+        "vol_ratio": float(amt[-1] / amt[-20:].mean()),
+    }
+    if market_rets:
+        if 5 in market_rets:
+            fs["pct5"] = float((market_rets[5] < ret5).mean() * 100)
+        if 20 in market_rets:
+            fs["pct20"] = float((market_rets[20] < ret20).mean() * 100)
     return fs

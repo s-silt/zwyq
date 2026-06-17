@@ -7,7 +7,7 @@ report quotes; we compute them ourselves rather than trust an unverified source.
 
 import math
 from collections.abc import Sequence
-from typing import cast
+from typing import Any, cast
 
 import pandas as pd
 
@@ -170,3 +170,38 @@ def daily_tech_facts(
         if 20 in market_rets:
             fs["pct20"] = float((market_rets[20] < ret20).mean() * 100)
     return fs
+
+
+def entry_rank(facts: dict[str, Any]) -> tuple[float, str]:
+    """Transparent 'buying-discipline' score + tag for one stock — NOT a return
+    prediction (momentum & reversal both tested NO_GO in this market/window).
+
+    The stated rule, organizing by a disciplined entry lens:
+      base   = 20-day cross-sectional relative strength (pct20, 0-100)
+      −60    if 空头 (downtrend) — don't catch a falling knife
+      −20    if RSI > 70 — don't chase an overbought move
+      +15    if 多头 and price within −5%..+3% of EMA20 — a pullback to support
+             inside an uptrend (the disciplined entry)
+    Higher = better fits the lens. Tag summarizes the entry condition.
+    """
+    rs = float(facts.get("pct20", 0.0) or 0.0)
+    trend = facts.get("trend")
+    rsi_val = float(facts.get("rsi", 50.0))
+    close = float(facts.get("close", 0.0))
+    ema_long = float(facts.get("ema_long", close)) or close
+    dist_ema_pct = (close / ema_long - 1) * 100 if ema_long else 0.0
+
+    score = rs
+    tags: list[str] = []
+    if trend == "空头":
+        score -= 60
+        tags.append("下跌趋势·勿接")
+    if rsi_val > 70:
+        score -= 20
+        tags.append("超买·勿追")
+    if trend == "多头" and -5.0 <= dist_ema_pct <= 3.0:
+        score += 15
+        tags.append("回踩支撑·趋势内")
+    if not tags:
+        tags.append("趋势内" if trend == "多头" else "中性")
+    return score, "·".join(tags)

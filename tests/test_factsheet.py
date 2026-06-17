@@ -12,6 +12,7 @@ from ashare_gauntlet.factsheet import (
     build_factsheet,
     daily_tech_facts,
     ema,
+    entry_rank,
     market_returns,
     rsi,
 )
@@ -97,3 +98,21 @@ def test_daily_tech_facts_labels_trend_and_cross_sectional_percentile():
     # WIN beats LOS cross-sectionally, so its 5d percentile is the higher one.
     assert win["pct5"] > los["pct5"]
     assert set(["close", "rsi", "ret5_pct", "vol_ratio", "dist_60d_high_pct"]).issubset(win)
+
+
+def test_entry_rank_prefers_uptrend_penalizes_falling_knife_and_overbought():
+    # Same relative strength (pct20=80); the entry discipline should still rank
+    # an uptrend-pullback above a downtrend and above an overbought chase.
+    up = {"trend": "多头", "rsi": 55.0, "close": 11.0, "ema_long": 10.8, "pct20": 80.0}
+    down = {"trend": "空头", "rsi": 40.0, "close": 9.0, "ema_long": 10.0, "pct20": 80.0}
+    hot = {"trend": "多头", "rsi": 78.0, "close": 13.0, "ema_long": 10.0, "pct20": 80.0}
+
+    s_up, tag_up = entry_rank(up)
+    s_down, tag_down = entry_rank(down)
+    s_hot, tag_hot = entry_rank(hot)
+
+    assert s_up > s_down  # uptrend beats falling knife
+    assert s_up > s_hot   # disciplined entry beats chasing overbought
+    assert "勿接" in tag_down
+    assert "勿追" in tag_hot
+    assert "回踩" in tag_up

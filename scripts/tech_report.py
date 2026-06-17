@@ -18,7 +18,7 @@ import sys
 
 import pandas as pd
 
-from ashare_gauntlet.factsheet import daily_tech_facts, market_returns
+from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
 
 # Default tech watchlist (头部 large-cap leaders + 中部 mid-cap), labelled tier·theme.
 DEFAULT_WATCH: dict[str, str] = {
@@ -58,26 +58,26 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
 
     print(f"=== 科技股事实报告 (截至 {as_of};前复权,分位=全市场横截面) ===")
     print(f"市场广度(当日): 涨 {up} / 跌 {dn}   | 宏观叙事 + 北向净流入为 live web 层,交付时附")
+    print("排序=入场纪律分(强势+趋势确认,惩罚追高/接刀);这是组织信息的镜头,非预测会涨。")
     print("—— 描述现状,非预测/非买卖建议 ——")
 
     rows = []
     for code, label in watch.items():
         if (daily["ts_code"] == code).sum() < 60:
-            rows.append((label, code, None))
+            rows.append((label, code, None, (-1e9, "数据不足")))
             continue
-        rows.append((label, code, daily_tech_facts(code, daily, adj, mret)))
+        f = daily_tech_facts(code, daily, adj, mret)
+        rows.append((label, code, f, entry_rank(f)))
 
-    rows.sort(key=lambda r: (r[2]["pct20"] if r[2] and "pct20" in r[2] else -1.0), reverse=True)
-    for label, code, f in rows:
+    rows.sort(key=lambda r: r[3][0], reverse=True)
+    for label, code, f, (score, tag) in rows:
         if f is None:
             print(f"{label} [{code}] 数据不足")
             continue
-        p5 = f.get("pct5", float("nan"))
         p20 = f.get("pct20", float("nan"))
         print(
-            f"{label} {f['close']:.2f} | {f['trend']}(价{'>' if f['close'] > f['ema_long'] else '<'}EMA20) "
-            f"| RSI {f['rsi']:.0f}{f['rsi_dir']} | 距60高 {f['dist_60d_high_pct']:+.0f}% "
-            f"| 近5 {f['ret5_pct']:+.1f}%(分位{p5:.0f}) 近20 {f['ret20_pct']:+.1f}%(分位{p20:.0f}) "
+            f"[{score:>3.0f}〕{tag}〕{label} {f['close']:.2f} | {f['trend']} | RSI {f['rsi']:.0f}{f['rsi_dir']} "
+            f"| 距60高 {f['dist_60d_high_pct']:+.0f}% | 近5 {f['ret5_pct']:+.1f}% 近20 {f['ret20_pct']:+.1f}%(分位{p20:.0f}) "
             f"| 量比 {f['vol_ratio']:.2f}"
         )
 

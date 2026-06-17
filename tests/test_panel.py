@@ -182,30 +182,31 @@ def test_universe_from_daily_derives_codes_without_stock_basic():
     assert all(d is None for d in uni["delist_date"])
 
 
-def test_north_flow_signal_is_negative_change_in_holding_ratio():
-    # hk_hold.ratio = 北向持股占流通股比例. 增持 (ratio up) is the smart-money-buy
-    # hypothesis, and the gauntlet's buy leg is bucket 0 (lowest signal), so the
-    # signal must be the NEGATED change: 增持 -> low signal -> buy leg.
+def test_north_flow_signal_filters_to_northbound_and_handles_string_ratio():
+    # hk_hold mixes 北向 (A-shares .SH/.SZ) and 南向 (港股通 .HK); the 北向 signal
+    # is only A-shares. ratio comes back as object/strings and must be coerced.
+    # 增持 (ratio up) -> NEGATED -> low signal -> the gauntlet buy leg (bucket 0).
     hk = pd.DataFrame(
         {
-            "ts_code": ["A", "A", "A", "B", "B", "B"],
-            "trade_date": ["20250102", "20250103", "20250104"] * 2,
-            "ratio": [1.0, 1.5, 2.0, 3.0, 2.0, 1.0],  # A 增持, B 减持
+            "ts_code": ["000001.SZ"] * 3 + ["600000.SH"] * 3 + ["01038.HK"] * 3,
+            "trade_date": ["20250102", "20250103", "20250104"] * 3,
+            "ratio": ["1.0", "1.5", "2.0", "3.0", "2.0", "1.0", "5.0", "6.0", "7.0"],
         }
     )
 
     out = north_flow_signal(hk, k=1).set_index(["ts_code", "trade_date"])
 
-    # A 0103: +0.5 增持 -> signal -0.5 (buy leg); B 0103: -1.0 减持 -> signal +1.0
-    assert out.loc[("A", "20250103"), "signal"] == pytest.approx(-0.5)
-    assert out.loc[("B", "20250103"), "signal"] == pytest.approx(1.0)
-    # No prior day -> no signal.
-    assert pd.isna(out.loc[("A", "20250102"), "signal"])
+    # Southbound .HK is dropped — it is not part of the 北向 A-share signal.
+    assert "01038.HK" not in {c for c, _ in out.index}
+    # 000001.SZ 增持 +0.5 -> signal -0.5; 600000.SH 减持 -1.0 -> signal +1.0.
+    assert out.loc[("000001.SZ", "20250103"), "signal"] == pytest.approx(-0.5)
+    assert out.loc[("600000.SH", "20250103"), "signal"] == pytest.approx(1.0)
+    assert pd.isna(out.loc[("000001.SZ", "20250102"), "signal"])
 
 
 def test_assemble_flow_panel_uses_flow_signal_with_price_forward_return():
     days = [f"2024010{i}" for i in range(1, 10)] + ["20240110"]
-    codes = ["A", "B"]
+    codes = ["000001.SZ", "600000.SH"]
     daily = pd.DataFrame(
         [
             {"ts_code": c, "trade_date": d, "open": 10.0 + j, "close": 10.0 + j, "amount": 1e6}
@@ -216,10 +217,10 @@ def test_assemble_flow_panel_uses_flow_signal_with_price_forward_return():
     adj = pd.DataFrame(
         [{"ts_code": c, "trade_date": d, "adj_factor": 1.0} for c in codes for d in days]
     )
-    # A 北向增持 (ratio j+1 rising), B 减持 (falling).
+    # 000001.SZ 北向增持 (ratio rising), 600000.SH 减持 (falling).
     hk = pd.DataFrame(
-        [{"ts_code": "A", "trade_date": d, "ratio": float(j + 1)} for j, d in enumerate(days)]
-        + [{"ts_code": "B", "trade_date": d, "ratio": float(10 - j)} for j, d in enumerate(days)]
+        [{"ts_code": "000001.SZ", "trade_date": d, "ratio": float(j + 1)} for j, d in enumerate(days)]
+        + [{"ts_code": "600000.SH", "trade_date": d, "ratio": float(10 - j)} for j, d in enumerate(days)]
     )
     universe = universe_from_daily(daily)
 
@@ -228,6 +229,6 @@ def test_assemble_flow_panel_uses_flow_signal_with_price_forward_return():
     ).set_index(["ts_code", "trade_date"])
 
     assert list(out.columns) == ["signal", "fwd_ret"]
-    # Decision date 20240104 (idx3): A 增持 -> signal = -(4-3) = -1 (flow, not reversal).
-    assert out.loc[("A", "20240104"), "signal"] == pytest.approx(-1.0)
-    assert out.loc[("B", "20240104"), "signal"] == pytest.approx(1.0)
+    # Decision 20240104 (idx3): 增持 -> signal = -(4-3) = -1 (flow, not reversal).
+    assert out.loc[("000001.SZ", "20240104"), "signal"] == pytest.approx(-1.0)
+    assert out.loc[("600000.SH", "20240104"), "signal"] == pytest.approx(1.0)

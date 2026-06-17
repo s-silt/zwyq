@@ -42,7 +42,11 @@ def north_flow_signal(hk_hold: pd.DataFrame, k: int) -> pd.DataFrame:
     signal), so the change is negated to put 增持 names in bucket 0. Returns
     columns ``ts_code``, ``trade_date``, ``signal``.
     """
-    out = hk_hold.sort_values(["ts_code", "trade_date"]).copy()
+    # hk_hold mixes 北向 (A-shares on SSE/SZSE, .SH/.SZ) and 南向 (港股通, .HK).
+    # The northbound signal is A-shares only; ratio comes back as object/strings.
+    out = cast(pd.DataFrame, hk_hold[hk_hold["ts_code"].str.endswith((".SH", ".SZ"))].copy())
+    out["ratio"] = pd.to_numeric(out["ratio"], errors="coerce")
+    out = out.sort_values(["ts_code", "trade_date"])
     delta = out.groupby("ts_code", group_keys=False)["ratio"].transform(
         lambda s: s - s.shift(k)
     )

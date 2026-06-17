@@ -18,7 +18,12 @@ import sys
 
 import pandas as pd
 
-from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
+from ashare_gauntlet.factsheet import (
+    daily_tech_facts,
+    entry_rank,
+    market_returns,
+    north_flow_disclosure,
+)
 
 # Default tech watchlist (头部 large-cap leaders + 中部 mid-cap), labelled tier·theme.
 DEFAULT_WATCH: dict[str, str] = {
@@ -57,7 +62,8 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
     dn = int((last["pct_chg"] < 0).sum()) if "pct_chg" in last.columns else -1
 
     print(f"=== 科技股事实报告 (截至 {as_of};前复权,分位=全市场横截面) ===")
-    print(f"市场广度(当日): 涨 {up} / 跌 {dn}   | 宏观叙事 + 北向净流入为 live web 层,交付时附")
+    print(f"市场广度(当日): 涨 {up} / 跌 {dn}   | 宏观叙事为 live web 层,交付时附(带 source)")
+    print(north_flow_disclosure())
     print("排序=入场纪律分(强势+趋势确认,惩罚追高/接刀);这是组织信息的镜头,非预测会涨。")
     print("—— 描述现状,非预测/非买卖建议 ——")
 

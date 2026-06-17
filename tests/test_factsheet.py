@@ -14,6 +14,7 @@ from ashare_gauntlet.factsheet import (
     ema,
     entry_rank,
     market_returns,
+    north_flow_disclosure,
     rsi,
 )
 
@@ -98,6 +99,18 @@ def test_daily_tech_facts_labels_trend_and_cross_sectional_percentile():
     # WIN beats LOS cross-sectionally, so its 5d percentile is the higher one.
     assert win["pct5"] > los["pct5"]
     assert set(["close", "rsi", "ret5_pct", "vol_ratio", "dist_60d_high_pct"]).issubset(win)
+
+
+def test_north_flow_disclosure_states_the_standing_facts():
+    # The honest standing limit must be self-carried by every report rather than
+    # left to a manual footnote: daily northbound NET inflow was discontinued on
+    # 2024-08-19 (per-stock holdings moved to quarterly), so the factual layer
+    # must never quote a daily net figure that no longer officially exists.
+    note = north_flow_disclosure()
+    assert "2024-08-19" in note
+    assert "停披露" in note
+    assert "季度" in note
+    assert "净" in note  # explicitly disclaims a net figure
 
 
 def test_entry_rank_prefers_uptrend_penalizes_falling_knife_and_overbought():

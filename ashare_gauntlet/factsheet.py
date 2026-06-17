@@ -36,6 +36,21 @@ def bollinger(close: pd.Series, n: int = 20, k: float = 2.0) -> tuple[float, flo
     return mid - k * sd, mid, mid + k * sd
 
 
+def north_flow_disclosure() -> str:
+    """The standing, honest fact about northbound daily-flow availability.
+
+    Daily northbound NET inflow disclosure was discontinued on 2024-08-19 (per-
+    stock 北向持股 moved to quarterly); only the aggregate turnover + the top-10
+    active names remain daily. Returned as a one-liner so every report self-
+    carries the limit instead of relying on a manual footnote — the factual
+    layer must never quote a daily net figure that no longer officially exists.
+    """
+    return (
+        "北向净流入: 自 2024-08-19 制度性停披露(个股持股改季度), 无官方日频净额; "
+        "日频仅总成交额+十大成交活跃股 —— 事实层不提供北向净流入(非遗漏,是数据缺口)"
+    )
+
+
 def build_factsheet(
     ts_code: str,
     daily_all: pd.DataFrame,

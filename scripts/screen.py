@@ -56,7 +56,7 @@ def _facts_table(daily: pd.DataFrame, adj: pd.DataFrame, codes: list[str],
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--board", default="sh_main", choices=["sh_main", "all"])
+    ap.add_argument("--board", default="sh_main", choices=["sh_main", "sz_main", "main", "all"])
     ap.add_argument("--sector", default="comm_elec", choices=list(SECTORS))
     ap.add_argument("--max-price", type=float, default=300.0)
     ap.add_argument("--min-pct20", type=float, default=50.0)
@@ -78,7 +78,11 @@ def main() -> None:
     rank20 = mr[20].rank(pct=True) * 100
     last = daily[daily["trade_date"] == as_of].set_index("ts_code")["close"].astype(float)
     counts = daily["ts_code"].value_counts()
-    boards = ["沪主板"] if a.board == "sh_main" else None
+    _BOARDS: dict[str, list[str] | None] = {
+        "sh_main": ["沪主板"], "sz_main": ["深主板"],
+        "main": ["沪主板", "深主板"], "all": None,
+    }
+    boards = _BOARDS[a.board]
 
     counts_d, rank_d, last_d = counts.to_dict(), rank20.to_dict(), last.to_dict()
     codes = [str(c) for c in mr[20].index
@@ -93,8 +97,9 @@ def main() -> None:
         from ashare_gauntlet.data.tushare_source import make_pro_api
         pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
         db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv"))
+        _EXCHANGE = {"sh_main": "SSE", "sz_main": "SZSE", "main": "", "all": ""}
         sb = call_with_retry(lambda: pro.stock_basic(
-            exchange="SSE" if a.board == "sh_main" else "", list_status="L",
+            exchange=_EXCHANGE[a.board], list_status="L",
             fields="ts_code,name,industry"))
         df = df.merge(db, on="ts_code", how="left").merge(sb, on="ts_code", how="left")
         industries = SECTORS[a.sector]

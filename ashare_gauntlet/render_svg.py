@@ -25,8 +25,14 @@ from typing import Any, Callable, Optional
 # 常量:画布 / 配色(色盲安全:颜色仅作辅助,文字档名+图标承载语义)
 # ---------------------------------------------------------------------------
 W: int = 640
-H: int = 760
+H: int = 760  # 基准画布高(0–2 条旗标);旗标更多时按 _card_height 动态增高
 PLACEHOLDER: str = "—"
+
+# 事件旗标行布局常量(与 _flags 一致;用于动态算高,保证末条不被底框裁剪)
+_FLAG_TITLE_Y: int = 706      # "事件提示旗" 标题基线
+_FLAG_FIRST_Y: int = 726      # 首条旗标文字基线(标题 +20)
+_FLAG_STEP: int = 18          # 每条旗标行高
+_FLAG_BOTTOM_PAD: int = 12    # 末条距画布底的安全余量
 
 # tier 档:emoji 图标 + 中性配色(色盲安全靠图标+文字,不靠颜色区分)
 TIER_FILL: dict[str, str] = {
@@ -140,10 +146,18 @@ def _risk_value(record: dict[str, Any]) -> Optional[float]:
     return None if recv is None else -recv
 
 
+def _ep_value(record: dict[str, Any]) -> Optional[float]:
+    """估值轴(EP=1/PE,越大越便宜)。pe_ttm<=0(亏损/缺失)降级为缺失,
+    不让负 EP 混入 cohort 百分位排序(负 PE 语义含糊)。"""
+    pe = _num(record, "valuation.pe_ttm")
+    if pe is None or pe <= 0.0:
+        return None
+    return 1.0 / pe
+
+
 # (label, 取值器, 该轴口径脚注)
 AXES: list[tuple[str, Callable[[dict[str, Any]], Optional[float]], str]] = [
-    ("估值", lambda r: (None if (_num(r, "valuation.pe_ttm") in (None, 0.0))
-                        else 1.0 / float(_num(r, "valuation.pe_ttm") or 0.0)), "EP=1/PE"),
+    ("估值", _ep_value, "EP=1/PE"),
     ("成长", lambda r: _num(r, "fundamental.np_yoy"), "归母净利同比"),
     ("盈利质量", lambda r: _num(r, "quality.net_cash_ratio"), "净现比"),
     ("现金质量", lambda r: (None if _num(r, "quality.accrual") is None
@@ -390,10 +404,28 @@ def _bullets(record: dict[str, Any], cohort: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def _flag_dicts(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """取出 record 中合法的 dict 旗标(过滤非 dict 噪声),顺序保留。"""
+    return [fl for fl in (record.get("flags") or []) if isinstance(fl, dict)]
+
+
+def _card_height(record: dict[str, Any]) -> int:
+    """按旗标数动态算画布高:基准 H,旗标多时增高,保证末条 ly <= H - 安全余量。"""
+    n = len(_flag_dicts(record))
+    if n <= 0:
+        return H
+    last_ly = _FLAG_FIRST_Y + (n - 1) * _FLAG_STEP
+    return max(H, last_ly + _FLAG_BOTTOM_PAD)
+
+
 def _flags(record: dict[str, Any]) -> str:
-    """底部事件旗标行:中性提示 emoji + 事实 + 日期 + a11y <title>。绝不当买入触发器。"""
-    flags = record.get("flags") or []
-    y = 706
+    """底部事件旗标行:中性提示 emoji + 事实 + 日期 + a11y <title>。绝不当买入触发器。
+
+    severity==警示 时加中性强调(前置 ‼ 中性符 + severity 文字加粗),非红非恐吓,
+    保证中性分级在视觉+读屏均可辨;提示行不强调。
+    """
+    flags = _flag_dicts(record)
+    y = _FLAG_TITLE_Y
     parts: list[str] = [
         '<g font-family="Segoe UI,Microsoft YaHei,sans-serif">'
         f'<line x1="16" y1="{y - 18}" x2="{W - 16}" y2="{y - 18}" stroke="{GRID}" stroke-width="1"/>'
@@ -404,22 +436,27 @@ def _flags(record: dict[str, Any]) -> str:
             f'<text x="16" y="{y + 20}" font-size="12" fill="{MUTE}">无质押/解禁/减持/超预期旗标</text>'
         )
     else:
-        ly = y + 20
+        ly = _FLAG_FIRST_Y
         for fl in flags:
-            if not isinstance(fl, dict):
-                continue
             ftype = str(fl.get("type", ""))
             icon = FLAG_ICON.get(ftype, "•")
             fact = str(fl.get("fact", ""))
             date = str(fl.get("date", PLACEHOLDER))
             sev = str(fl.get("severity", "提示"))
-            label = f"{ftype} · {fact} · {date}({sev})"
+            warn = sev == "警示"
+            mark = "‼ " if warn else ""  # 中性强调前置符(非红/非爆炸),读屏可读
+            label = f"{mark}{ftype} · {fact} · {date}({sev})"
+            # severity 文字:警示加粗(font-weight=700)中性强调,提示常规
+            sev_weight = ' font-weight="700"' if warn else ""
             parts.append(
                 f'<text x="16" y="{ly}" font-size="12" fill="{INK}" aria-label="{_esc(label)}">'
-                f'{icon} {_esc(ftype)} · {_esc(fact)} · <tspan fill="{MUTE}">{_esc(date)}({_esc(sev)})</tspan>'
+                f'{mark}{icon} {_esc(ftype)} · {_esc(fact)} · '
+                f'<tspan fill="{MUTE}">{_esc(date)}(</tspan>'
+                f'<tspan fill="{MUTE}"{sev_weight}>{_esc(sev)}</tspan>'
+                f'<tspan fill="{MUTE}">)</tspan>'
                 f'<title>{_esc(label)}</title></text>'
             )
-            ly += 18
+            ly += _FLAG_STEP
     parts.append("</g>")
     return "".join(parts)
 
@@ -440,6 +477,7 @@ def render_svg_card(record: dict[str, Any], cohort: Optional[list[dict[str, Any]
     pool: list[dict[str, Any]] = list(cohort) if cohort else []
     code = _esc(record.get("ts_code", ""))
     name = _esc(record.get("name", ""))
+    h = _card_height(record)  # 动态高:旗标多时增高,保证末条不被底框裁剪
 
     body = (
         _header(record)
@@ -449,12 +487,12 @@ def render_svg_card(record: dict[str, Any], cohort: Optional[list[dict[str, Any]
     )
 
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
-        f'viewBox="0 0 {W} {H}" role="img" '
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{h}" '
+        f'viewBox="0 0 {W} {h}" role="img" '
         f'aria-label="单股质地卡 {name} {code}">'
         f"<title>单股质地卡 {name}({code})</title>"
-        f'<rect x="0" y="0" width="{W}" height="{H}" fill="#ffffff"/>'
-        f'<rect x="6" y="6" width="{W - 12}" height="{H - 12}" rx="14" fill="none" stroke="#ececec" stroke-width="2"/>'
+        f'<rect x="0" y="0" width="{W}" height="{h}" fill="#ffffff"/>'
+        f'<rect x="6" y="6" width="{W - 12}" height="{h - 12}" rx="14" fill="none" stroke="#ececec" stroke-width="2"/>'
         f"{body}"
         f"</svg>"
     )

@@ -283,3 +283,91 @@ def test_pledge_pct_falls_back_to_fact_when_value_absent():
 
     rec = {"flags": [{"type": "质押", "fact": "控股股东体系质押12.9%"}]}
     assert _pledge_pct(rec) == pytest.approx(12.9)
+
+
+# ---------------------------------------------------------------------------
+# C1:四类旗标(质押/解禁/减持/超预期)全渲染时,末条 y 坐标不被画布裁剪
+# ---------------------------------------------------------------------------
+def _four_flags() -> list[dict]:
+    return [
+        {"type": "质押", "severity": "提示", "fact": "控股股东体系质押12.9%", "date": "20260618"},
+        {"type": "解禁", "severity": "警示", "fact": "首发限售解禁8.2%", "date": "20260701"},
+        {"type": "减持", "severity": "提示", "fact": "近一年减持2笔", "date": "20251223"},
+        {"type": "超预期", "severity": "提示", "fact": "业绩预告上修", "date": "20260415"},
+    ]
+
+
+def _svg_height(svg: str) -> float:
+    m = re.search(r'<svg[^>]*\bheight="([0-9.]+)"', svg)
+    assert m, "缺 <svg height>"
+    return float(m.group(1))
+
+
+def test_four_flags_last_row_y_within_canvas_height():
+    """四类旗标全出时,最后一条文字基线 ly 必须 <= 画布高 - 12(不被底框裁剪)。"""
+    svg = render_svg_card(_rec(flags=_four_flags()), cohort=_cohort())
+    h = _svg_height(svg)
+    # 取所有旗标文字 y(事件提示旗标题行之后的 <text ... y=...>),末条须留 12px 余量
+    ys = [float(y) for y in re.findall(r'<text x="16" y="([0-9.]+)" font-size="12" fill="#222222" aria-label=', svg)]
+    assert ys, "应渲染出旗标文字行"
+    assert max(ys) <= h - 12, f"末条旗标 y={max(ys)} 超出画布 h-12={h - 12}"
+
+
+def test_svg_height_grows_with_more_flags():
+    """画布高随旗标数增大(动态 H),保证多旗不被裁。"""
+    h1 = _svg_height(render_svg_card(_rec(flags=_four_flags()[:1]), cohort=_cohort()))
+    h4 = _svg_height(render_svg_card(_rec(flags=_four_flags()), cohort=_cohort()))
+    assert h4 > h1
+
+
+def test_svg_height_matches_viewbox():
+    """动态 H 时 viewBox 高度须与 height 一致(否则缩放错位)。"""
+    svg = render_svg_card(_rec(flags=_four_flags()), cohort=_cohort())
+    h = _svg_height(svg)
+    m = re.search(r'viewBox="0 0 \d+ ([0-9.]+)"', svg)
+    assert m and float(m.group(1)) == h
+
+
+# ---------------------------------------------------------------------------
+# C2:负 PE(亏损股)估值轴降级为缺失,不混入 cohort 百分位排序
+# ---------------------------------------------------------------------------
+def test_negative_pe_valuation_axis_degrades_not_raises():
+    """pe_ttm<=0(亏损)→ 估值轴归一化为缺失/灰点,不抛、不算负 EP 进百分位。"""
+    from ashare_gauntlet.render_svg import AXES
+
+    val_getter = AXES[0][1]  # 估值轴 getter
+    assert val_getter(_rec(pe_ttm=-10.0)) is None
+    assert val_getter(_rec(pe_ttm=0.0)) is None
+    # 正常 PE 仍返回正 EP
+    assert val_getter(_rec(pe_ttm=20.0)) == pytest.approx(0.05)
+    # 整卡不抛
+    svg = render_svg_card(_rec(pe_ttm=-10.0), cohort=_cohort())
+    assert svg.lstrip().startswith("<svg")
+
+
+# ---------------------------------------------------------------------------
+# C3:severity==警示 视觉/读屏可辨(中性强调,非红非恐吓);提示不强调
+# ---------------------------------------------------------------------------
+def _flags_group(svg: str) -> str:
+    """抽出事件旗标 <g>...</g> 段(标题文字之后到该 g 末),用于只看旗标区强调。"""
+    i = svg.index("事件提示旗")
+    return svg[i:]
+
+
+def test_severity_warn_is_emphasized_hint_is_not():
+    svg_warn = render_svg_card(
+        _rec(flags=[{"type": "解禁", "severity": "警示", "fact": "解禁8.2%", "date": "20260701"}]),
+        cohort=_cohort(),
+    )
+    svg_hint = render_svg_card(
+        _rec(flags=[{"type": "减持", "severity": "提示", "fact": "减持2笔", "date": "20251223"}]),
+        cohort=_cohort(),
+    )
+    warn_g = _flags_group(svg_warn)
+    hint_g = _flags_group(svg_hint)
+    # 警示:旗标区出现中性强调标记(前置中性符 ‼ 或对 severity 加粗 font-weight=700),非红非恐吓
+    assert "警示" in warn_g
+    assert ("‼" in warn_g) or ('font-weight="700"' in warn_g)
+    # 提示:旗标区无该强调(确认是 severity 触发,而非恒定渲染)
+    assert "‼" not in hint_g
+    assert 'font-weight="700"' not in hint_g

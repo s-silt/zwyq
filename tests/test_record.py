@@ -14,7 +14,7 @@ from ashare_gauntlet.record import build_record, diff_records, merge_factcheck, 
 # ---------------------------------------------------------------------------
 def _rec(
     *,
-    profitable: bool = True,
+    profitable: bool | None = True,
     np_yoy: float | None = 20.0,
     dedt_yoy: float | None = 15.0,
     rev_yoy: float | None = 12.0,
@@ -23,7 +23,7 @@ def _rec(
     ocf: float | None = 6.0,
     goodwill: float | None = 1.0,
     net_assets: float | None = 50.0,
-    is_st: bool = False,
+    is_st: bool | None = False,
     flags: list[dict] | None = None,
 ):
     return {
@@ -92,6 +92,20 @@ def test_tier_yellow_negative_cashflow():
     assert t["grade"] == "🟡"
 
 
+def test_tier_yellow_negative_cashflow_profitable_none_no_prefix():
+    # [A3] profitable=None(净利绝对值缺失)+ ocf<0:不得断言"盈利但",无依据
+    t = tier_of(_rec(profitable=None, np_yi=None, ocf=-2.0))
+    assert t["grade"] == "🟡"
+    assert any("经营现金流<0" in r for r in t["reasons"])
+    assert not any("盈利但" in r for r in t["reasons"])
+
+
+def test_tier_yellow_negative_cashflow_profitable_true_keeps_prefix():
+    # [A3] profitable=True 时仍保留"盈利但"前缀(有依据)
+    t = tier_of(_rec(profitable=True, ocf=-2.0))
+    assert any("盈利但经营现金流<0" in r for r in t["reasons"])
+
+
 def test_tier_yellow_low_base():
     # 疑低基数:净利 +50% 但营收 +5%
     t = tier_of(_rec(np_yoy=50.0, rev_yoy=5.0))
@@ -112,9 +126,58 @@ def test_tier_yellow_missing_data_downgrade():
     assert any("数据缺失" in r for r in t["reasons"])
 
 
+def test_tier_dedt_abs_missing_blocks_green():
+    # [A1] 净利绝对值为正但扣非绝对值缺失(None)→ 无法核扣非背离,
+    # 不得凭 dedt_yoy>0 直达 🟢;保守降级 🟡 + needs_human 并标注无法核
+    t = tier_of(_rec(np_yi=5.0, dedt_yi=None))
+    assert t["grade"] == "🟡"
+    assert t["needs_human"] is True
+    assert any("扣非绝对值缺失" in r and "无法核" in r for r in t["reasons"])
+
+
+def test_tier_dedt_abs_present_negative_still_red():
+    # [A1] 守卫不得误伤:扣非绝对值确为负时仍走 🔴 背离,不被新降级吞掉
+    t = tier_of(_rec(np_yi=5.0, dedt_yi=-1.0))
+    assert t["grade"] == "🔴"
+
+
+def test_tier_np_abs_missing_no_spurious_dedt_downgrade():
+    # [A1] 净利绝对值缺失(np_yi=None)时,扣非背离判据本就 N/A,
+    # 不应因 dedt_yi 缺失而触发"无法核扣非背离"降级(背离前提是 np_yi>0)
+    t = tier_of(_rec(np_yi=None, dedt_yi=None))
+    assert not any("无法核扣非背离" in r for r in t["reasons"])
+
+
 def test_tier_priority_mine_beats_red():
     # 既亏损(⛔)又扣非负(🔴)→ ⛔ 优先
     assert tier_of(_rec(profitable=False, np_yi=-2.0, dedt_yi=-3.0))["grade"] == "⛔"
+
+
+# ---------------------------------------------------------------------------
+# [A5] tier_of 边界/优先级(characterization:锁住现有正确行为,非 red-first)
+# ---------------------------------------------------------------------------
+def test_double_decline_boundary_minus40():
+    # 净利&扣非同比恰好 = -40%(<= DECLINE_SEVERE)→ ⛔(边界含等号)
+    t = tier_of(_rec(np_yoy=-40.0, dedt_yoy=-40.0))
+    assert t["grade"] == "⛔"
+    assert any("双降" in r for r in t["reasons"])
+
+
+def test_double_decline_needs_both():
+    # 仅净利 -45% 而扣非同比缺失(None)→ 不判 ⛔(双降需两者俱在)。
+    # rev_yoy 也置 None 以隔离 🔴"增收不增利"路径(rev_yoy>0 才触发),
+    # 从而验证落点为 🟡 数据缺失降级而非 ⛔。
+    t = tier_of(_rec(np_yoy=-45.0, dedt_yoy=None, rev_yoy=None))
+    assert t["grade"] == "🟡"
+    assert t["needs_human"] is True
+    assert any("数据缺失" in r for r in t["reasons"])
+
+
+def test_mine_beats_yellow():
+    # ST(⛔)+ 经营现金流<0(🟡 候选)→ ⛔ 优先,严格 ⛔>🟡
+    t = tier_of(_rec(is_st=True, ocf=-2.0))
+    assert t["grade"] == "⛔"
+    assert any("ST" in r for r in t["reasons"])
 
 
 def test_tier_yellow_fallback_describes_failure():
@@ -124,6 +187,17 @@ def test_tier_yellow_fallback_describes_failure():
     assert t["grade"] == "🟡"
     assert t["needs_human"] is True
     assert any("净利未增" in r for r in t["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# [A6] missing-data 降级参数化(characterization:缺任一 🟢 必需输入 → 🟡 + needs_human)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("field", ["np_yoy", "rev_yoy", "ocf"])
+def test_tier_missing_required_input_downgrades(field):
+    t = tier_of(_rec(**{field: None}))
+    assert t["grade"] == "🟡"
+    assert t["needs_human"] is True
+    assert any("数据缺失" in r for r in t["reasons"])
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +227,47 @@ def test_diff_records_tier_and_flags_and_field():
     assert any(c["path"] == "fundamental.np_yoy" for c in d["field_changes"])
 
 
+def test_diff_records_non_numeric_string_value_no_raise():
+    # [A4] 回读的历史/外部 cards JSON 在 DIFF_FIELDS 塞了非数值字符串("N/A")
+    # 不得抛 ValueError;转不出 float 的按"变化"记入 field_changes
+    old = {
+        "ts_code": "601138.SH",
+        "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": "N/A", "dedt_yoy": 15.0},
+        "valuation": {"pe_ttm": 30.0},
+        "flags": [],
+    }
+    new = {
+        "ts_code": "601138.SH",
+        "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": 20.0, "dedt_yoy": 15.0},
+        "valuation": {"pe_ttm": 30.0},
+        "flags": [],
+    }
+    d = diff_records(old, new)  # 不抛
+    # np_yoy: "N/A"->20.0 算变化;dedt_yoy/pe_ttm 不变
+    paths = {c["path"] for c in d["field_changes"]}
+    assert "fundamental.np_yoy" in paths
+    assert "fundamental.dedt_yoy" not in paths
+    assert "valuation.pe_ttm" not in paths
+
+
+def test_diff_records_both_non_numeric_equal_string_no_change():
+    # [A4] 两侧同为非数值字符串("N/A"=="N/A")→ 转不出 float,但相等,不应记为变化
+    old = {
+        "ts_code": "X", "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": "N/A", "dedt_yoy": 15.0},
+        "valuation": {"pe_ttm": 30.0}, "flags": [],
+    }
+    new = {
+        "ts_code": "X", "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": "N/A", "dedt_yoy": 15.0},
+        "valuation": {"pe_ttm": 30.0}, "flags": [],
+    }
+    d = diff_records(old, new)
+    assert all(c["path"] != "fundamental.np_yoy" for c in d["field_changes"])
+
+
 def test_diff_records_no_change():
     rec = {
         "ts_code": "X",
@@ -167,6 +282,41 @@ def test_diff_records_no_change():
     assert d["entry_change"] is None
     assert d["new_flags"] == []
     assert d["dropped_flags"] == []
+
+
+def test_diff_dropped_flags():
+    # [A7] 旧有旗、新无旗 → dropped_flags 非空(且 new_flags 空)
+    old = {
+        "ts_code": "X", "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": 20.0}, "valuation": {"pe_ttm": 30.0},
+        "flags": [{"type": "质押", "severity": "警示"}],
+    }
+    new = {
+        "ts_code": "X", "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": 20.0}, "valuation": {"pe_ttm": 30.0},
+        "flags": [],
+    }
+    d = diff_records(old, new)
+    assert "质押" in d["dropped_flags"]
+    assert d["new_flags"] == []
+
+
+def test_diff_field_none_transition():
+    # [A7] 字段 None↔有值 记入 field_changes(任一为 None 即变化,不抛)
+    old = {
+        "ts_code": "X", "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": None, "dedt_yoy": 15.0},
+        "valuation": {"pe_ttm": 30.0}, "flags": [],
+    }
+    new = {
+        "ts_code": "X", "tier": {"grade": "🟢"}, "entry": {"grade": "A"},
+        "fundamental": {"np_yoy": 20.0, "dedt_yoy": None},
+        "valuation": {"pe_ttm": 30.0}, "flags": [],
+    }
+    d = diff_records(old, new)
+    paths = {c["path"]: (c["old"], c["new"]) for c in d["field_changes"]}
+    assert paths["fundamental.np_yoy"] == (None, 20.0)
+    assert paths["fundamental.dedt_yoy"] == (15.0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +345,23 @@ def test_merge_factcheck_does_not_overwrite_interface_numbers():
     assert out["factcheck"]["q1_net_profit_yi"] == 3.2
     # 不就地改原对象
     assert record["factcheck"] is None
+
+
+def test_merge_factcheck_none_resets():
+    # [A7] fc=None 把旧 factcheck 重置为 None;不就地改原对象;不动 tier
+    record = {
+        "ts_code": "601138.SH",
+        "fundamental": {"np_yi": 5.0},
+        "tier": {"grade": "🟢"},
+        "factcheck": {"confirmed": True, "q1_net_profit_yi": 3.2},
+    }
+    out = merge_factcheck(record, None)
+    assert out["factcheck"] is None
+    # tier 不被触碰
+    assert out["tier"] == {"grade": "🟢"}
+    # 不 mutate 原对象
+    assert record["factcheck"] == {"confirmed": True, "q1_net_profit_yi": 3.2}
+    assert out is not record
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +455,12 @@ def test_build_record_assembles_and_reuses_lit_factors():
     assert "valuation.pe_ttm" in rec["meta"]
     assert rec["meta"]["valuation.pe_ttm"]["source"]
     assert "quality.net_cash_ratio" in rec["meta"]
+    # [A2] technical.vol_ratio 是被渲染的数值叶子(render_md "量比"),口径标注不得漏
+    assert "technical.vol_ratio" in rec["meta"]
+    vr_meta = rec["meta"]["technical.vol_ratio"]
+    assert vr_meta["unit"]
+    assert vr_meta["as_of"]
+    assert vr_meta["source"]
 
 
 # ---------------------------------------------------------------------------

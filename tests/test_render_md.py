@@ -301,3 +301,24 @@ def test_html_in_text_is_escaped_no_injection() -> None:
     # 渲染器自身的结构性 HTML 标签仍在(没把合法标签也误转义)
     assert "<details>" in out
     assert "<summary>" in out
+
+
+# ---------------------------------------------------------------------------
+# B1 correctness:现金质量小表表头年份须从 quality.* meta as_of 动态派生,
+# 不得硬编码"2025年报"(否则 lit_factors.ANNUAL 滚年后表头撒谎,口径与底层数据期不符)
+# ---------------------------------------------------------------------------
+def test_cash_quality_header_year_derived_from_meta_not_hardcoded() -> None:
+    rec = _rec("601138.SH", "工业富联", "🟢")
+    rec["meta"] = _meta("20260618", cash="20261231")  # 现金质量数据期=2026年报
+    out = render_md([rec])
+    # 表头年份须跟随底层数据期(2026),不得硬编码 2025
+    assert "现金质量（@2026年报）" in out
+    assert "现金质量（@2025年报）" not in out
+
+
+def test_cash_quality_header_falls_back_when_meta_missing() -> None:
+    rec = _rec("601138.SH", "工业富联", "🟢")
+    rec["meta"] = {}  # 无 quality.* meta -> 回退"年报"(不硬编码年份)
+    out = render_md([rec])
+    assert "现金质量（@年报）" in out
+    assert "2025" not in out.split("现金质量")[1].split("\n")[0]

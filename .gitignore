@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 *.egg-info/
 .pytest_cache/
+.coverage
 
 # Secrets — never commit the Tushare token / endpoint
 .env.local

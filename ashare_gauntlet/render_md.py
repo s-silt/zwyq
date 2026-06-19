@@ -130,6 +130,23 @@ def _kv_table(title: str, pairs: list[tuple[str, str]]) -> list[str]:
     return out
 
 
+def _cash_period(rec: dict[str, Any]) -> str:
+    """现金质量数据期(年报年份),从 rec 的 quality.* meta as_of 前4位派生。
+
+    与基本面表头(从 fund.end_date 动态拼)、_footnote(从 quality.* meta 汇总
+    cash_dates)同源,避免硬编码年份在 lit_factors.ANNUAL 滚年后与底层数据期不符。
+    无 quality.* meta as_of 时回退 "年报"(不伪造年份)。
+    """
+    meta = rec.get("meta") or {}
+    for path, info in meta.items():
+        if not isinstance(info, dict) or not path.startswith("quality."):
+            continue
+        as_of_v = info.get("as_of")
+        if isinstance(as_of_v, str) and len(as_of_v) >= 4:
+            return f"{as_of_v[:4]}年报"
+    return "年报"
+
+
 def _detail_section(rec: dict[str, Any]) -> list[str]:
     """② 单只 <details> 折叠节。"""
     tier = rec.get("tier") or {}
@@ -197,7 +214,7 @@ def _detail_section(rec: dict[str, Any]) -> list[str]:
         ],
     )
     out += _kv_table(
-        "现金质量（@2025年报）",
+        f"现金质量（@{_cash_period(rec)}）",
         [
             ("经营现金流", _fmt(qual.get("op_cashflow_yi"), suffix=" 亿")),
             ("净现比", _fmt(qual.get("net_cash_ratio"), suffix=" 倍")),

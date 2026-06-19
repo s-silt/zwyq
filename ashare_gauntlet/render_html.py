@@ -80,9 +80,10 @@ def _num(rec: dict[str, Any], dotted: str) -> Optional[float]:
     if cur is None or isinstance(cur, bool):
         return None
     try:
-        return float(cur)
+        f = float(cur)
     except (TypeError, ValueError):
         return None
+    return None if f != f else f  # NaN -> None(与 record._num 口径一致,防 NaN 混入排序/分桶)
 
 
 def _fmt(v: Optional[float], digits: int = 2, suffix: str = "", *, plus: bool = False) -> str:
@@ -202,7 +203,8 @@ def _summary(records: list[dict[str, Any]]) -> str:
     mv_na = 0
     for r in records:
         mv = _num(r, "valuation.mv_yi")
-        if mv is None:
+        # 负 mv 为异常(总市值实务非负、不可达);计入 mv_na 而非误导性归入小盘桶
+        if mv is None or mv < 0:
             mv_na += 1
             continue
         for i, (hi, _lab) in enumerate(_MV_BUCKETS):
@@ -314,6 +316,41 @@ def _spark_multiples(rec: dict[str, Any]) -> str:
     )
 
 
+def _flag_cell(flags: list[Any], nflags: int) -> str:
+    """概览表旗标列:中性 _FLAG_ICON 按 type(不用随计数放大的红旗 🚩×N);
+    title 枚举每条旗的 type·fact·date(severity),与 SVG/MD 口径一致,
+    色盲/读屏不展开行也能拿到事件文字。"""
+    valid = [fl for fl in flags if isinstance(fl, dict)]
+    if not valid:
+        return (
+            f'<td class="flags" data-v="{nflags}" title="无中性提示旗">·</td>'
+        )
+
+    # 按出现顺序聚合同 type 计数,渲染中性 type 图标(同 type 多条用 ×N)
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    title_lines: list[str] = []
+    for fl in valid:
+        ftype = str(fl.get("type", ""))
+        if ftype not in counts:
+            counts[ftype] = 0
+            order.append(ftype)
+        counts[ftype] += 1
+        fact = str(fl.get("fact", ""))
+        date = str(fl.get("date", NA))
+        sev = str(fl.get("severity", "提示"))
+        title_lines.append(f"{ftype} · {fact} · {date}（{sev}）")
+
+    icons = "".join(
+        f"{_FLAG_ICON.get(t, '•')}{('×' + str(counts[t])) if counts[t] > 1 else ''}"
+        for t in order
+    )
+    title = "；".join(title_lines)
+    return (
+        f'<td class="flags" data-v="{nflags}" title="{_esc(title)}">{icons}</td>'
+    )
+
+
 def _row(rec: dict[str, Any], idx: int, cohort: list[dict[str, Any]], pcts: dict[str, list[float]]) -> str:
     tier = rec.get("tier") or {}
     grade = str(tier.get("grade", "")) or NA
@@ -355,17 +392,14 @@ def _row(rec: dict[str, Any], idx: int, cohort: list[dict[str, Any]], pcts: dict
         + _bar_cell("资金", dims["资金"], f"净现比 {_fmt(_num(rec,'quality.net_cash_ratio'),2,'倍')}")
     )
     spark_cell = f'<td class="spark" data-v="{_esc(name)}">{_spark_multiples(rec)}</td>'
-    flag_cell = (
-        f'<td class="flags" data-v="{nflags}" title="中性提示旗（非买卖信号）">'
-        f'{("🚩×" + str(nflags)) if nflags else "·"}</td>'
-    )
+    flag_cell = _flag_cell(flags, nflags)
     trend_cell = f'<td class="trend" data-v="{_esc(trend)}">{_esc(trend)}</td>'
 
-    # 钻取详情行:内联 B 的单股 SVG 卡(cohort=全量)
-    try:
-        svg = render_svg_card(rec, cohort=cohort)
-    except Exception as exc:  # noqa: BLE001 — 不吞:把渲染失败显式标到 UI,便于定位坏 record
-        svg = f'<p class="err">单股卡渲染失败:{_esc(type(exc).__name__)}: {_esc(exc)}</p>'
+    # 钻取详情行:内联 B 的单股 SVG 卡(cohort=全量)。
+    # render_svg_card 契约为"永不抛"(缺失只降级占位),故真到这里的只有编程错误
+    # (KeyError/TypeError 等);按铁律"真错误向上抛、不 swallow",不再兜底吞成红字,
+    # 让异常向上传播,由调用方(scripts/dashboard.py)决定是否容错。
+    svg = render_svg_card(rec, cohort=cohort)
     detail = (
         f'<tr class="detail" id="d{idx}" hidden><td colspan="{len(_COLS)}">'
         f'<div class="card">{svg}</div></td></tr>'
@@ -456,7 +490,6 @@ td.flags{text-align:center}
 tr.detail>td{background:#fbfbfd;padding:10px}
 .card{display:flex;justify-content:center}
 .card svg{max-width:100%;height:auto}
-.err{color:#b23b3b}
 footer{color:var(--mute);font-size:12px;margin-top:14px;line-height:1.6}
 """
 

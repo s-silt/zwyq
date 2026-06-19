@@ -135,8 +135,12 @@ def tier_of(rec: dict[str, Any]) -> dict[str, Any]:
     # 🟡 盈利但瑕疵
     yellow: list[str] = []
     needs_human = False
+    if np_yi is not None and np_yi > 0 and dedt_yi is None:
+        # 净利为正但扣非绝对值缺失:无法核扣非真实正负(背离),不得凭 dedt_yoy 直达 🟢
+        yellow.append("扣非绝对值缺失·无法核扣非背离")
+        needs_human = True
     if ocf is not None and ocf < 0:
-        yellow.append("盈利但经营现金流<0(年报)")
+        yellow.append("经营现金流<0(年报)" if profitable is not True else "盈利但经营现金流<0(年报)")
     if np_yoy is not None and rev_yoy is not None and np_yoy > LOW_BASE_NP and rev_yoy < LOW_BASE_REV:
         yellow.append(f"疑低基数(净利+{np_yoy:.0f}% 营收+{rev_yoy:.0f}%)")
         needs_human = True
@@ -330,6 +334,7 @@ def build_record(
     _m("technical.pct20", technical["pct20"], "百分位", as_of, "全市场20日收益排名")
     _m("technical.rsi", technical["rsi"], "0-100", as_of, "RSI14(前复权)")
     _m("technical.ret20", technical["ret20"], "%", as_of, "近20日收益(前复权)")
+    _m("technical.vol_ratio", technical["vol_ratio"], "倍", as_of, "量/20日均量(前复权)")
     _m("valuation.pe_ttm", pe, "倍", as_of, "daily_basic接口")
     _m("valuation.pb", pb, "倍", as_of, "daily_basic接口")
     _m("valuation.peg", valuation["peg"], "倍", as_of, "PE_TTM/净利同比增速")
@@ -390,7 +395,14 @@ def diff_records(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
         ov, nv = _get(old, path), _get(new, path)
         if ov is None and nv is None:
             continue
-        if ov is None or nv is None or abs(float(ov) - float(nv)) > 1e-6:
+        # 回读的历史/外部 cards JSON 可能塞了非数值字符串(如 "N/A"):用 _num 各转 float|None,
+        # 不抛 ValueError。两侧都能转成 float -> 比数值;否则(任一转不出)按原值是否相等判变化。
+        fo, fn = _num(ov), _num(nv)
+        if fo is not None and fn is not None:
+            changed = abs(fo - fn) > 1e-6
+        else:
+            changed = ov != nv
+        if changed:
             field_changes.append({"path": path, "old": ov, "new": nv})
 
     old_ft = {fl.get("type") for fl in (old.get("flags") or []) if fl.get("type")}

@@ -199,10 +199,28 @@ def test_portfolio_summary_mv_buckets():
 def test_portfolio_summary_tier_distribution():
     html = render_dashboard(_mixed_cohort())
     # tier 分布:四档计数。mixed 中 🟢2 🟡1 🔴1 ⛔1
-    assert "2" in html  # 🟢 计数
-    # 分布须以离散档呈现
-    for g in ("🟢", "🟡", "🔴", "⛔"):
-        assert g in html
+    # 强化:断言具体 chip 片段(🟢 强干净 <b>2</b>),而非 "2" in html(几乎恒真,捕不到计数错)
+    assert "🟢 强干净 <b>2</b>" in html
+    assert "🟡 盈利瑕疵 <b>1</b>" in html
+    assert "🔴 题材背离 <b>1</b>" in html
+    assert "⛔ 地雷出局 <b>1</b>" in html
+
+
+def test_portfolio_summary_mv_bucket_counts_specific():
+    """市值桶计数须落到具体 <b>N</b> 片段(mixed:4 只 mv_yi=15494.2 → 大盘桶,1 只缺失)。"""
+    html = render_dashboard(_mixed_cohort())
+    # 4 只大市值入 ≥3000亿(大盘)桶
+    assert "≥3000亿(大盘) <b>4</b>" in html
+    # 1 只全缺失 → 市值缺失计 1
+    assert "市值缺失 <b>1</b>" in html
+
+
+def test_portfolio_summary_budget_per_stock_amount_when_green_a():
+    """有 🟢×entryA 时,预算 chip 须给出单只金额字符串(等权占满)。"""
+    html = render_dashboard(_mixed_cohort())
+    # mixed 中 🟢×A 共 2 只(两只 grade=🟢 entry=A),60000/2=30000
+    assert "30,000 元" in html
+    assert "2 只" in html
 
 
 def test_portfolio_summary_budget_reference_marked_not_advice():
@@ -268,6 +286,107 @@ def test_xss_safety_name_is_escaped():
 # ---------------------------------------------------------------------------
 # 真实底座:全部 41 行 + None 占位 + 离散档
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# C4:render_svg_card 契约"永不抛";真到这里的是编程错误,须向上抛、不吞成红字
+# ---------------------------------------------------------------------------
+def test_svg_card_real_error_propagates_not_swallowed(monkeypatch):
+    """坏 record 触发 render_svg_card 内部异常(编程错误)应向上抛,而非被吞成 <p class=err>。"""
+    import ashare_gauntlet.render_html as rh
+
+    def _boom(rec, cohort=None):
+        raise KeyError("missing_key")
+
+    monkeypatch.setattr(rh, "render_svg_card", _boom)
+    with pytest.raises(KeyError):
+        rh.render_dashboard(_mixed_cohort())
+
+
+def test_no_err_swallow_string_in_normal_render():
+    """正常 record 渲染不应出现兜底吞异常的红字片段(该兜底已移除)。"""
+    html = render_dashboard(_mixed_cohort())
+    assert "单股卡渲染失败" not in html
+
+
+# ---------------------------------------------------------------------------
+# C5/C6:概览表旗标列——per-flag type·fact·date(severity) 进 title;
+#         中性 _FLAG_ICON 按 type,不用随计数放大的红旗 🚩×N
+# ---------------------------------------------------------------------------
+def _flag_cell_html(html: str, ts_code: str) -> str:
+    """抽出某只行内的旗标 <td class="flags" ...> 单元格。"""
+    # 行以 aria-label 含 ts_code 标识;简单起见从含该 code 的位置向后找 flags td
+    i = html.index(ts_code)
+    seg = html[i:]
+    j = seg.index('<td class="flags"')
+    end = seg.index("</td>", j)
+    return seg[j:end]
+
+
+def test_flag_cell_title_enumerates_per_flag_fact_type_date():
+    rec = _rec(
+        ts_code="600519.SH", name="贵州茅台", industry="白酒",
+        flags=[
+            {"type": "减持", "severity": "提示", "fact": "近一年减持2笔", "date": "20251223"},
+            {"type": "解禁", "severity": "警示", "fact": "首发解禁8.2%", "date": "20260701"},
+        ],
+    )
+    html = render_dashboard([rec])
+    cell = _flag_cell_html(html, "600519.SH")
+    # title 须含每条旗的 type·fact·date(severity),色盲/读屏不展开行也能拿到事件文字
+    assert "减持" in cell
+    assert "近一年减持2笔" in cell
+    assert "20251223" in cell
+    assert "解禁" in cell
+    assert "首发解禁8.2%" in cell
+    assert "警示" in cell
+
+
+def test_flag_cell_uses_neutral_type_icon_not_red_flag_count():
+    """单一类型旗标行渲染该 type 的中性 _FLAG_ICON,而非 🚩×N(红旗随量放大)。"""
+    from ashare_gauntlet.render_html import _FLAG_ICON
+
+    rec = _rec(
+        ts_code="600519.SH", name="贵州茅台", industry="白酒",
+        flags=[
+            {"type": "减持", "severity": "提示", "fact": "减持A", "date": "20251223"},
+            {"type": "减持", "severity": "提示", "fact": "减持B", "date": "20251224"},
+        ],
+    )
+    html = render_dashboard([rec])
+    cell = _flag_cell_html(html, "600519.SH")
+    assert _FLAG_ICON["减持"] in cell           # 📉 中性 type 图标
+    assert "🚩" not in cell                       # 不用红旗随计数放大
+
+
+def test_no_flags_row_has_no_red_flag_icon():
+    rec = _rec(ts_code="600000.SH", name="无旗", industry="银行", flags=[])
+    html = render_dashboard([rec])
+    cell = _flag_cell_html(html, "600000.SH")
+    assert "🚩" not in cell
+
+
+# ---------------------------------------------------------------------------
+# C7:负市值(异常,实务不可达)计入 mv_na 而非小盘桶,避免误导
+# ---------------------------------------------------------------------------
+def test_negative_market_cap_not_counted_as_small_cap():
+    recs = [
+        _rec(ts_code="000004.SZ", name="负市值", industry="测试", mv_yi=-5.0),
+        _rec(ts_code="000005.SZ", name="正常小盘", industry="测试", mv_yi=50.0),
+    ]
+    html = render_dashboard(recs)
+    # 负 mv 不入小盘桶:小盘桶应只计 1(那只 50 亿),不是 2
+    assert "<100亿(小盘) <b>1</b>" in html
+    # 负 mv 计入市值缺失/异常
+    assert "市值缺失 <b>1</b>" in html
+
+
+def test_num_rejects_nan():
+    """_num 须把 NaN 视作缺失(None),与 record._num 口径一致,防 NaN 混入排序/分桶。"""
+    from ashare_gauntlet.render_html import _num
+
+    assert _num({"valuation": {"mv_yi": float("nan")}}, "valuation.mv_yi") is None
+    assert _num({"valuation": {"mv_yi": 12.5}}, "valuation.mv_yi") == 12.5
+
+
 @pytest.mark.skipif(not os.path.exists(CARDS), reason="无真实底座")
 def test_real_cards_all_41_rows_present():
     with open(CARDS, encoding="utf-8") as fh:

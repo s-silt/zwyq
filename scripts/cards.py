@@ -3,7 +3,8 @@
 
 纯函数在 ashare_gauntlet/record.py;此处只做 IO/编排/打印,贴合 screen.py/fundamentals.py 既有 pattern。
 
-Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/cards.py [--limit N]
+Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.cards [--limit N] [--no-render]
+默认数据生成后一键渲染面板+决策台到 data/panels/;--no-render 只出数据。
 """
 import glob
 import json
@@ -17,9 +18,12 @@ from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import market_returns
 from ashare_gauntlet.record import build_record, diff_records, merge_factcheck
+from ashare_gauntlet.render_html import render_dashboard
+from ashare_gauntlet.render_md import render_md
 
 CACHE = "data/cache"
 CARDS_DIR = "data/cards"
+PANELS_DIR = "data/panels"
 WATCHLIST = "data/watchlist.json"
 SYMBOL_TABLES = (
     "income", "fina_indicator", "balancesheet", "cashflow", "share_float",
@@ -56,7 +60,19 @@ def _prev_cards(as_of: str) -> dict[str, Any] | None:
     return {r["ts_code"]: r for r in data}
 
 
-def main(limit: int | None = None) -> None:
+def render_outputs(records: list[dict[str, Any]], as_of: str, panels_dir: str = PANELS_DIR) -> dict[str, str]:
+    """从内存 records 直出 markdown 诚实面板 + HTML 决策台(一键出图,复用 A/C 渲染器)。"""
+    os.makedirs(panels_dir, exist_ok=True)
+    md_path = f"{panels_dir}/{as_of}.md"
+    html_path = f"{panels_dir}/dashboard_{as_of}.html"
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write(render_md(records))
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(render_dashboard(records))
+    return {"md": md_path, "html": html_path}
+
+
+def main(limit: int | None = None, render: bool = True) -> None:
     _load_env_local()
     daily, adj = _load("daily"), _load("adj_factor")
     if daily.empty:
@@ -111,6 +127,10 @@ def main(limit: int | None = None) -> None:
         json.dump(records, fh, ensure_ascii=False, indent=2)
     print(f"落库 {out_path}({len(records)} 只)")
 
+    if render:
+        out = render_outputs(records, as_of)
+        print(f"渲染 {out['md']} + {out['html']}")
+
     prev = _prev_cards(as_of)
     if prev:
         print("\n== 跨日变化 ==")
@@ -128,4 +148,4 @@ if __name__ == "__main__":
     lim: int | None = None
     if "--limit" in argv:
         lim = int(argv[argv.index("--limit") + 1])
-    main(lim)
+    main(lim, render="--no-render" not in argv)

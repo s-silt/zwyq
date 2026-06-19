@@ -107,6 +107,10 @@ def _pledge_pct(record: dict[str, Any]) -> Optional[float]:
     """从 flags 解析控股股东体系质押百分比(中性事实,仅用于风险轴归一化)。"""
     for fl in record.get("flags", []) or []:
         if isinstance(fl, dict) and fl.get("type") == "质押":
+            # 优先结构化数值(record._build_flags 已带 value);缺则回退解析展示串
+            v = fl.get("value")
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return float(v)
             fact = str(fl.get("fact", ""))
             # 形如 "控股股东体系质押12.9%"
             digits = ""

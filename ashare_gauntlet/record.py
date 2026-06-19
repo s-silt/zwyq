@@ -110,6 +110,8 @@ def tier_of(rec: dict[str, Any]) -> dict[str, Any]:
         mine.append("亏损")
     if np_yoy is not None and dedt_yoy is not None and np_yoy <= DECLINE_SEVERE and dedt_yoy <= DECLINE_SEVERE:
         mine.append(f"净利&扣非双降≤{DECLINE_SEVERE:.0f}%")
+    if na is not None and na <= 0:
+        mine.append("资不抵债(净资产≤0)")
     if gw is not None and na is not None and na > 0 and gw / na * 100 > GOODWILL_WARN:
         mine.append(f"商誉占净资产>{GOODWILL_WARN:.0f}%")
     if mine:
@@ -179,6 +181,7 @@ def _build_flags(fund_tables: dict[str, pd.DataFrame], as_of: str, q_end: str) -
             "type": "质押",
             "severity": "警示" if pr >= PLEDGE_WARN else "提示",
             "fact": f"控股股东体系质押{pr:.1f}%",
+            "value": pr,  # 结构化数值:渲染器读这个,勿反解析 fact 字符串
             "date": as_of,
             "source": "pledge_stat接口",
         })

@@ -193,7 +193,8 @@ def test_needs_human_surfaced(sample: list[dict[str, Any]]) -> None:
 
 def test_tier_reasons_surfaced(sample: list[dict[str, Any]]) -> None:
     out = render_md(sample)
-    assert "净利&扣非&营收三增" in out  # 🟢 reason
+    # reason 里的 & / > 会被 HTML 转义(防注入),断言不含特殊字符的子串即可证明其浮现
+    assert "营收三增" in out  # 🟢 reason("净利&扣非&营收三增…")
     assert "增收不增利" in out  # 🔴 reason
 
 
@@ -223,3 +224,80 @@ def test_no_naked_decimal_score_as_conclusion(sample: list[dict[str, Any]]) -> N
 def test_empty_records_returns_str() -> None:
     out = render_md([])
     assert isinstance(out, str)
+
+
+# ---------------------------------------------------------------------------
+# review follow-up #2:文本含 `|` / 换行不得破坏 Markdown 表格 / 行结构
+# ---------------------------------------------------------------------------
+def test_pipe_in_name_does_not_break_overview_table_columns() -> None:
+    base = _rec("601138.SH", "工业富联", "🟢")
+    evil = _rec(
+        "000001.SZ",
+        "恶意|名称",  # 裸竖线会撑乱表格列
+        "🟡",
+        flags=[{"type": "解禁", "severity": "提示", "fact": "解禁|占流通4.7%",
+                "date": "20260710", "source": "x"}],
+    )
+    out = render_md([base, evil])
+    # 只取概览表(输出里第一段连续的 `|` 行),不混入详情区的小表
+    table_rows: list[str] = []
+    for ln in out.splitlines():
+        if ln.startswith("|"):
+            table_rows.append(ln)
+        elif table_rows:
+            break
+    assert len(table_rows) >= 4  # 表头 + 分隔 + 2 只数据行
+
+    def _delims(row: str) -> int:  # 只数未转义的 `|`(列分隔符),`\|` 是字面竖线
+        return row.count("|") - row.count("\\|")
+
+    header_delims = _delims(table_rows[0])
+    for row in table_rows[2:]:  # 数据行列数须与表头一致
+        assert _delims(row) == header_delims, f"列错位: {row!r}"
+    # 名称里的裸 `|` 应被转义为 `\|`
+    assert r"恶意\|名称" in out
+
+
+def test_newline_in_factcheck_text_stays_single_line() -> None:
+    rec = _rec(
+        "000063.SZ",
+        "中兴通讯",
+        "🔴",
+        factcheck={
+            "confirmed": True,
+            "q1_net_profit_yi": 9.13,
+            "disputes": ["争议\n第二行注入"],  # 裸换行会劈出新行
+            "news": [],
+            "verified_at": "20260618",
+        },
+    )
+    out = render_md([rec])
+    assert "争议\n第二行注入" not in out  # 换行不得原样保留
+    assert "第二行注入" in out  # 内容仍在(被并到同一行)
+
+
+def test_html_in_text_is_escaped_no_injection() -> None:
+    # render_md 内嵌 <details>/<summary>,markdown→HTML 会透传 raw HTML;
+    # name/reasons/factcheck(部分来自 web 核实)含 HTML 必须转义,防 stored-XSS
+    rec = _rec(
+        "601138.SH",
+        "工业富联<script>alert(1)</script>",
+        "🔴",
+        reasons=["<b>raw</b>理由"],
+        factcheck={
+            "confirmed": True,
+            "q1_net_profit_yi": 1.0,
+            "disputes": ["</summary><script>evil()</script>"],
+            "news": ["<img src=x onerror=alert(1)>"],
+            "verified_at": "20260618",
+        },
+    )
+    out = render_md([rec])
+    # 注入载荷不得原样出现(必须被转义)
+    assert "<script>" not in out
+    assert "<img src=x onerror=alert(1)>" not in out
+    # 转义形式应出现
+    assert "&lt;script&gt;" in out
+    # 渲染器自身的结构性 HTML 标签仍在(没把合法标签也误转义)
+    assert "<details>" in out
+    assert "<summary>" in out

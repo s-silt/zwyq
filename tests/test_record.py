@@ -288,3 +288,39 @@ def test_build_record_assembles_and_reuses_lit_factors():
     assert "valuation.pe_ttm" in rec["meta"]
     assert rec["meta"]["valuation.pe_ttm"]["source"]
     assert "quality.net_cash_ratio" in rec["meta"]
+
+
+# ---------------------------------------------------------------------------
+# review follow-up #1:负净资产(资不抵债)→ ⛔(不被 na>0 守卫跳过)
+# ---------------------------------------------------------------------------
+def test_tier_mine_negative_net_assets():
+    # 净资产≤0(资不抵债)比"商誉占净资产>50%"更该出局;原 na>0 守卫会把它漏掉
+    t = tier_of(_rec(net_assets=-3.0, goodwill=1.0))
+    assert t["grade"] == "⛔"
+    assert any("资不抵债" in r or "净资产" in r for r in t["reasons"])
+
+
+def test_tier_missing_net_assets_not_fabricated_mine():
+    # 净资产缺失(None)不得伪造资不抵债;其余指标正常 → 不应判 ⛔
+    t = tier_of(_rec(net_assets=None, goodwill=None))
+    assert t["grade"] != "⛔"
+
+
+# ---------------------------------------------------------------------------
+# review follow-up #3:质押旗标带结构化数值 value(renderer 不再反解析字符串)
+# ---------------------------------------------------------------------------
+def test_build_flags_pledge_carries_structured_value():
+    from ashare_gauntlet.record import _build_flags
+
+    empty = pd.DataFrame()
+    fund_tables = {
+        "pledge_stat": pd.DataFrame([{"end_date": "20260331", "pledge_ratio": 60.0}]),
+        "share_float": empty,
+        "stk_holdertrade": empty,
+        "forecast": empty,
+        "express": empty,
+    }
+    flags = _build_flags(fund_tables, "20260618", "20260331")
+    pledge = next(f for f in flags if f["type"] == "质押")
+    assert pledge["severity"] == "警示"  # 60% >= 50 阈值
+    assert pledge["value"] == pytest.approx(60.0)

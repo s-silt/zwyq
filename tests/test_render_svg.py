@@ -266,3 +266,20 @@ def test_real_cards_no_raw_attribute_injection_breaks_svg():
     parser.Parse(svg, True)  # well-formed 即不抛 ExpatError
     # 不得有未转义裸 & (除实体)
     assert not re.search(r"&(?!amp;|lt;|gt;|quot;|apos;|#)", svg)
+
+
+# ---------------------------------------------------------------------------
+# review follow-up #3:风险轴优先读结构化 value,不再反解析展示字符串
+# ---------------------------------------------------------------------------
+def test_pledge_pct_prefers_structured_value_over_parsing_fact():
+    from ashare_gauntlet.render_svg import _pledge_pct
+
+    rec = {"flags": [{"type": "质押", "value": 42.0, "fact": "无数字的纯文字描述"}]}
+    assert _pledge_pct(rec) == pytest.approx(42.0)
+
+
+def test_pledge_pct_falls_back_to_fact_when_value_absent():
+    from ashare_gauntlet.render_svg import _pledge_pct
+
+    rec = {"flags": [{"type": "质押", "fact": "控股股东体系质押12.9%"}]}
+    assert _pledge_pct(rec) == pytest.approx(12.9)

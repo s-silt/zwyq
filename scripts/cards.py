@@ -3,8 +3,9 @@
 
 纯函数在 ashare_gauntlet/record.py;此处只做 IO/编排/打印,贴合 screen.py/fundamentals.py 既有 pattern。
 
-Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.cards [--limit N] [--no-render]
-默认数据生成后一键渲染面板+决策台到 data/panels/;--no-render 只出数据。
+Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.cards [--limit N]
+只产出数据层 data/cards/<as_of>.json;面板/决策台/单股卡分别由
+scripts.panel / scripts.dashboard / scripts.card_svg 读最新 cards 渲染。
 """
 import glob
 import json

@@ -18,6 +18,7 @@ score 当结论;每个数值就近标注口径/时点/来源。② 资金/事件
 
 from __future__ import annotations
 
+import html as _html
 from typing import Any
 
 # tier 档:emoji -> (展示顺序权重小=靠前, 文字档名)。色盲安全:emoji 已含图标,补文字。
@@ -33,6 +34,22 @@ _TIER_LABEL: dict[str, str] = {
 _BLOCKS: str = "▁▂▃▄▅▆▇█"
 
 _NA: str = "—"
+
+
+def _md(s: object) -> str:
+    """文本进 markup 前转义:① HTML 实体(< > &,本面板内嵌 <details> 会透传 raw HTML,
+    防 stored-XSS);② Markdown 结构字符 `|`(表格列分隔)转义、换行折成空格。
+
+    用于一切非受控自由文本(股票名/行业/趋势/tier 理由/旗标 fact/factcheck 文本)。
+    数值经 _fmt 已是受控字符串,无需经此。
+    """
+    return (
+        _html.escape(str(s), quote=False)
+        .replace("\\", "\\\\")  # 先转义反斜杠,避免与下面的 `\|` 混淆
+        .replace("|", "\\|")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
 
 
 def _fmt(value: Any, *, suffix: str = "", decimals: int = 2, pct_sign: bool = False) -> str:
@@ -56,7 +73,7 @@ def _spark(pct: Any) -> str:
 
 
 def _name_code(rec: dict[str, Any]) -> str:
-    return f"{rec.get('name', '?')}({rec.get('ts_code', '?')})"
+    return f"{_md(rec.get('name', '?'))}({_md(rec.get('ts_code', '?'))})"
 
 
 def _sorted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -96,7 +113,7 @@ def _overview_table(records: list[dict[str, Any]]) -> list[str]:
         pe = _fmt(val.get("pe_ttm"), decimals=1)
         peg = _fmt(val.get("peg"), decimals=2)
         flag_cell = str(len(flags)) if flags else "·"
-        trend = tech.get("trend") or _NA
+        trend = _md(tech.get("trend") or _NA)
 
         rows.append(
             f"| {label}{human} | {_name_code(rec)} | {entry.get('grade', _NA)} "
@@ -131,7 +148,7 @@ def _detail_section(rec: dict[str, Any]) -> list[str]:
     # 质地档理由 + 需人工复核
     reasons = tier.get("reasons") or []
     if reasons:
-        out.append("质地理由:" + "；".join(str(r) for r in reasons))
+        out.append("质地理由:" + "；".join(_md(r) for r in reasons))
     out.append(
         "人工复核:需要(needs_human)" if tier.get("needs_human") else "人工复核:免(规则可判)"
     )
@@ -153,7 +170,7 @@ def _detail_section(rec: dict[str, Any]) -> list[str]:
             ("近20分位", f"{_spark(tech.get('pct20'))} {_fmt(tech.get('pct20'), decimals=1)}"),
             ("RSI14", _fmt(tech.get("rsi"), decimals=1)),
             ("量比", _fmt(tech.get("vol_ratio"))),
-            ("趋势", str(tech.get("trend") or _NA)),
+            ("趋势", _md(tech.get("trend") or _NA)),
         ],
     )
     out += _kv_table(
@@ -204,11 +221,11 @@ def _detail_section(rec: dict[str, Any]) -> list[str]:
     out.append("")
     if flags:
         for f in flags:
-            ftype = f.get("type", "")
-            sev = f.get("severity", "提示")
-            fact = f.get("fact", "")
-            date = f.get("date", _NA)
-            src = f.get("source", "")
+            ftype = _md(f.get("type", ""))
+            sev = _md(f.get("severity", "提示"))
+            fact = _md(f.get("fact", ""))
+            date = _md(f.get("date", _NA))
+            src = _md(f.get("source", ""))
             out.append(f"- 🚩 [{sev}] {ftype}:{fact}（{date}{('，' + src) if src else ''}）")
     else:
         out.append(f"- {_NA} 无事件提示")
@@ -224,11 +241,11 @@ def _detail_section(rec: dict[str, Any]) -> list[str]:
         out.append(f"- 核实Q1归母净利:{_fmt(fc.get('q1_net_profit_yi'), suffix=' 亿')}（独立核实,与接口 income 并列）")
         disputes = fc.get("disputes") or []
         if disputes:
-            out.append("- 争议:" + "；".join(str(d) for d in disputes))
+            out.append("- 争议:" + "；".join(_md(d) for d in disputes))
         news = fc.get("news") or []
         if news:
-            out.append("- 消息:" + "；".join(str(n) for n in news))
-        out.append(f"- 核实时点:{fc.get('verified_at', _NA)}")
+            out.append("- 消息:" + "；".join(_md(n) for n in news))
+        out.append(f"- 核实时点:{_md(fc.get('verified_at', _NA))}")
         out.append("")
 
     out += ["</details>", ""]

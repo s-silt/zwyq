@@ -35,6 +35,7 @@ TIER_FILL: dict[str, str] = {
     "🔴": "#b23b3b",  # 暗红(中性,不刺眼)
     "⛔": "#6b6b6b",  # 灰(地雷=回避,非恐吓红)
 }
+TIER_NAME: dict[str, str] = {"🟢": "强干净", "🟡": "盈利瑕疵", "🔴": "题材背离", "⛔": "地雷出局"}
 GRAY: str = "#bdbdbd"  # 缺失/降级灰条
 INK: str = "#222222"
 MUTE: str = "#666666"
@@ -189,7 +190,8 @@ def _header(record: dict[str, Any]) -> str:
     tier = record.get("tier", {}) or {}
     grade = str(tier.get("grade", "")) or "⛔"
     reasons = tier.get("reasons") or []
-    words = str(reasons[0]) if reasons else "未定档"
+    tname = TIER_NAME.get(grade, "未定档")               # 短档名(由 grade 派生)进徽章,防长 reason 溢出
+    reason_full = " · ".join(str(r) for r in reasons) if reasons else "未定档"
     fill = TIER_FILL.get(grade, GRAY)
     entry = record.get("entry", {}) or {}
     eg = str(entry.get("grade", PLACEHOLDER))
@@ -203,8 +205,8 @@ def _header(record: dict[str, Any]) -> str:
         f'<g font-family="Segoe UI,Microsoft YaHei,sans-serif">'
         # tier 徽章(色盲安全:emoji 图标 + 文字档名,颜色仅辅助)
         f'<rect x="16" y="16" rx="8" ry="8" width="250" height="42" fill="{fill}" '
-        f'aria-label="质地档 {grade} {_esc(words)}"><title>质地档 {grade} {_esc(words)}{_esc(flag_human)}</title></rect>'
-        f'<text x="28" y="44" font-size="22" fill="#ffffff">{grade} 档 {_esc(words)}</text>'
+        f'aria-label="质地档 {grade} {_esc(tname)}"><title>质地档 {grade} {_esc(tname)} · {_esc(reason_full)}{_esc(flag_human)}</title></rect>'
+        f'<text x="28" y="44" font-size="22" fill="#ffffff">{grade} {_esc(tname)}</text>'
         # entry 档(离散字母,非小数 score)
         f'<rect x="278" y="16" rx="8" ry="8" width="120" height="42" fill="#33373d">'
         f'<title>入场档 {_esc(eg)}(离散档,非小数评分)</title></rect>'

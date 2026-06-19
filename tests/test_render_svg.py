@@ -111,6 +111,15 @@ def test_tier_color_is_colorblind_safe_text_present_for_each_grade():
         assert words in svg      # 文字档名(颜色之外的可读信息)
 
 
+def test_badge_shows_short_tier_name_not_long_reason_overflow():
+    # 真实数据 reason 很长(如"净利&扣非&营收三增·现金流>0·无警示");徽章固定 250px,
+    # 必须显示由 grade 派生的短档名,长 reason 只进 tooltip,否则文字溢出徽章撞 entry 档。
+    long_reason = "增收不增利营收增但净利与扣非下滑需配涨幅人工复核额外冗长占位以触发溢出风险"
+    svg = render_svg_card(_rec(grade="🔴", tier_label_words=long_reason), cohort=_cohort())
+    assert 'font-size="22" fill="#ffffff">🔴 题材背离</text>' in svg   # 22px 徽章=短档名(防溢出)
+    assert long_reason in svg                                          # 完整 reason 仍可达(tooltip;此串无需转义字符)
+
+
 # ---------------------------------------------------------------------------
 # 雷达 / 雪花图:固定 6 轴
 # ---------------------------------------------------------------------------

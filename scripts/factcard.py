@@ -98,7 +98,8 @@ def main() -> None:
             pes = f"{float(pe):.0f}" if pd.notna(pe) else "-"
             pbs = f"{float(pb):.1f}" if pd.notna(pb) else "-"
             mvs = f"{float(mv) / 1e4:.0f}" if pd.notna(mv) else "-"
-            print(f"[{score:>3.0f}] {name}({code}) {ind} | 现{f['close']:.2f} 距60高{f['dist_60d_high_pct']:+.0f}% "
+            sc = f"{score:>3.0f}" if score is not None else "  —"  # 入场分缺失(契约C2)
+            print(f"[{sc}] {name}({code}) {ind} | 现{f['close']:.2f} 距60高{f['dist_60d_high_pct']:+.0f}% "
                   f"近20{f['ret20_pct']:+.1f}%(分{rank20.get(code, 0):.0f}) PE{pes} PB{pbs} 市值{mvs}亿")
 
             tabs = {t: fetch_symbol_table(pro, t, code, CACHE) for t in SYMBOL_TABLES}

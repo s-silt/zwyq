@@ -5,6 +5,7 @@ import pytest
 from ashare_gauntlet.lit_factors import (
     accrual_ratio,
     earnings_yield,
+    latest_annual_end,
     net_cash_ratio,
     reversal,
     volatility,
@@ -80,6 +81,47 @@ def test_reversal_uses_adjusted_price():
     # adj_factor 恒定时前复权收益等于裸收益(因子约去);验证用的是复权价路径
     closes = [float(x) for x in range(100, 121)]
     assert reversal(_daily(closes), _adj(21, factor=2.0), n=20) == pytest.approx(0.20)
+
+
+# ---- 契约C3:最近年报期从数据动态取 max(end_date endswith '1231'),不硬编码 ----
+def test_latest_annual_end_picks_max_1231():
+    # 多年年报 + 季报混在一起 → 取最大的 …1231(最近年报),忽略季报 …0331/0630
+    inc = pd.DataFrame([
+        {"end_date": "20231231", "n_income_attr_p": 1e8},
+        {"end_date": "20241231", "n_income_attr_p": 2e8},
+        {"end_date": "20250331", "n_income_attr_p": 3e8},  # 季报,非年报
+    ])
+    assert latest_annual_end(inc) == "20241231"
+
+
+def test_latest_annual_end_uses_max_across_frames():
+    # 跨表(income/cashflow)取并集最大年报期 —— cashflow 比 income 多一年年报
+    inc = pd.DataFrame([{"end_date": "20241231", "n_income_attr_p": 2e8}])
+    cf = pd.DataFrame([
+        {"end_date": "20241231", "n_cashflow_act": 1e8},
+        {"end_date": "20251231", "n_cashflow_act": 2e8},
+    ])
+    assert latest_annual_end(inc, cf) == "20251231"
+
+
+def test_latest_annual_end_returns_none_when_no_annual():
+    # 只有季报、无任何 …1231 → 取不到年报期返回 None(不套固定日期伪造)
+    inc = pd.DataFrame([{"end_date": "20250331", "n_income_attr_p": 3e8}])
+    assert latest_annual_end(inc) is None
+
+
+def test_latest_annual_end_handles_empty_and_none():
+    assert latest_annual_end(pd.DataFrame()) is None
+    assert latest_annual_end(None) is None
+
+
+def test_net_cash_ratio_honours_dynamic_end():
+    # 把动态取到的年报期传进去仍可算(不再依赖硬编码 20251231)
+    inc = pd.DataFrame([{"end_date": "20241231", "ann_date": "20250401", "n_income_attr_p": 10e8}])
+    cf = pd.DataFrame([{"end_date": "20241231", "ann_date": "20250401", "n_cashflow_act": 12e8}])
+    end = latest_annual_end(inc, cf)
+    assert end == "20241231"
+    assert net_cash_ratio(inc, cf, end=end) == pytest.approx(1.2)
 
 
 # ---- 波动率 = 近 n 日前复权日收益标准差(越低越好,低波动因子) ----

@@ -10,6 +10,7 @@ Everything is descriptive — real reported numbers, never invented or predicted
 """
 
 import datetime as dt
+import sys
 from typing import Any, cast
 
 import pandas as pd
@@ -76,8 +77,9 @@ def latest_quarter(income: pd.DataFrame, fina: pd.DataFrame | None) -> dict[str,
     if fr is not None:
         out["revenue_yoy_pct"] = _num(fr.get("or_yoy"))
         out["net_profit_yoy_pct"] = _num(fr.get("netprofit_yoy"))
-        gm = _num(fr.get("grossprofit_margin"))
-        out["gross_margin_pct"] = gm if gm is not None else _num(fr.get("gross_margin"))
+        # 只取真·百分率 grossprofit_margin;缺失就保持 None。
+        # 不回退 gross_margin 列——那是绝对毛利额(元),拿元当 % 是伪造。
+        out["gross_margin_pct"] = _num(fr.get("grossprofit_margin"))
     return out
 
 
@@ -176,6 +178,12 @@ def recent_holder_trades(stk_holdertrade: pd.DataFrame, as_of: str, within_days:
         try:
             day = dt.datetime.strptime(raw, "%Y%m%d").date()
         except ValueError:
+            # 坏日期跳过但留痕(不静默吞):上报 ts_code + 原始值到 stderr。
+            print(
+                f"recent_holder_trades: skip row ts_code={r.get('ts_code')!r} "
+                f"bad ann_date={raw!r}",
+                file=sys.stderr,
+            )
             continue
         if floor <= day <= end:
             out.append({
@@ -234,6 +242,12 @@ def upcoming_unlocks(share_float: pd.DataFrame, as_of: str, within_days: int = 1
         try:
             day = dt.datetime.strptime(raw, "%Y%m%d").date()
         except ValueError:
+            # 坏日期跳过但留痕(不静默吞):上报 ts_code + 原始值到 stderr。
+            print(
+                f"upcoming_unlocks: skip row ts_code={r.get('ts_code')!r} "
+                f"bad float_date={raw!r}",
+                file=sys.stderr,
+            )
             continue
         if start < day <= end:
             out.append({

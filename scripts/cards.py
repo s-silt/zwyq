@@ -61,6 +61,18 @@ def _prev_cards(as_of: str) -> dict[str, Any] | None:
     return {r["ts_code"]: r for r in data}
 
 
+def dump_cards(records: list[dict[str, Any]], out_path: str) -> None:
+    """落库 cards JSON,``allow_nan=False`` 兜底防线(#1)。
+
+    正常情况下 record.py 的技术面叶子已过 ``_num``(NaN→None),不该有 NaN 漏到这里;
+    但 ``json.dump`` 默认会把 NaN 写成非法字面量 ``NaN``(非标准 JSON,下游/外部解析器
+    会失败或静默读成错值)。``allow_nan=False`` 让任何漏网的 NaN/Infinity **响亮抛
+    ValueError** 而非写出脏数据 —— 数据源纯净优先于"先落个库"。
+    """
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(records, fh, ensure_ascii=False, indent=2, allow_nan=False)
+
+
 def render_outputs(records: list[dict[str, Any]], as_of: str, panels_dir: str = PANELS_DIR) -> dict[str, str]:
     """从内存 records 直出 markdown 诚实面板 + HTML 决策台(一键出图,复用 A/C 渲染器)。"""
     os.makedirs(panels_dir, exist_ok=True)
@@ -124,8 +136,7 @@ def main(limit: int | None = None, render: bool = True) -> None:
 
     os.makedirs(CARDS_DIR, exist_ok=True)
     out_path = f"{CARDS_DIR}/{as_of}.json"
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(records, fh, ensure_ascii=False, indent=2)
+    dump_cards(records, out_path)
     print(f"落库 {out_path}({len(records)} 只)")
 
     if render:

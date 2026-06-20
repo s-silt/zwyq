@@ -32,7 +32,7 @@ from ashare_gauntlet.fundamentals import (
     st_status,
     upcoming_unlocks,
 )
-from ashare_gauntlet.lit_factors import ANNUAL, accrual_ratio, net_cash_ratio
+from ashare_gauntlet.lit_factors import accrual_ratio, latest_annual_end, net_cash_ratio
 
 # ---- 可调常量(离散档阈值) -------------------------------------------------
 ENTRY_GRADE_CUTS: tuple[float, float] = (70.0, 40.0)  # A: >=70, B: >=40, C: <40
@@ -42,6 +42,13 @@ LOW_BASE_NP = 40.0       # 🟡 低基数:净利同比 > 此值
 LOW_BASE_REV = 10.0      # 🟡 低基数:而营收同比 < 此值
 PLEDGE_WARN = 50.0       # 质押旗标升"警示"的比例(%)
 DIFF_FIELDS = ("fundamental.np_yoy", "fundamental.dedt_yoy", "valuation.pe_ttm")
+# 事件/资金面表(空允许,但空≠确认无事件 —— 契约C1 用 data_coverage 区分未取到/确认无)
+EVENT_TABLES = ("share_float", "pledge_stat", "stk_holdertrade", "forecast", "express")
+
+
+def _table_has_rows(df: Any) -> bool:
+    """事件表是否取到行(非 None 且非空 DataFrame)。空=未取到=未确认,不当「确认无」。"""
+    return isinstance(df, pd.DataFrame) and not df.empty
 
 
 def _num(value: Any) -> float | None:
@@ -73,7 +80,12 @@ def _value_at(df: pd.DataFrame, col: str, end: str) -> float | None:
     return _num(rows.iloc[-1][col])
 
 
-def _entry_grade(score: float) -> str:
+ENTRY_GRADE_MISSING = "—"  # 入场分缺失档(契约C2:不补默认分伪造 A/B/C)
+
+
+def _entry_grade(score: float | None) -> str:
+    if score is None:  # 缺关键技术输入(pct20/close)→ 缺失档,不伪造等级
+        return ENTRY_GRADE_MISSING
     a, b = ENTRY_GRADE_CUTS
     if score >= a:
         return "A"
@@ -245,21 +257,30 @@ def build_record(
     bs = fund_tables["balancesheet"]
     cashflow = fund_tables["cashflow"]
 
-    # 技术面(前复权,描述性)
+    # 技术面(前复权,描述性)。每个数值叶子过 _num():NaN/inf(如停牌/历史不足)
+    # 不当真值写入(#1),否则会骗过下方 meta 的 is-not-None 守卫盖出错误口径章。
     tech = daily_tech_facts(ts_code, daily_sub, adj_sub, mr)
     technical: dict[str, Any] = {
-        "close": tech.get("close"),
-        "dist60": tech.get("dist_60d_high_pct"),
-        "pct20": tech.get("pct20"),
-        "trend": tech.get("trend"),
-        "rsi": tech.get("rsi"),
-        "ret20": tech.get("ret20_pct"),
-        "vol_ratio": tech.get("vol_ratio"),
+        "close": _num(tech.get("close")),
+        "dist60": _num(tech.get("dist_60d_high_pct")),
+        "pct20": _num(tech.get("pct20")),
+        "trend": tech.get("trend"),  # 标签(非数值),原样
+        "rsi": _num(tech.get("rsi")),
+        "ret20": _num(tech.get("ret20_pct")),
+        "vol_ratio": _num(tech.get("vol_ratio")),
     }
+    # 技术面 as_of 用该股最新有效 bar 的 trade_date(#10):停牌股只把旧 bar 标真实
+    # 最后交易日,不伪造成 cards 运行日 as_of。daily_tech_facts 已给出该 bar 日期。
+    tech_as_of = str(tech.get("as_of")) if tech.get("as_of") else as_of
 
-    # 入场纪律分 -> 离散档
+    # 入场纪律分 -> 离散档。缺关键技术输入(pct20/close)时 entry_rank 返 None 分(契约C2):
+    # 不补 0/50/close 默认;此处 grade 设缺失档、score=None(round(None) 会崩,须挡)。
     score, tag = entry_rank(tech)
-    entry: dict[str, Any] = {"grade": _entry_grade(score), "score": round(score, 1), "tag": tag}
+    entry: dict[str, Any] = {
+        "grade": _entry_grade(score),
+        "score": round(score, 1) if score is not None else None,
+        "tag": tag,
+    }
 
     # 基本面(最新季)
     q = latest_quarter(income, fina)
@@ -303,12 +324,18 @@ def build_record(
         "recv_to_annual_net_pct": receivables_ratio(bs, income),
     }
 
-    # 现金质量(年报口径,复用 lit_factors,不重复实现)
-    quality: dict[str, Any] = {
-        "op_cashflow_yi": cashflow_facts(cashflow, ANNUAL).get("op_cashflow_yi"),
-        "net_cash_ratio": net_cash_ratio(income, cashflow),
-        "accrual": accrual_ratio(income, cashflow, bs),
-    }
+    # 现金质量(年报口径,复用 lit_factors,不重复实现)。
+    # 契约C3:'最近年报'从数据动态取 max(end_date endswith '1231'),不硬编码;取不到→None。
+    # #14:三叶子(OCF/净现比/应计)统一用同一个动态年报期 annual_end,口径标注与实算一致。
+    annual_end = latest_annual_end(income, cashflow, bs)
+    if annual_end is not None:
+        quality = {
+            "op_cashflow_yi": cashflow_facts(cashflow, annual_end).get("op_cashflow_yi"),
+            "net_cash_ratio": net_cash_ratio(income, cashflow, end=annual_end),
+            "accrual": accrual_ratio(income, cashflow, bs, end=annual_end),
+        }
+    else:  # 年报缺失:三叶子无依据,全 None(不套固定 20251231 伪造年报期)
+        quality = {"op_cashflow_yi": None, "net_cash_ratio": None, "accrual": None}
 
     # ST 状态
     st = st_status(fund_tables["namechange"]) or {}
@@ -320,6 +347,14 @@ def build_record(
 
     flags = _build_flags(fund_tables, as_of, str(end) if end else "")
 
+    # 契约C1:事件表为空不得静默当「确认无事件」。这里标 data_coverage:
+    # 该事件表有行=present(可信「确认无事件」),空=unknown(未取到,无法判定)。
+    # 让面板区分「确认无」与「没取到」(否则空表会被误读成"无质押/无解禁/无减持")。
+    data_coverage: dict[str, str] = {
+        ev: ("present" if _table_has_rows(fund_tables.get(ev)) else "unknown")
+        for ev in EVENT_TABLES
+    }
+
     # 口径标注:每个非空数值叶子 -> {unit, as_of, source}
     meta: dict[str, dict[str, str]] = {}
 
@@ -329,15 +364,20 @@ def build_record(
 
     qend = str(end) if end else ""
     bstr = str(bend) if bend else ""
-    _m("technical.close", technical["close"], "元", as_of, "daily前复权")
-    _m("technical.dist60", technical["dist60"], "%", as_of, "距60日高(前复权)")
-    _m("technical.pct20", technical["pct20"], "百分位", as_of, "全市场20日收益排名")
-    _m("technical.rsi", technical["rsi"], "0-100", as_of, "RSI14(前复权)")
-    _m("technical.ret20", technical["ret20"], "%", as_of, "近20日收益(前复权)")
-    _m("technical.vol_ratio", technical["vol_ratio"], "倍", as_of, "量/20日均量(前复权)")
+    # 技术面 as_of 用真实最新 bar 日(#10),非 cards 运行日 as_of(停牌股防伪造)。
+    _m("technical.close", technical["close"], "元", tech_as_of, "daily前复权")
+    _m("technical.dist60", technical["dist60"], "%", tech_as_of, "距60日高(前复权)")
+    _m("technical.pct20", technical["pct20"], "百分位", tech_as_of, "沪深主板20日收益排名(cohort=沪深主板)")
+    _m("technical.rsi", technical["rsi"], "0-100", tech_as_of, "RSI14(前复权)")
+    _m("technical.ret20", technical["ret20"], "%", tech_as_of, "近20日收益(前复权)")
+    _m("technical.vol_ratio", technical["vol_ratio"], "倍", tech_as_of, "量/20日均量(前复权)")
     _m("valuation.pe_ttm", pe, "倍", as_of, "daily_basic接口")
     _m("valuation.pb", pb, "倍", as_of, "daily_basic接口")
-    _m("valuation.peg", valuation["peg"], "倍", as_of, "PE_TTM/净利同比增速")
+    # #4/#16:peg=PE_TTM(交易日)÷净利同比(季报期 Q1 单季同比、非TTM)。as_of 标双期、
+    # source 注明分母口径,否则整体标交易日会掩盖混期+单季增速非TTM。
+    _m("valuation.peg", valuation["peg"], "倍",
+       f"估值@{as_of} / 增速@{qend}",
+       "PE_TTM÷净利同比(分母为季报单季同比、非TTM增速)")
     _m("valuation.mv_yi", valuation["mv_yi"], "亿元", as_of, "daily_basic.total_mv")
     _m("fundamental.rev_yi", fundamental["rev_yi"], "亿元", qend, "income.total_revenue")
     _m("fundamental.rev_yoy", fundamental["rev_yoy"], "%", qend, "fina_indicator.or_yoy")
@@ -351,16 +391,22 @@ def build_record(
     _m("balance.money_cap_yi", balance["money_cap_yi"], "亿元", bstr, "balancesheet.money_cap")
     _m("balance.net_assets_yi", balance["net_assets_yi"], "亿元", bstr, "balancesheet.total_hldr_eqy_exc_min_int")
     _m("balance.total_assets_yi", balance["total_assets_yi"], "亿元", bstr, "balancesheet.total_assets")
-    _m("balance.recv_to_annual_net_pct", balance["recv_to_annual_net_pct"], "%", qend, "应收/最近年报归母净利")
-    _m("quality.op_cashflow_yi", quality["op_cashflow_yi"], "亿元", ANNUAL, "cashflow.n_cashflow_act(年报)")
-    _m("quality.net_cash_ratio", quality["net_cash_ratio"], "倍", ANNUAL, "经营现金流/归母净利(年报)")
-    _m("quality.accrual", quality["accrual"], "倍", ANNUAL, "(归母净利-经营现金流)/总资产(年报)")
+    # #13:recv_to_annual_net_pct = 应收(季报期 bstr)÷最近年报归母净利(annual_end),混期比;
+    # as_of 只标季报会掩盖年报分母,标双期。
+    _m("balance.recv_to_annual_net_pct", balance["recv_to_annual_net_pct"], "%",
+       f"应收@季报{bstr} / 分母@年报{annual_end or '缺失'}", "应收账款/最近年报归母净利")
+    # 契约C3/#14:quality 三叶子统一用真实动态年报期 annual_end,口径标注=实算取行。
+    aend = str(annual_end) if annual_end else ""
+    _m("quality.op_cashflow_yi", quality["op_cashflow_yi"], "亿元", aend, "cashflow.n_cashflow_act(年报)")
+    _m("quality.net_cash_ratio", quality["net_cash_ratio"], "倍", aend, "经营现金流/归母净利(年报)")
+    _m("quality.accrual", quality["accrual"], "倍", aend, "(归母净利-经营现金流)/总资产(年报)")
 
     record: dict[str, Any] = {
         "ts_code": ts_code,
         "name": name,
         "industry": industry,
         "as_of": as_of,
+        "annual_as_of": annual_end,  # 真实最近年报期(动态);None=年报缺失(契约C3)
         "entry": entry,
         "technical": technical,
         "valuation": valuation,
@@ -369,6 +415,7 @@ def build_record(
         "quality": quality,
         "status": status,
         "flags": flags,
+        "data_coverage": data_coverage,  # 事件表取数覆盖(契约C1:区分确认无/未取到)
         "meta": meta,
     }
     record["tier"] = tier_of(record)

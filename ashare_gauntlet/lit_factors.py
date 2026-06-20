@@ -14,6 +14,22 @@ import pandas as pd
 ANNUAL = "20251231"
 
 
+def latest_annual_end(*dfs: pd.DataFrame | None) -> str | None:
+    """从传入的财报表动态取「最近年报期」= max(end_date 以 '1231' 结尾)。
+
+    契约C3:'最近年报'不再硬编码 ``ANNUAL``。跨表(income/cashflow…)取并集里最大的
+    年报期;取不到任何 …1231 → 返回 ``None``(由调用方标「年报缺失」,**不**套固定日期
+    伪造一个年报期)。空表/None 安全跳过。
+    """
+    ends: set[str] = set()
+    for df in dfs:
+        if df is None or df.empty or "end_date" not in df.columns:
+            continue
+        col = df["end_date"].astype(str)
+        ends.update(col[col.str.endswith("1231")].tolist())
+    return max(ends) if ends else None
+
+
 def _annual_value(df: pd.DataFrame | None, col: str, end: str) -> float | None:
     """取年报(end_date==end)某字段值;多行按 ann_date 取最新。缺失/非数返回 None。"""
     if df is None or col not in df.columns or "end_date" not in df.columns:

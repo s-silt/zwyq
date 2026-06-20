@@ -11,6 +11,34 @@ from typing import Any, cast
 
 import pandas as pd
 
+# 沪深主板代码集 = 600/601/603/605(沪)+ 000/001/002/003(深);
+# 不含创业板(300/301)、科创板(688/689)、北交所(8xx)、B股。横截面分位的对比集
+# 必须只对主板 cohort 计算(契约C2),否则被科创/创业的高波动股污染分位口径。
+_MAIN_BOARD_PREFIXES = ("600", "601", "603", "605", "000", "001", "002", "003")
+
+
+def _num(value: Any) -> float | None:
+    """转 float;None / 非数 / NaN -> None(缺失即缺失,不伪造默认值)。"""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def is_main_board(ts_code: str) -> bool:
+    """ts_code 是否属沪深主板(对比集纯净度:横截面分位只在主板内排名)。"""
+    code = str(ts_code).partition(".")[0]
+    return code[:3] in _MAIN_BOARD_PREFIXES
+
+
+def _main_board_cohort(returns: pd.Series) -> pd.Series:
+    """把一条 ``{ts_code: return}`` Series 过滤到沪深主板 cohort。"""
+    mask = [is_main_board(c) for c in returns.index]
+    return cast(pd.Series, returns[mask])
+
 
 def ema(close: pd.Series, span: int) -> pd.Series:
     """Exponential moving average (adjust=False, the conventional TA form)."""
@@ -214,14 +242,20 @@ def daily_tech_facts(
         "vol_ratio": float(amt[-1] / amt[-20:].mean()),
     }
     if market_rets:
+        # 横截面分位只对沪深主板 cohort 计算(契约C2:对比集纯净)。cohort 为空
+        # (无主板可比股)→ 分位无依据,不写该键(下游按缺失/None 处理,不伪造)。
         if 5 in market_rets:
-            fs["pct5"] = float((market_rets[5] < ret5).mean() * 100)
+            cohort5 = _main_board_cohort(market_rets[5])
+            if not cohort5.empty:
+                fs["pct5"] = float((cohort5 < ret5).mean() * 100)
         if 20 in market_rets:
-            fs["pct20"] = float((market_rets[20] < ret20).mean() * 100)
+            cohort20 = _main_board_cohort(market_rets[20])
+            if not cohort20.empty:
+                fs["pct20"] = float((cohort20 < ret20).mean() * 100)
     return fs
 
 
-def entry_rank(facts: dict[str, Any]) -> tuple[float, str]:
+def entry_rank(facts: dict[str, Any]) -> tuple[float | None, str]:
     """Transparent 'buying-discipline' score + tag for one stock — NOT a return
     prediction (momentum & reversal both tested NO_GO in this market/window).
 
@@ -232,12 +266,19 @@ def entry_rank(facts: dict[str, Any]) -> tuple[float, str]:
       +15    if 多头 and price within −5%..+3% of EMA20 — a pullback to support
              inside an uptrend (the disciplined entry)
     Higher = better fits the lens. Tag summarizes the entry condition.
+
+    缺关键技术输入(横截面分位 pct20 / 现价 close)时**不补 0/50/close 默认**
+    伪造一个分(契约C2,数据源纯净):返回 ``(None, '数据缺失·无入场分')``。
     """
-    rs = float(facts.get("pct20", 0.0) or 0.0)
+    rs = _num(facts.get("pct20"))
+    close = _num(facts.get("close"))
+    if rs is None or close is None:
+        missing = [n for n, v in (("近20分位", rs), ("现价", close)) if v is None]
+        return None, "数据缺失·无入场分(" + "/".join(missing) + ")"
+
     trend = facts.get("trend")
     rsi_val = float(facts.get("rsi", 50.0))
-    close = float(facts.get("close", 0.0))
-    ema_long = float(facts.get("ema_long", close)) or close
+    ema_long = _num(facts.get("ema_long")) or close
     dist_ema_pct = (close / ema_long - 1) * 100 if ema_long else 0.0
 
     score = rs

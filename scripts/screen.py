@@ -129,7 +129,8 @@ def main() -> None:
         mv = r.get("total_mv"); mv = f"{float(mv) / 1e4:.0f}" if pd.notna(mv) else "-"
         name = "" if pd.isna(r.get("name")) else str(r.get("name"))
         ind = "" if pd.isna(r.get("industry")) else str(r.get("industry"))
-        print(f"[{r['entry']:>3.0f}] {name:<6}{r['ts_code']} {ind:<7} {r['close']:7.2f} "
+        eg = f"{r['entry']:>3.0f}" if pd.notna(r['entry']) else "  —"  # 入场分缺失(契约C2)
+        print(f"[{eg}] {name:<6}{r['ts_code']} {ind:<7} {r['close']:7.2f} "
               f"{r['trend']:<4} RSI{r['rsi']:.0f} 距60高{r['dist60']:+.0f}% "
               f"近20{r['ret20']:+.1f}%(分位{r['pct20']:.0f}) PE{pe} PB{pb} 市值{mv}亿")
 

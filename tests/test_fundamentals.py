@@ -56,6 +56,15 @@ def test_latest_quarter_flags_a_loss():
     assert q["revenue_yoy_pct"] is None  # 无 fina 时同比缺失,不编
 
 
+def test_latest_quarter_gross_margin_does_not_fall_back_to_absolute_amount():
+    # gross_margin 列是绝对毛利额(元),不是百分率;grossprofit_margin 缺失时
+    # 不得用它伪造毛利率(601138 Q1 gross_margin≈184.5亿元会被当成 18450000000%)。
+    income = pd.DataFrame([{"end_date": "20260331", "report_type": "1", "total_revenue": 2.51e11, "n_income_attr_p": 1.06e10}])
+    fina = pd.DataFrame([{"end_date": "20260331", "or_yoy": 56.52, "netprofit_yoy": 102.55, "gross_margin": 1.845e10}])
+    q = latest_quarter(income, fina)
+    assert q["gross_margin_pct"] is None  # 缺真·百分率就保持 None,不拿元当 %
+
+
 def test_pledge_ratio_takes_latest_period():
     p = pd.DataFrame([{"end_date": "20260605", "pledge_ratio": 0.29}, {"end_date": "20260612", "pledge_ratio": 0.31}])
     assert pledge_ratio(p) == pytest.approx(0.31)
@@ -102,6 +111,32 @@ def test_recent_holder_trades_flags_reductions_in_window():
     assert len(out) == 1
     assert out[0]["holder_name"] == "薛革文"
     assert out[0]["direction"] == "减持"
+
+
+def test_recent_holder_trades_bad_date_is_skipped_but_warned(capsys):
+    ht = pd.DataFrame(
+        [
+            {"ann_date": "20260430", "holder_name": "薛革文", "in_de": "DE", "change_vol": 8.66e6, "change_ratio": 1.94, "avg_price": 17.4},
+            {"ann_date": "坏日期", "holder_name": "坏行股东", "in_de": "DE", "change_vol": 1e6, "change_ratio": 0.2, "avg_price": 10.0},
+        ]
+    )
+    out = recent_holder_trades(ht, as_of="20260617", within_days=365)
+    assert [o["holder_name"] for o in out] == ["薛革文"]  # 坏行被跳过
+    err = capsys.readouterr().err
+    assert "坏日期" in err  # 不静默吞:原始值上报到 stderr
+
+
+def test_upcoming_unlocks_bad_date_is_skipped_but_warned(capsys):
+    sf = pd.DataFrame(
+        [
+            {"float_date": "20260630", "float_share": 2.6e7, "float_ratio": 1.5, "holder_name": "定增对象"},
+            {"float_date": "NaT", "float_share": 5e6, "float_ratio": 0.3, "holder_name": "坏行"},
+        ]
+    )
+    out = upcoming_unlocks(sf, as_of="20260617", within_days=180)
+    assert [u["holder_name"] for u in out] == ["定增对象"]  # 坏行被跳过
+    err = capsys.readouterr().err
+    assert "NaT" in err  # 原始坏值上报到 stderr,不静默丢行
 
 
 def test_st_status_detects_current_and_history():

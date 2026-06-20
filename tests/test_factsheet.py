@@ -68,15 +68,16 @@ def test_build_factsheet_assembles_facts_for_one_stock_incl_northbound():
 
 def _two_stock_market():
     days = [f"202506{d:02d}" for d in range(1, 26)]
-    # WINNER rises steadily, LOSER falls steadily.
+    # WINNER rises steadily, LOSER falls steadily. 用真实沪深主板代码,使横截面
+    # 分位 cohort(过滤到 600/000…)非空 —— 契约C2 后 pct 只对主板 cohort 计算。
     daily = pd.DataFrame(
-        [{"ts_code": "WIN.SZ", "trade_date": d, "open": 10 + j, "close": 10 + j, "amount": 1e6}
+        [{"ts_code": "000002.SZ", "trade_date": d, "open": 10 + j, "close": 10 + j, "amount": 1e6}
          for j, d in enumerate(days)]
-        + [{"ts_code": "LOS.SH", "trade_date": d, "open": 50 - j, "close": 50 - j, "amount": 1e6}
+        + [{"ts_code": "600519.SH", "trade_date": d, "open": 50 - j, "close": 50 - j, "amount": 1e6}
            for j, d in enumerate(days)]
     )
     adj = pd.DataFrame([{"ts_code": c, "trade_date": d, "adj_factor": 1.0}
-                        for c in ("WIN.SZ", "LOS.SH") for d in days])
+                        for c in ("000002.SZ", "600519.SH") for d in days])
     return daily, adj
 
 
@@ -84,16 +85,16 @@ def test_market_returns_gives_each_stock_horizon_return():
     daily, adj = _two_stock_market()
     mr = market_returns(daily, adj, horizons=(5,))
     # WIN last=34, 5 sessions ago=29 -> +5/29; LOS last=26, 5 ago=31 -> -5/31
-    assert mr[5]["WIN.SZ"] == pytest.approx(34 / 29 - 1)
-    assert mr[5]["LOS.SH"] == pytest.approx(26 / 31 - 1)
+    assert mr[5]["000002.SZ"] == pytest.approx(34 / 29 - 1)
+    assert mr[5]["600519.SH"] == pytest.approx(26 / 31 - 1)
 
 
 def test_daily_tech_facts_labels_trend_and_cross_sectional_percentile():
     daily, adj = _two_stock_market()
     mr = market_returns(daily, adj, horizons=(5, 20))
 
-    win = daily_tech_facts("WIN.SZ", daily, adj, mr)
-    los = daily_tech_facts("LOS.SH", daily, adj, mr)
+    win = daily_tech_facts("000002.SZ", daily, adj, mr)  # 深主板,稳涨
+    los = daily_tech_facts("600519.SH", daily, adj, mr)  # 沪主板,稳跌
 
     assert win["trend"] == "多头"  # price > EMA5 > EMA20 (steady rise)
     assert los["trend"] == "空头"
@@ -155,3 +156,62 @@ def test_entry_rank_prefers_uptrend_penalizes_falling_knife_and_overbought():
     assert "勿接" in tag_down
     assert "勿追" in tag_hot
     assert "回踩" in tag_up
+
+
+# ---------------------------------------------------------------------------
+# 契约C2:entry_rank 缺关键技术输入(pct20/close)时返回 None 分(不补 0/50/close 默认)
+# ---------------------------------------------------------------------------
+def test_entry_rank_returns_none_score_when_pct20_missing():
+    # pct20 缺失(横截面分位算不出,如停牌/历史不足)→ 不得把 base 补 0 伪造一个分,
+    # 返回 score=None,标签注明数据缺失
+    score, tag = entry_rank({"trend": "多头", "rsi": 55.0, "close": 11.0, "ema_long": 10.8})
+    assert score is None
+    assert "缺" in tag
+
+
+def test_entry_rank_returns_none_score_when_close_missing():
+    # close 缺失 → 距 EMA 等判据无依据,返回 score=None,不补 close 默认
+    score, tag = entry_rank({"trend": "多头", "rsi": 55.0, "ema_long": 10.8, "pct20": 80.0})
+    assert score is None
+    assert "缺" in tag
+
+
+def test_entry_rank_present_inputs_still_numeric():
+    # 关键输入俱在时仍返回数值分(守卫不得误伤正常路径)
+    score, _ = entry_rank({"trend": "多头", "rsi": 55.0, "close": 11.0, "ema_long": 10.8, "pct20": 80.0})
+    assert isinstance(score, float)
+
+
+# ---------------------------------------------------------------------------
+# 契约C2:daily_tech_facts 的 pct20/pct5 横截面分位 cohort 过滤到沪深主板
+# (600/601/603/605/000/001/002/003;不含创业300/科创688/北交8xx)
+# ---------------------------------------------------------------------------
+def _cohort_market():
+    days = [f"202506{d:02d}" for d in range(1, 26)]
+    # 600519 是「主板 cohort」里最强的(3 只主板里跑赢另 2 只);cohort 里混入
+    # 一只科创(688)与一只创业板(300),二者是全市场最强,若未过滤会污染主板股分位。
+    rows = []
+    for code, base, step in [
+        ("600519.SH", 10.0, 1.0),   # 主板,被评估(主板内最强)
+        ("000001.SZ", 30.0, -0.2),  # 主板,弱(cohort 内)
+        ("601988.SH", 30.0, -0.3),  # 主板,更弱(cohort 内)
+        ("688981.SH", 10.0, 5.0),   # 科创,极强(应被排除)
+        ("300750.SZ", 10.0, 5.0),   # 创业板,极强(应被排除)
+    ]:
+        for j, d in enumerate(days):
+            rows.append({"ts_code": code, "trade_date": d, "open": base + j * step,
+                         "close": base + j * step, "amount": 1e6})
+    daily = pd.DataFrame(rows)
+    adj = pd.DataFrame([{"ts_code": c, "trade_date": d, "adj_factor": 1.0}
+                        for c in daily["ts_code"].unique() for d in days])
+    return daily, adj
+
+
+def test_daily_tech_facts_percentile_cohort_is_main_board_only():
+    # 主板 cohort = {600519 强, 000001 弱, 601988 更弱};600519 跑赢另 2 只主板,
+    # cohort 内 2/3 在其下 → pct20 ≈ 66.7。若把极强的 688/300 算进 cohort
+    # (5 只里 600519 排第 3),分位会跌到 ~40。验证 cohort 过滤生效。
+    daily, adj = _cohort_market()
+    mr = market_returns(daily, adj, horizons=(20,))
+    fs = daily_tech_facts("600519.SH", daily, adj, mr)
+    assert fs["pct20"] == pytest.approx(2 / 3 * 100, abs=0.1)

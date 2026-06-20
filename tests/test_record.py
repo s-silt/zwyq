@@ -497,3 +497,198 @@ def test_build_flags_pledge_carries_structured_value():
     pledge = next(f for f in flags if f["type"] == "质押")
     assert pledge["severity"] == "警示"  # 60% >= 50 阈值
     assert pledge["value"] == pytest.approx(60.0)
+
+
+# ---------------------------------------------------------------------------
+# [#1] technical 数值叶子过 _num:NaN/inf 不当真值写入,且 meta 守卫不给缺失叶子盖章
+# ---------------------------------------------------------------------------
+def _build(code="601138.SH", n=25, as_of="20260618", db_row=None):
+    daily, adj = _daily_adj(code, n)
+    from ashare_gauntlet.factsheet import market_returns
+
+    mr = market_returns(daily, adj, (5, 20))
+    if db_row is None:
+        db_row = {"pe_ttm": 20.0, "pb": 2.0, "total_mv": 500000.0}
+    return build_record(
+        code, name="测试股", industry="电池", as_of=as_of,
+        daily_sub=daily, adj_sub=adj, mr=mr, fund_tables=_fund_tables(), db_row=db_row,
+    )
+
+
+def test_technical_nan_leaf_is_none_and_meta_omitted():
+    # 历史不足 21 根 → ret20_pct = NaN(daily_tech_facts 用 math.nan)。
+    # 该 NaN 不得当真值写入 technical.ret20,须经 _num → None;且 meta 不给它盖口径章。
+    rec = _build(n=10)  # 仅 10 根,ret(20) 算不出 → NaN
+    assert rec["technical"]["ret20"] is None
+    assert "technical.ret20" not in rec["meta"]
+
+
+def test_technical_present_leaf_still_numeric_with_meta():
+    # 守卫不得误伤:历史充足时 ret20/close 等仍为数值且有 meta
+    rec = _build(n=25)
+    assert isinstance(rec["technical"]["close"], float)
+    assert "technical.close" in rec["meta"]
+    assert isinstance(rec["technical"]["ret20"], float)
+    assert "technical.ret20" in rec["meta"]
+
+
+# ---------------------------------------------------------------------------
+# [#10] technical 叶子 meta.as_of 用该股最新有效 bar 的 trade_date,非 cards 运行日
+# ---------------------------------------------------------------------------
+def test_technical_meta_as_of_is_last_bar_not_cards_day():
+    # cards 运行日 20260701,但该股最后一根 bar 是 20260525(停牌/数据滞后)。
+    # technical 叶子的 as_of 必须标真实最后交易日,不能伪造成今日。
+    rec = _build(n=25, as_of="20260701")  # 最后 bar = 20260525
+    assert rec["technical"]["close"] is not None
+    assert rec["meta"]["technical.close"]["as_of"] == "20260525"
+    assert rec["meta"]["technical.close"]["as_of"] != "20260701"
+
+
+# ---------------------------------------------------------------------------
+# [#4/#16] peg meta 注明双期(估值@交易日 / 增速@季报期)且分母为 Q1 单季同比、非TTM
+# ---------------------------------------------------------------------------
+def test_peg_meta_marks_dual_period_and_non_ttm():
+    rec = _build()
+    assert rec["valuation"]["peg"] is not None
+    m = rec["meta"]["valuation.peg"]
+    # as_of 标双期:估值@交易日 + 增速@季报期
+    assert "20260618" in m["as_of"]          # 估值交易日
+    assert rec["fundamental"]["end_date"] in m["as_of"]  # 季报期
+    # source 明确分母是 Q1 单季同比、非 TTM 增速(否则掩盖混期)
+    assert "单季" in m["source"] or "非TTM" in m["source"]
+
+
+# ---------------------------------------------------------------------------
+# [#13] recv_to_annual_net_pct 混期比:as_of 须注明 应收@季报 / 分母@年报
+# ---------------------------------------------------------------------------
+def test_recv_to_annual_meta_marks_mixed_period():
+    rec = _build()
+    assert rec["balance"]["recv_to_annual_net_pct"] is not None
+    m = rec["meta"]["balance.recv_to_annual_net_pct"]
+    assert "季报" in m["as_of"] or "季报" in m["source"]
+    assert "年报" in m["as_of"] or "年报" in m["source"]
+
+
+# ---------------------------------------------------------------------------
+# [#14 + 契约C3] quality 三叶子口径标注与实算一致,as_of 用真实年报期(动态),非硬编码
+# ---------------------------------------------------------------------------
+def _fund_tables_annual_2024():
+    """最近年报是 2024(无 20251231 年报),验证动态年报期 + 三叶子同口径。"""
+    income = pd.DataFrame([
+        {"end_date": "20241231", "total_revenue": 80e8, "n_income_attr_p": 8e8},
+        {"end_date": "20250331", "total_revenue": 20e8, "n_income_attr_p": 2e8},
+    ])
+    fina = pd.DataFrame([
+        {"end_date": "20241231", "or_yoy": 10.0, "netprofit_yoy": 18.0,
+         "dt_netprofit_yoy": 16.0, "grossprofit_margin": 29.0, "profit_dedt": 7.5e8},
+        {"end_date": "20250331", "or_yoy": 12.0, "netprofit_yoy": 20.0,
+         "dt_netprofit_yoy": 15.0, "grossprofit_margin": 30.0, "profit_dedt": 1.8e8},
+    ])
+    cashflow = pd.DataFrame([{"end_date": "20241231", "n_cashflow_act": 10e8}])
+    balancesheet = pd.DataFrame([
+        {"end_date": "20241231", "total_assets": 200e8, "total_hldr_eqy_exc_min_int": 120e8,
+         "goodwill": 5e8, "accounts_receiv": 10e8, "money_cap": 30e8},
+        {"end_date": "20250331", "total_assets": 210e8, "total_hldr_eqy_exc_min_int": 122e8,
+         "goodwill": 5e8, "accounts_receiv": 11e8, "money_cap": 28e8},
+    ])
+    empty = pd.DataFrame()
+    return {
+        "income": income, "fina_indicator": fina, "balancesheet": balancesheet,
+        "cashflow": cashflow, "share_float": empty, "pledge_stat": empty,
+        "stk_holdertrade": empty, "namechange": empty, "forecast": empty, "express": empty,
+    }
+
+
+def test_quality_meta_as_of_uses_dynamic_annual_period():
+    # 最近年报是 20241231(非硬编码 20251231)→ quality 三叶子 meta.as_of 必须为 20241231,
+    # 且三者口径一致(同年报期)。验证契约C3 动态年报 + #14 口径对齐。
+    code = "601138.SH"
+    daily, adj = _daily_adj(code)
+    from ashare_gauntlet.factsheet import market_returns
+
+    mr = market_returns(daily, adj, (5, 20))
+    rec = build_record(
+        code, name="测试股", industry="电池", as_of="20250618",
+        daily_sub=daily, adj_sub=adj, mr=mr,
+        fund_tables=_fund_tables_annual_2024(),
+        db_row={"pe_ttm": 20.0, "pb": 2.0, "total_mv": 500000.0},
+    )
+    # 三叶子都算出来了(净现比=10/8=1.25,应计=(8-10)/200=-0.01,OCF=10)
+    assert rec["quality"]["op_cashflow_yi"] == pytest.approx(10.0)
+    assert rec["quality"]["net_cash_ratio"] == pytest.approx(1.25)
+    assert rec["quality"]["accrual"] == pytest.approx(-0.01)
+    # 三者 meta.as_of 全为真实年报期 20241231(动态,非 20251231 硬编码)
+    for leaf in ("op_cashflow_yi", "net_cash_ratio", "accrual"):
+        assert rec["meta"][f"quality.{leaf}"]["as_of"] == "20241231"
+
+
+def test_quality_meta_marks_annual_missing_when_no_annual():
+    # 无任何年报(只有季报)→ 年报期取不到。lit_factors 缺失返 None,
+    # 且 op_cashflow 年报口径也取不到 → meta 不应套固定 20251231 伪造年报期。
+    income = pd.DataFrame([{"end_date": "20250331", "total_revenue": 20e8, "n_income_attr_p": 2e8}])
+    fina = pd.DataFrame([{"end_date": "20250331", "or_yoy": 12.0, "netprofit_yoy": 20.0,
+                          "dt_netprofit_yoy": 15.0, "grossprofit_margin": 30.0, "profit_dedt": 1.8e8}])
+    cashflow = pd.DataFrame([{"end_date": "20250331", "n_cashflow_act": 3e8}])
+    balancesheet = pd.DataFrame([{"end_date": "20250331", "total_assets": 210e8,
+                                  "total_hldr_eqy_exc_min_int": 122e8, "goodwill": 5e8,
+                                  "accounts_receiv": 11e8, "money_cap": 28e8}])
+    empty = pd.DataFrame()
+    ft = {"income": income, "fina_indicator": fina, "balancesheet": balancesheet,
+          "cashflow": cashflow, "share_float": empty, "pledge_stat": empty,
+          "stk_holdertrade": empty, "namechange": empty, "forecast": empty, "express": empty}
+    code = "601138.SH"
+    daily, adj = _daily_adj(code)
+    from ashare_gauntlet.factsheet import market_returns
+
+    mr = market_returns(daily, adj, (5, 20))
+    rec = build_record(code, name="x", industry="x", as_of="20250618",
+                       daily_sub=daily, adj_sub=adj, mr=mr, fund_tables=ft,
+                       db_row={"pe_ttm": 20.0, "pb": 2.0, "total_mv": 500000.0})
+    # 无年报 → 三叶子均 None(不伪造),meta 不给它们盖固定年报章
+    assert rec["quality"]["net_cash_ratio"] is None
+    assert rec["quality"]["accrual"] is None
+    assert rec["quality"]["op_cashflow_yi"] is None
+    for leaf in ("op_cashflow_yi", "net_cash_ratio", "accrual"):
+        assert f"quality.{leaf}" not in rec["meta"]
+    # 年报缺失须如实标注(annual_as_of 字段标 None/年报缺失,而非套 20251231)
+    assert rec.get("annual_as_of") is None
+
+
+# ---------------------------------------------------------------------------
+# [契约C2] entry_rank 缺关键技术输入 → entry.score=None、grade 缺失档(非补默认分)
+# ---------------------------------------------------------------------------
+def test_entry_grade_missing_when_score_none():
+    # 历史不足(无横截面分位 pct20)→ entry_rank 返 None 分 → entry.score=None、
+    # grade 设缺失档(不伪造 A/B/C),不抛(round(None) 会崩,实现须挡)。
+    rec = _build(n=10)  # ret20 NaN、pct20 仍会算(全市场只此一股)…
+    # 确保 pct20 缺失:单股 n=10、horizon20 → market_returns 不含 20 档 → 无 pct20
+    assert rec["technical"]["pct20"] is None
+    assert rec["entry"]["score"] is None
+    assert rec["entry"]["grade"] in ("—", "缺失")
+
+
+# ---------------------------------------------------------------------------
+# [契约C1] 事件表为空 → 表示「未知/未确认」,不静默当「确认无事件」
+# ---------------------------------------------------------------------------
+def test_data_coverage_marks_empty_event_tables_unknown():
+    rec = _build()  # _fund_tables 的 5 张事件表全空
+    cov = rec.get("data_coverage")
+    assert cov is not None
+    for ev in ("share_float", "pledge_stat", "stk_holdertrade", "forecast", "express"):
+        assert cov[ev] == "unknown"  # 空 = 未取到 = 未确认,不是「确认无」
+
+
+def test_data_coverage_marks_present_event_tables():
+    code = "601138.SH"
+    daily, adj = _daily_adj(code)
+    from ashare_gauntlet.factsheet import market_returns
+
+    mr = market_returns(daily, adj, (5, 20))
+    ft = _fund_tables()
+    ft["pledge_stat"] = pd.DataFrame([{"end_date": "20260331", "pledge_ratio": 10.0}])
+    rec = build_record(code, name="x", industry="x", as_of="20260618",
+                       daily_sub=daily, adj_sub=adj, mr=mr, fund_tables=ft,
+                       db_row={"pe_ttm": 20.0, "pb": 2.0, "total_mv": 500000.0})
+    cov = rec["data_coverage"]
+    assert cov["pledge_stat"] == "present"  # 有行 = 取到
+    assert cov["share_float"] == "unknown"  # 仍空

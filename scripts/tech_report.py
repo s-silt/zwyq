@@ -99,14 +99,15 @@ def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> 
         f = daily_tech_facts(code, daily, adj, mret)
         rows.append((label, code, f, entry_rank(f)))
 
-    rows.sort(key=lambda r: r[3][0], reverse=True)
+    rows.sort(key=lambda r: (r[3][0] if r[3][0] is not None else -1e9), reverse=True)
     for label, code, f, (score, tag) in rows:
         if f is None:
             print(f"{label} [{code}] 数据不足")
             continue
         p20 = f.get("pct20", float("nan"))
+        sc = f"{score:>3.0f}" if score is not None else "  —"  # 入场分缺失(契约C2)
         print(
-            f"[{score:>3.0f}〕{tag}〕{label} {f['close']:.2f} | {f['trend']} | RSI {f['rsi']:.0f}{f['rsi_dir']} "
+            f"[{sc}〕{tag}〕{label} {f['close']:.2f} | {f['trend']} | RSI {f['rsi']:.0f}{f['rsi_dir']} "
             f"| 距60高 {f['dist_60d_high_pct']:+.0f}% | 近5 {f['ret5_pct']:+.1f}% 近20 {f['ret20_pct']:+.1f}%(分位{p20:.0f}) "
             f"| 量比 {f['vol_ratio']:.2f}"
         )

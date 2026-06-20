@@ -20,15 +20,47 @@ _T = TypeVar("_T")
 
 # Substrings tushare puts in its (bare Exception) API error messages.
 _FATAL_MARKERS = ("过期", "欠费", "余额不足")  # token exhausted/expired -> abort
-_RATE_MARKERS = ("每分钟", "频率", "频繁", "too many", "rate limit")  # throttle -> retry
+# Throttle markers must be *specific* to the rate-limit message, not bare
+# "频率"/"频繁" — those bare substrings also appear in genuine parameter-error
+# wording ("...更频繁", "调用频率参数错误"), which a substring match would
+# misclassify as a transient throttle and waste `attempts` retries before
+# raising (#11). Keep only phrasings that uniquely mark a real rate limit.
+_RATE_MARKERS = (
+    "每分钟",          # "抱歉，您每分钟最多访问该接口N次"
+    "访问频率",        # "访问频率过快/超限"
+    "调用频繁",        # "调用频繁，请稍后再试"
+    "too many",
+    "rate limit",
+)  # throttle -> retry
 
 
 class TokenExpiredError(RuntimeError):
     """The data token is expired/out of credits — fatal; abort the backfill."""
 
+
+class EmptyCoreTableError(RuntimeError):
+    """A core financial-statement table came back empty (0 rows).
+
+    For ``income``/``fina_indicator``/``balancesheet``/``cashflow`` an empty
+    pull is never a real "this company has no statements" — it means the pull
+    failed or returned nothing, and treating it as a true value (caching it /
+    returning it) would poison every downstream computation. Raise loudly so the
+    real error surfaces instead of silently producing fabricated facts.
+    """
+
 # Endpoints pulled per trade date. "daily_basic" / "stk_limit" carry the
 # turnover and price-limit fields used by the tradability filters.
 MARKET_ENDPOINTS: tuple[str, ...] = ("daily", "adj_factor", "daily_basic", "stk_limit")
+
+# Per-symbol full-history tables whose *emptiness* is meaningful vs. fatal:
+#   - core financial statements: 0 rows is never a real value -> raise loudly.
+#   - everything else (event tables: share_float/pledge_stat/stk_holdertrade/
+#     forecast/express, plus namechange) may legitimately be empty.
+# Classifying here (the layer that knows the endpoint) keeps the generic
+# read_or_fetch free of any core/event policy, so other callers aren't affected.
+CORE_SYMBOL_TABLES: frozenset[str] = frozenset(
+    {"income", "fina_indicator", "balancesheet", "cashflow"}
+)
 
 
 def trading_days_from_cal(trade_cal: pd.DataFrame) -> list[str]:
@@ -144,8 +176,26 @@ def fetch_symbol_table(
     for the analysis mode's step 3, replacing the web-scrape of Q1 业绩/风险旗标.
     """
     path = Path(cache_dir) / endpoint / f"{ts_code}.parquet"
+    is_core = endpoint in CORE_SYMBOL_TABLES
 
     def _pull() -> pd.DataFrame:
-        return getattr(pro, endpoint)(ts_code=ts_code)
+        df = call_with_retry(lambda: getattr(pro, endpoint)(ts_code=ts_code))
+        # Guard *before* read_or_fetch caches it: an empty core table must never
+        # be written to disk, or the next run serves the fabricated empty value
+        # from cache and the error is permanently masked.
+        if is_core and df.empty:
+            raise EmptyCoreTableError(
+                f"core table {endpoint!r} returned 0 rows for ts_code={ts_code!r} "
+                f"— refusing to cache an empty financial statement as a real value"
+            )
+        return df
 
-    return read_or_fetch(path, lambda: call_with_retry(_pull))
+    df = read_or_fetch(path, _pull)
+    # Also guard the cache-hit path: a legacy/partial empty parquet on disk for a
+    # core table is just as poisonous as a fresh empty pull — surface it too.
+    if is_core and df.empty:
+        raise EmptyCoreTableError(
+            f"cached core table {endpoint!r} is empty (0 rows) for ts_code={ts_code!r} "
+            f"at {path} — refusing to serve an empty financial statement as a real value"
+        )
+    return df

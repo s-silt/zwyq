@@ -371,3 +371,40 @@ def test_severity_warn_is_emphasized_hint_is_not():
     # 提示:旗标区无该强调(确认是 severity 触发,而非恒定渲染)
     assert "‼" not in hint_g
     assert 'font-weight="700"' not in hint_g
+
+
+# ---------------------------------------------------------------------------
+# data_coverage:事件表空=未取到,卡底部 surface(中性灰字,且高度容纳不被裁)
+# ---------------------------------------------------------------------------
+def test_data_coverage_unknown_surfaced_in_card():
+    rec = _rec()
+    rec["data_coverage"] = {
+        "share_float": "present", "pledge_stat": "present",
+        "stk_holdertrade": "unknown", "forecast": "present", "express": "unknown",
+    }
+    svg = render_svg_card(rec, cohort=_cohort())
+    assert "数据未取到" in svg
+    assert "未确认" in svg
+    assert svg.lstrip().startswith("<svg") and "</svg>" in svg
+
+
+def test_data_coverage_grows_card_height_not_clipped():
+    flags = [
+        {"type": "质押", "severity": "提示", "fact": "质押10%", "date": "20260618"},
+        {"type": "解禁", "severity": "提示", "fact": "解禁5%", "date": "20260701"},
+    ]
+    base = render_svg_card(_rec(flags=flags), cohort=_cohort())
+    rec = _rec(flags=flags)
+    rec["data_coverage"] = {
+        "share_float": "present", "pledge_stat": "present",
+        "stk_holdertrade": "present", "forecast": "present", "express": "unknown",
+    }
+    withcov = render_svg_card(rec, cohort=_cohort())
+    hb = int(re.search(r'height="(\d+)"', base).group(1))
+    hc = int(re.search(r'height="(\d+)"', withcov).group(1))
+    assert hc > hb  # 未取到 caveat 多一行 → 卡更高,不被底框裁
+
+
+def test_data_coverage_missing_no_crash_svg():
+    svg = render_svg_card(_rec(), cohort=_cohort())  # _rec 无 data_coverage
+    assert "数据未取到" not in svg and svg.lstrip().startswith("<svg")

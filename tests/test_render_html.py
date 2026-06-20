@@ -423,3 +423,25 @@ def test_real_cards_well_formed_no_unescaped_ampersand():
     markup = re.sub(r"<script\b[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
     markup = re.sub(r"<style\b[^>]*>.*?</style>", "", markup, flags=re.DOTALL | re.IGNORECASE)
     assert not re.search(r"&(?!amp;|lt;|gt;|quot;|apos;|#)", markup)
+
+
+# ---------------------------------------------------------------------------
+# data_coverage:事件表空=未取到,dashboard 要 surface(内嵌 SVG 卡 + 概览旗标 title)
+# ---------------------------------------------------------------------------
+def test_data_coverage_unknown_surfaced_in_dashboard():
+    rec = _rec()
+    rec["data_coverage"] = {
+        "share_float": "present", "pledge_stat": "present",
+        "stk_holdertrade": "unknown", "forecast": "present", "express": "unknown",
+    }
+    html = render_dashboard([rec])
+    assert "数据未取到" in html  # 经内嵌 render_svg_card 卡 / 概览旗标单元格 title
+
+
+def test_data_coverage_all_present_no_caveat_dashboard():
+    rec = _rec()
+    rec["data_coverage"] = {
+        k: "present" for k in ("share_float", "pledge_stat", "stk_holdertrade", "forecast", "express")
+    }
+    html = render_dashboard([rec])
+    assert "数据未取到" not in html

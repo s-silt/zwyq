@@ -24,7 +24,7 @@ from __future__ import annotations
 import html as _html
 from typing import Any, Optional
 
-from ashare_gauntlet.render_svg import render_svg_card
+from ashare_gauntlet.render_svg import _coverage_unknowns, render_svg_card
 
 # ---------------------------------------------------------------------------
 # 常量(色盲安全:颜色仅辅助,文字档名+图标承载语义)
@@ -316,12 +316,13 @@ def _spark_multiples(rec: dict[str, Any]) -> str:
     )
 
 
-def _flag_cell(flags: list[Any], nflags: int) -> str:
+def _flag_cell(flags: list[Any], nflags: int, unknown: list[str]) -> str:
     """概览表旗标列:中性 _FLAG_ICON 按 type(不用随计数放大的红旗 🚩×N);
     title 枚举每条旗的 type·fact·date(severity),与 SVG/MD 口径一致,
-    色盲/读屏不展开行也能拿到事件文字。"""
+    色盲/读屏不展开行也能拿到事件文字。``unknown``=事件表空(未取到)的中文名,
+    用 ⚐ 标记 + title 注明「未取到≠确认无」(memory analysis-priorities:缺数据 surface 不藏)。"""
     valid = [fl for fl in flags if isinstance(fl, dict)]
-    if not valid:
+    if not valid and not unknown:
         return (
             f'<td class="flags" data-v="{nflags}" title="无中性提示旗">·</td>'
         )
@@ -345,9 +346,12 @@ def _flag_cell(flags: list[Any], nflags: int) -> str:
         f"{_FLAG_ICON.get(t, '•')}{('×' + str(counts[t])) if counts[t] > 1 else ''}"
         for t in order
     )
+    if unknown:  # 事件表未取到:⚐ 标记 + title,概览不展开也能看到"非确认无"
+        icons += "⚐"
+        title_lines.append("数据未取到:" + "、".join(unknown) + "(未确认,非「确认无」)")
     title = "；".join(title_lines)
     return (
-        f'<td class="flags" data-v="{nflags}" title="{_esc(title)}">{icons}</td>'
+        f'<td class="flags" data-v="{nflags}" title="{_esc(title)}">{icons or "·"}</td>'
     )
 
 
@@ -392,7 +396,7 @@ def _row(rec: dict[str, Any], idx: int, cohort: list[dict[str, Any]], pcts: dict
         + _bar_cell("资金", dims["资金"], f"净现比 {_fmt(_num(rec,'quality.net_cash_ratio'),2,'倍')}")
     )
     spark_cell = f'<td class="spark" data-v="{_esc(name)}">{_spark_multiples(rec)}</td>'
-    flag_cell = _flag_cell(flags, nflags)
+    flag_cell = _flag_cell(flags, nflags, _coverage_unknowns(rec))
     trend_cell = f'<td class="trend" data-v="{_esc(trend)}">{_esc(trend)}</td>'
 
     # 钻取详情行:内联 B 的单股 SVG 卡(cohort=全量)。

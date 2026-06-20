@@ -322,3 +322,33 @@ def test_cash_quality_header_falls_back_when_meta_missing() -> None:
     out = render_md([rec])
     assert "现金质量（@年报）" in out
     assert "2025" not in out.split("现金质量")[1].split("\n")[0]
+
+
+# ---------------------------------------------------------------------------
+# data_coverage:事件表空=未取到,面板要 surface(区分"确认无"vs"没取到",中性不恐吓)
+# ---------------------------------------------------------------------------
+def test_data_coverage_unknown_surfaced_as_neutral_caveat() -> None:
+    rec = _rec("601138.SH", "工业富联", "🟢")
+    rec["data_coverage"] = {
+        "share_float": "present", "pledge_stat": "present",
+        "stk_holdertrade": "unknown", "forecast": "present", "express": "unknown",
+    }
+    out = render_md([rec])
+    assert "数据未取到" in out
+    assert "减持" in out and "业绩快报" in out  # stk_holdertrade→减持 / express→业绩快报
+    assert "未确认" in out  # 明确区分"未取到"与"确认无"
+
+
+def test_data_coverage_all_present_no_caveat() -> None:
+    rec = _rec("601138.SH", "工业富联", "🟢")
+    rec["data_coverage"] = {
+        k: "present" for k in ("share_float", "pledge_stat", "stk_holdertrade", "forecast", "express")
+    }
+    out = render_md([rec])
+    assert "数据未取到" not in out
+
+
+def test_data_coverage_missing_field_no_crash() -> None:
+    rec = _rec("601138.SH", "工业富联", "🟢")  # 无 data_coverage 键(旧记录)
+    out = render_md([rec])
+    assert isinstance(out, str) and "数据未取到" not in out

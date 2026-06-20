@@ -52,6 +52,20 @@ def _md(s: object) -> str:
     )
 
 
+# data_coverage 事件表 -> 中文事件名。事件表空=「未取到」(未确认)≠「确认无事件」。
+_COVERAGE_LABELS: dict[str, str] = {
+    "share_float": "解禁", "pledge_stat": "质押", "stk_holdertrade": "减持",
+    "forecast": "业绩预告", "express": "业绩快报",
+}
+_COVERAGE_ORDER = ("share_float", "pledge_stat", "stk_holdertrade", "forecast", "express")
+
+
+def _coverage_unknowns(rec: dict[str, Any]) -> list[str]:
+    """rec.data_coverage 里取数失败(unknown)的事件表中文名(顺序固定)。"""
+    cov = rec.get("data_coverage") or {}
+    return [_COVERAGE_LABELS[k] for k in _COVERAGE_ORDER if cov.get(k) == "unknown"]
+
+
 def _fmt(value: Any, *, suffix: str = "", decimals: int = 2, pct_sign: bool = False) -> str:
     """格式化数值;None/非数 -> 占位 "—"(绝不当 0)。
 
@@ -246,6 +260,10 @@ def _detail_section(rec: dict[str, Any]) -> list[str]:
             out.append(f"- 🚩 [{sev}] {ftype}:{fact}（{date}{('，' + src) if src else ''}）")
     else:
         out.append(f"- {_NA} 无事件提示")
+    # 事件表空=未取到(未确认,非确认无):中性 surface,区分缺数据与"确认无事件"。
+    unknown = _coverage_unknowns(rec)
+    if unknown:
+        out.append(f"- ⚐ 数据未取到:{'、'.join(unknown)}(未确认,非「确认无」)")
     out.append("")
 
     # factcheck:非空则与接口数字并列,标"独立核实"

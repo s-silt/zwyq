@@ -56,6 +56,20 @@ FLAG_ICON: dict[str, str] = {
     "超预期": "✨",
 }
 
+# data_coverage 事件表 -> 中文事件名。事件表空=「未取到」(未确认),≠「确认无事件」;
+# 面板要 surface 这一区分(memory analysis-priorities:坏/缺数据 surface 不藏)。
+_COVERAGE_LABELS: dict[str, str] = {
+    "share_float": "解禁", "pledge_stat": "质押", "stk_holdertrade": "减持",
+    "forecast": "业绩预告", "express": "业绩快报",
+}
+_COVERAGE_ORDER = ("share_float", "pledge_stat", "stk_holdertrade", "forecast", "express")
+
+
+def _coverage_unknowns(record: dict[str, Any]) -> list[str]:
+    """record.data_coverage 里取数失败(unknown)的事件表中文名(顺序固定)。"""
+    cov = record.get("data_coverage") or {}
+    return [_COVERAGE_LABELS[k] for k in _COVERAGE_ORDER if cov.get(k) == "unknown"]
+
 
 # ---------------------------------------------------------------------------
 # 小工具
@@ -411,10 +425,10 @@ def _flag_dicts(record: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _card_height(record: dict[str, Any]) -> int:
     """按旗标数动态算画布高:基准 H,旗标多时增高,保证末条 ly <= H - 安全余量。"""
-    n = len(_flag_dicts(record))
-    if n <= 0:
-        return H
-    last_ly = _FLAG_FIRST_Y + (n - 1) * _FLAG_STEP
+    n_flags = len(_flag_dicts(record))
+    n_cov = 1 if _coverage_unknowns(record) else 0  # 未取到 caveat 占 1 行
+    rows = (n_flags if n_flags else 1) + n_cov  # 无旗也占 1 行消息
+    last_ly = _FLAG_FIRST_Y + (rows - 1) * _FLAG_STEP
     return max(H, last_ly + _FLAG_BOTTOM_PAD)
 
 
@@ -431,12 +445,13 @@ def _flags(record: dict[str, Any]) -> str:
         f'<line x1="16" y1="{y - 18}" x2="{W - 16}" y2="{y - 18}" stroke="{GRID}" stroke-width="1"/>'
         f'<text x="16" y="{y}" font-size="12" font-weight="700" fill="{INK}">事件提示旗(中性事实,非买卖信号)</text>'
     ]
+    ly = _FLAG_FIRST_Y
     if not flags:
         parts.append(
-            f'<text x="16" y="{y + 20}" font-size="12" fill="{MUTE}">无质押/解禁/减持/超预期旗标</text>'
+            f'<text x="16" y="{ly}" font-size="12" fill="{MUTE}">无质押/解禁/减持/超预期旗标</text>'
         )
+        ly += _FLAG_STEP
     else:
-        ly = _FLAG_FIRST_Y
         for fl in flags:
             ftype = str(fl.get("type", ""))
             icon = FLAG_ICON.get(ftype, "•")
@@ -457,6 +472,14 @@ def _flags(record: dict[str, Any]) -> str:
                 f'<title>{_esc(label)}</title></text>'
             )
             ly += _FLAG_STEP
+    # 事件表空=未取到(未确认,非确认无):中性灰字 surface,区分缺数据与"确认无事件"。
+    unknown = _coverage_unknowns(record)
+    if unknown:
+        cov = "⚐ 数据未取到:" + "、".join(unknown) + "(未确认,非「确认无」)"
+        parts.append(
+            f'<text x="16" y="{ly}" font-size="11" fill="{MUTE}" aria-label="{_esc(cov)}">'
+            f'{_esc(cov)}<title>{_esc(cov)}</title></text>'
+        )
     parts.append("</g>")
     return "".join(parts)
 

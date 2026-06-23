@@ -33,6 +33,14 @@ _RATE_MARKERS = (
     "rate limit",
 )  # throttle -> retry
 
+# Source-side transient unavailability: the (self-hosted) proxy's upstream
+# briefly drops and returns "上游数据源暂时不可用" on an otherwise-valid call —
+# distinct from rate-limiting but equally retryable (the same call usually
+# succeeds on retry). A genuinely persistent case (e.g. a trade date whose data
+# isn't published yet) simply exhausts attempts and then propagates, which the
+# caller handles (e.g. survivors falls back to the previous trading day).
+_TRANSIENT_MARKERS = ("暂时不可用",)  # source temporarily down -> retry
+
 
 class TokenExpiredError(RuntimeError):
     """The data token is expired/out of credits — fatal; abort the backfill."""
@@ -48,9 +56,28 @@ class EmptyCoreTableError(RuntimeError):
     real error surfaces instead of silently producing fabricated facts.
     """
 
+
+class EmptyMarketDayError(RuntimeError):
+    """A full-market per-trade-date pull came back empty (0 rows).
+
+    For ``daily``/``adj_factor``/``daily_basic``/``stk_limit`` the whole market is
+    ~5000 rows on any open trading day — 0 rows is never "no trading happened",
+    it means the source hasn't published this day's EOD yet (or the pull failed).
+    Caching it writes an empty parquet that the *idempotent* backfill then skips
+    forever, so the real data can never land until the stale file is deleted by
+    hand. Raise loudly and refuse to cache, so the next run simply retries.
+    """
+
 # Endpoints pulled per trade date. "daily_basic" / "stk_limit" carry the
 # turnover and price-limit fields used by the tradability filters.
 MARKET_ENDPOINTS: tuple[str, ...] = ("daily", "adj_factor", "daily_basic", "stk_limit")
+
+# Full-market endpoints whose *emptiness* on an open trading day is never real
+# (the whole market is ~5000 rows) -> raise instead of caching the empty pull.
+# "hk_hold" (北向持股) is intentionally excluded: it can legitimately be empty.
+NONEMPTY_MARKET_ENDPOINTS: frozenset[str] = frozenset(
+    {"daily", "adj_factor", "daily_basic", "stk_limit"}
+)
 
 # Per-symbol full-history tables whose *emptiness* is meaningful vs. fatal:
 #   - core financial statements: 0 rows is never a real value -> raise loudly.
@@ -91,7 +118,7 @@ def call_with_retry(
             if any(marker in message for marker in _FATAL_MARKERS):
                 raise TokenExpiredError(message) from error
             transient = isinstance(error, requests.exceptions.RequestException) or any(
-                marker in message.lower() for marker in _RATE_MARKERS
+                marker in message.lower() for marker in (*_RATE_MARKERS, *_TRANSIENT_MARKERS)
             )
             if not transient:
                 raise
@@ -108,8 +135,16 @@ def fetch_market_day(
     trade_date: str,
     cache_dir: str | Path,
 ) -> pd.DataFrame:
-    """Cached full-market pull of ``endpoint`` for one ``trade_date``."""
+    """Cached full-market pull of ``endpoint`` for one ``trade_date``.
+
+    For the full-market price/factor endpoints (``NONEMPTY_MARKET_ENDPOINTS``) an
+    empty pull means the source hasn't published this day's EOD yet — never a real
+    value. Refuse to cache it (and refuse to serve a legacy empty cache), so the
+    next run retries instead of an empty parquet blocking the date forever. See
+    ``EmptyMarketDayError``.
+    """
     path = Path(cache_dir) / endpoint / f"{trade_date}.parquet"
+    must_be_nonempty = endpoint in NONEMPTY_MARKET_ENDPOINTS
     fields = (
         "ts_code,trade_date,turnover_rate,circ_mv,total_mv"
         if endpoint == "daily_basic"
@@ -118,11 +153,27 @@ def fetch_market_day(
 
     def _pull() -> pd.DataFrame:
         method = getattr(pro, endpoint)
-        if fields:
-            return method(trade_date=trade_date, fields=fields)
-        return method(trade_date=trade_date)
+        df = method(trade_date=trade_date, fields=fields) if fields else method(trade_date=trade_date)
+        # Guard *before* read_or_fetch caches it: an empty full-market pull must
+        # never be written, or the idempotent backfill skips the date forever.
+        if must_be_nonempty and df.empty:
+            raise EmptyMarketDayError(
+                f"market endpoint {endpoint!r} returned 0 rows for trade_date={trade_date!r} "
+                f"— the source likely hasn't published this day's EOD yet; refusing to cache "
+                f"an empty full-market pull as a real value"
+            )
+        return df
 
-    return read_or_fetch(path, lambda: call_with_retry(_pull))
+    df = read_or_fetch(path, lambda: call_with_retry(_pull))
+    # Also guard the cache-hit path: a legacy empty parquet (written before this
+    # guard, or by an earlier pre-publish pull) is just as poisonous — surface it
+    # so the date refetches once the stale file is gone, instead of serving 0 rows.
+    if must_be_nonempty and df.empty:
+        raise EmptyMarketDayError(
+            f"cached market endpoint {endpoint!r} is empty (0 rows) for trade_date={trade_date!r} "
+            f"at {path} — refusing to serve an empty full-market pull as a real value"
+        )
+    return df
 
 
 def fetch_range(

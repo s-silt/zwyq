@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import pandas as pd
 
+from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
@@ -56,14 +57,7 @@ def _load(ep: str) -> pd.DataFrame:
 
 
 def _load_env(path: str = ".env.local") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            s = line.strip()
-            if s and not s.startswith("#") and "=" in s:
-                k, v = s.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    load_env_local(path)  # .env.local 权威覆盖(见 ashare_gauntlet.data.env)
 
 
 def _tech_table(daily: pd.DataFrame, adj: pd.DataFrame, mr: dict[int, pd.Series], a: argparse.Namespace) -> tuple[pd.DataFrame, str]:
@@ -98,6 +92,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-price", type=float, default=300.0)
     ap.add_argument("--grades", default="🟢")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--industries", default=None,
+                    help="逗号分隔的行业子串过滤(substring),如 通信设备,元器件,半导体,IT设备,软件服务,互联网")
     a = ap.parse_args(argv)
 
     _load_env()
@@ -108,15 +104,32 @@ def main(argv: list[str] | None = None) -> None:
     df, as_of = _tech_table(daily, adj, mr, a)
 
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
-    db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv"))
+    # 估值表(daily_basic)常比行情(daily)晚发布几小时 —— 当天 as_of 取不到时
+    # 优雅回退到最近一个有估值的交易日(PE/PB 慢变,隔一两个交易日口径可接受),
+    # 免得 "估值还没发" 把整个筛选卡死(周五早跑的周更任务也吃这个保护)。
+    db, val_as_of = None, as_of
+    for d in sorted({str(x) for x in daily["trade_date"].unique()}, reverse=True)[:6]:
+        try:
+            cand = call_with_retry(lambda dd=d: pro.daily_basic(trade_date=dd, fields="ts_code,pe_ttm,pb,total_mv"))
+        except Exception as e:  # 源暂不可用/未发布 —— 回退上一交易日,不炸整池
+            print(f"  daily_basic({d}) 不可用({str(e)[:24]}),回退上一交易日…", file=sys.stderr, flush=True)
+            continue
+        if cand is not None and not cand.empty:
+            db, val_as_of = cand, d
+            break
+    if db is None or db.empty:
+        raise SystemExit("daily_basic 连续多日取不到 —— 估值数据源异常,稍后重试")
+    if val_as_of != as_of:
+        print(f"⚠ 估值口径={val_as_of}(as_of={as_of} 估值尚未发布);价格/动量仍为 {as_of},PE/PB 滞后 1+ 交易日", flush=True)
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry"))
     df = df.merge(db, on="ts_code", how="left").merge(sb, on="ts_code", how="left")
 
     # 关②:估值/盈利/趋势过滤(全行业,不限板块内部)
+    inds = tuple(s for s in a.industries.split(",") if s) if a.industries else None
     cand = screen_candidates(df, boards=_BOARDS[a.board], max_price=a.max_price,
                              min_pct20=a.min_pct20, max_dist60=None, trends=("多头", "纠缠"),
                              require_profitable=True, max_pe=a.max_pe, max_pb=None,
-                             industries=None, sort_by="pct20", ascending=False, top=999)
+                             industries=inds, sort_by="pct20", ascending=False, top=999)
     codes = list(cand["ts_code"])
     if a.limit:
         codes = codes[:a.limit]

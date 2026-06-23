@@ -6,8 +6,10 @@ import requests
 
 from ashare_gauntlet.data.fetch import (
     EmptyCoreTableError,
+    EmptyMarketDayError,
     TokenExpiredError,
     call_with_retry,
+    fetch_market_day,
     fetch_symbol_history,
     fetch_symbol_table,
     trading_days_from_cal,
@@ -214,3 +216,99 @@ def test_call_with_retry_does_not_retry_param_error_mentioning_frequency():
     with pytest.raises(Exception, match="参数错误"):
         call_with_retry(bad_param, attempts=5, base_delay=0.0, sleep=lambda _: None)
     assert calls == [1]
+
+
+# --- market-day 空守卫: 全市场某天取到 0 行 != 真值, 不落盘/读回都响亮抛 ---
+
+
+class _MarketPro:
+    """按端点返回注册好的 DataFrame 的全市场(trade_date)假 pro; 记录调用。"""
+
+    def __init__(self, returns: dict[str, pd.DataFrame]) -> None:
+        self._returns = returns
+        self.calls: list[tuple[str, str]] = []
+
+    def __getattr__(self, endpoint: str):
+        def _method(trade_date: str, fields: str = "") -> pd.DataFrame:
+            self.calls.append((endpoint, trade_date))
+            return self._returns[endpoint]
+
+        return _method
+
+
+@pytest.mark.parametrize("endpoint", ["daily", "adj_factor", "daily_basic", "stk_limit"])
+def test_fetch_market_day_raises_when_full_market_pull_is_empty(tmp_path, endpoint):
+    # 整个市场某交易日取到 0 行不是 "这天没行情", 而是源还没发布 EOD / 没取到 ->
+    # 必须响亮抛错, 异常里带 trade_date + endpoint 方便定位, 不能把空当真值。
+    pro = _MarketPro({endpoint: pd.DataFrame()})
+
+    with pytest.raises(EmptyMarketDayError) as excinfo:
+        fetch_market_day(pro, endpoint, "20260622", tmp_path)
+
+    message = str(excinfo.value)
+    assert "20260622" in message
+    assert endpoint in message
+
+
+def test_fetch_market_day_does_not_cache_empty_full_market(tmp_path):
+    # 空的全市场结果绝不能落盘 — 否则幂等机制下次跳过它, 当天真数据被空文件永久挡死
+    # (这正是 6/22 踩的坑)。落盘前就该抛。
+    pro = _MarketPro({"daily": pd.DataFrame()})
+
+    with pytest.raises(EmptyMarketDayError):
+        fetch_market_day(pro, "daily", "20260622", tmp_path)
+
+    assert not (tmp_path / "daily" / "20260622.parquet").exists()
+
+
+def test_fetch_market_day_raises_when_reading_back_empty_cache(tmp_path):
+    # 磁盘上已有一份历史遗留的空当日缓存(早先 EOD 未发布时写入的 0 行 parquet),
+    # 读回来也要抛 — 读写两条路径都护住, 不能把空文件当真值返回。
+    path = tmp_path / "daily" / "20260622.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame().to_parquet(path, index=False)
+    pro = _MarketPro({"daily": pd.DataFrame({"ts_code": ["A"], "trade_date": ["20260622"]})})
+
+    with pytest.raises(EmptyMarketDayError):
+        fetch_market_day(pro, "daily", "20260622", tmp_path)
+    assert pro.calls == []  # 命中缓存; 不应再次拉取
+
+
+def test_fetch_market_day_returns_non_empty_full_market(tmp_path):
+    df = pd.DataFrame({"ts_code": ["600519.SH"], "trade_date": ["20260622"], "close": [1500.0]})
+    pro = _MarketPro({"daily": df})
+
+    out = fetch_market_day(pro, "daily", "20260622", tmp_path)
+
+    pd.testing.assert_frame_equal(out, df)
+    assert (tmp_path / "daily" / "20260622.parquet").exists()
+
+
+def test_fetch_market_day_allows_empty_non_guarded_endpoint(tmp_path):
+    # 不在 "必非空" 守卫范围内的端点(如 hk_hold 北向持股, 可能合法为空)照常缓存返回, 不抛。
+    pro = _MarketPro({"hk_hold": pd.DataFrame()})
+
+    out = fetch_market_day(pro, "hk_hold", "20260622", tmp_path)
+
+    assert out.empty
+    assert (tmp_path / "hk_hold" / "20260622.parquet").exists()
+
+
+# --- 源 "上游数据源暂时不可用" 是瞬时抖动 -> 应重试, 不能一次就抛 ---
+
+
+def test_call_with_retry_retries_on_source_temporarily_unavailable():
+    # 这个代理源偶发返回 "上游数据源暂时不可用" —— 同一调用重试常常就成功,
+    # 属瞬时错误。若当成不可重试的 API 错误一次就抛, 整条回填/筛选会被一次抽风打断。
+    calls: list[int] = []
+
+    def flaky_source() -> str:
+        calls.append(1)
+        if len(calls) < 3:
+            raise Exception("上游数据源暂时不可用")
+        return "ok"
+
+    out = call_with_retry(flaky_source, attempts=5, base_delay=0.0, sleep=lambda _s: None)
+
+    assert out == "ok"
+    assert len(calls) == 3

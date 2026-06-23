@@ -11,6 +11,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import (
     TokenExpiredError,
     fetch_market_day,
@@ -39,6 +40,7 @@ def _pull_day(pro: object, day: str, cache_dir: str) -> list[str]:
 
 
 def main(start: str, end: str, cache_dir: str = "data/cache") -> None:
+    load_env_local()  # .env.local 权威覆盖 —— 调度任务可能没继承到新源的环境变量
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
     cal = pro.trade_cal(exchange="SSE", start_date=start, end_date=end)
     days = trading_days_from_cal(cal)

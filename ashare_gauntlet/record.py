@@ -482,3 +482,60 @@ def merge_factcheck(record: dict[str, Any], fc: dict[str, Any] | None) -> dict[s
         "verified_at": fc.get("verified_at"),
     }
     return out
+
+
+def compute_holdscore(record: dict) -> float:
+    """持有分(质地优先排序分):叠在 tier 之上量化"有多干净、值得持有"。
+
+    质地基座(tier)主导,再叠 盈利质量(扣非≥净利=真 / 净利远超扣非=靠非经常)、
+    现金流方向(净现比>0=真钱)、估值高低,并对低基数幻觉(净利暴增但营收没跟上)扣分。
+    **位置/动量不进此分** —— 持有分只管"质地有多干净",买入时机(MA20/回踩)另算。
+    用于"质地优先排序":先按持有分由高到低排,再看位置决定何时买(见 [[stock-analysis-mode]])。
+    """
+    f = record.get("fundamental") or {}
+    q = record.get("quality") or {}
+    v = record.get("valuation") or {}
+    grade = str((record.get("tier") or {}).get("grade") or "")
+
+    score = {"🟢": 55.0, "🟡": 32.0, "🔴": 12.0, "⛔": 0.0}.get(grade, 0.0)
+
+    np_yoy = f.get("np_yoy")
+    dedt = f.get("dedt_yoy")
+    rev = f.get("rev_yoy")
+    ncr = q.get("net_cash_ratio")
+    pe = v.get("pe_ttm")
+    peg = v.get("peg")
+
+    # 盈利质量:扣非≥净利=真增长;净利远超扣非=靠非经常,扣分
+    if isinstance(dedt, (int, float)) and isinstance(np_yoy, (int, float)):
+        if dedt >= np_yoy:
+            score += 8.0
+        elif np_yoy - dedt > 30:
+            score -= 6.0
+
+    # 现金流方向:净现比>0=真钱(分水岭);为负=警示
+    if isinstance(ncr, (int, float)):
+        score += 7.0 if ncr > 0 else -6.0
+
+    # 低基数幻觉:净利暴增但营收没跟上(见铁律)
+    if isinstance(np_yoy, (int, float)) and isinstance(rev, (int, float)):
+        if np_yoy > 200 and rev < 30:
+            score -= 12.0
+
+    # 估值:便宜加分、贵扣分(PE 低≠能买,但贵确实该减分)
+    if isinstance(pe, (int, float)) and pe > 0:
+        if pe < 15:
+            score += 10.0
+        elif pe < 25:
+            score += 5.0
+        elif pe > 60:
+            score -= 12.0
+        elif pe > 40:
+            score -= 6.0
+    if isinstance(peg, (int, float)) and peg > 0:
+        if peg < 0.5:
+            score += 4.0
+        elif peg > 3:
+            score -= 4.0
+
+    return round(score, 1)

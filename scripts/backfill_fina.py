@@ -29,25 +29,28 @@ from ashare_gauntlet.screen import board_of
 
 CACHE = "data/cache"
 LEAN_TABLES: tuple[str, ...] = ("fina_indicator",)
+CORE_TABLES: tuple[str, ...] = ("income", "fina_indicator", "balancesheet", "cashflow")
 FULL_TABLES: tuple[str, ...] = (
-    "income", "fina_indicator", "balancesheet", "cashflow",
+    *CORE_TABLES,
     "forecast", "express", "share_float", "pledge_stat", "stk_holdertrade", "namechange",
 )
 MAIN_BOARDS = ("沪主板", "深主板")
 
 
 def tables_for_mode(mode: str) -> tuple[str, ...]:
-    """模式 → 要拉的表集(纯函数)。lean 只拉 fina_indicator;full 拉核心+预警表。"""
+    """模式 → 要拉的表集(纯函数)。lean 只拉 fina_indicator;core 拉 4 核心财报表;full 拉核心+预警表。"""
     if mode == "lean":
         return LEAN_TABLES
+    if mode == "core":
+        return CORE_TABLES
     if mode == "full":
         return FULL_TABLES
-    raise ValueError(f"未知 mode={mode!r}(应为 lean / full)")
+    raise ValueError(f"未知 mode={mode!r}(应为 lean / core / full)")
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="lean", choices=("lean", "full"))
+    ap.add_argument("--mode", default="lean", choices=("lean", "core", "full"))
     ap.add_argument("--board", default="main", choices=("main", "all"))
     ap.add_argument("--limit", type=int, default=0, help="只拉前 N 只(0=全部),用于试跑")
     a = ap.parse_args(argv)

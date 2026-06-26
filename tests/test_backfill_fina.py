@@ -23,6 +23,15 @@ def test_full_superset_of_lean():
     assert set(tables_for_mode("lean")) <= set(tables_for_mode("full"))
 
 
+def test_core_is_four_core_financial_tables():
+    # core = 4 核心财报表(income/fina_indicator/balancesheet/cashflow),无预警表
+    assert set(tables_for_mode("core")) == {"income", "fina_indicator", "balancesheet", "cashflow"}
+
+
+def test_lean_subset_of_core_subset_of_full():
+    assert set(tables_for_mode("lean")) <= set(tables_for_mode("core")) <= set(tables_for_mode("full"))
+
+
 def test_invalid_mode_raises():
     with pytest.raises(ValueError):
         tables_for_mode("bogus")

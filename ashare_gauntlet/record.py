@@ -484,6 +484,34 @@ def merge_factcheck(record: dict[str, Any], fc: dict[str, Any] | None) -> dict[s
     return out
 
 
+def lean_tier(np_yoy: object, dedt_yoy: object, rev_yoy: object,
+              ocfps: object, roe: object) -> str:
+    """精简定档 —— 只用 fina_indicator 字段(无预警表)粗分四档,供"全市场质地首过"。
+
+    完整 tier_of 需 income/cashflow/预警表(质押/减持/forecast)才能抓 ⛔ 地雷;本函数只用
+    三增 + 经营现金流方向 + ROE,做 daily_basic 拉不到的"基本面首过",不替代完整 tier。
+    🔴 = 亏损(roe<0)或三降;🟢 = 三增且经营现金流为正;其余 🟡。无 ⛔(留给完整版)。
+    """
+    def num(x: object) -> float | None:
+        if isinstance(x, (int, float)) and x == x:  # 排除 NaN
+            return float(x)
+        return None
+
+    n, d, r = num(np_yoy), num(dedt_yoy), num(rev_yoy)
+    roe_v, ocf = num(roe), num(ocfps)
+    triple = (n, d, r)
+
+    loss = roe_v is not None and roe_v < 0
+    triple_down = all(x is not None and x < 0 for x in triple)
+    if loss or triple_down:
+        return "🔴"
+    triple_up = all(x is not None and x > 0 for x in triple)
+    cash_pos = ocf is not None and ocf > 0
+    if triple_up and cash_pos:
+        return "🟢"
+    return "🟡"
+
+
 def compute_holdscore(record: dict) -> float:
     """持有分(质地优先排序分):叠在 tier 之上量化"有多干净、值得持有"。
 

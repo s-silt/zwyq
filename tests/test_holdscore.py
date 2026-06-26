@@ -1,5 +1,31 @@
 """Tests for compute_holdscore —— 持有分(质地优先排序分),叠在 tier 之上量化质地。"""
-from ashare_gauntlet.record import compute_holdscore
+from ashare_gauntlet.record import compute_holdscore, lean_tier
+
+
+def test_lean_tier_triple_up_cash_positive_is_green():
+    assert lean_tier(40, 45, 30, ocfps=5.0, roe=12.0) == "🟢"
+
+
+def test_lean_tier_triple_down_is_red():
+    assert lean_tier(-50, -60, -20, ocfps=5.0, roe=8.0) == "🔴"
+
+
+def test_lean_tier_loss_roe_negative_is_red():
+    assert lean_tier(20, 20, 15, ocfps=5.0, roe=-3.0) == "🔴"
+
+
+def test_lean_tier_cash_negative_drops_from_green():
+    # 三增但经营现金流为负 → 不给 🟢(现金是分水岭)
+    assert lean_tier(40, 45, 30, ocfps=-2.0, roe=12.0) == "🟡"
+
+
+def test_lean_tier_not_triple_up_is_yellow():
+    # 扣非负(非三增)但不亏损 → 🟡
+    assert lean_tier(40, -5, 30, ocfps=5.0, roe=12.0) == "🟡"
+
+
+def test_lean_tier_missing_fields_defaults_yellow():
+    assert lean_tier(None, None, None, ocfps=None, roe=None) == "🟡"
 
 
 def _rec(grade, np_yoy, dedt, rev, ncr, pe, peg=None):

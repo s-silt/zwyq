@@ -84,6 +84,10 @@ def main(argv: list[str] | None = None) -> None:
                     ignore_index=True)
     as_of = str(daily["trade_date"].max())
     mr = market_returns(daily, adj, (5, 20))
+    # 预先按 ts_code 分组成字典(O(1) 查),避免循环里对全表反复过滤(O(n²))
+    daily_g = {str(c): g for c, g in daily.groupby("ts_code")}
+    adj_g = {str(c): g for c, g in adj.groupby("ts_code")}
+    _empty = daily.iloc[:0]
 
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
     db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv"))
@@ -101,8 +105,8 @@ def main(argv: list[str] | None = None) -> None:
         try:
             rec = build_record(code, name=str(name_d.get(code, code)),
                                industry=str(ind) if isinstance(ind, str) and ind else "-", as_of=as_of,
-                               daily_sub=cast(pd.DataFrame, daily[daily["ts_code"] == code]),
-                               adj_sub=cast(pd.DataFrame, adj[adj["ts_code"] == code]),
+                               daily_sub=cast(pd.DataFrame, daily_g.get(code, _empty)),
+                               adj_sub=cast(pd.DataFrame, adj_g.get(code, _empty)),
                                mr=mr, fund_tables=load_core_tables(code), db_row=db_d.get(code))
         except Exception as e:
             print(f"  {code} 失败: {type(e).__name__}: {str(e)[:40]}", flush=True)

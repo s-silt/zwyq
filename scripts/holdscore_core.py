@@ -47,13 +47,12 @@ def core_universe(board: str) -> list[str]:
 
 
 def load_core_tables(code: str) -> dict[str, pd.DataFrame]:
-    """核心表从本地读、预警表留空(不拉 API)。"""
+    """核心表 + 预警表都从本地读(预警表已 backfill 全主板,tier_of 才能做 ⛔ 治理雷检测:
+    ST/质押/解禁/预亏);本地缺则留空 DataFrame(graceful,不拉 API)。"""
     ft: dict[str, pd.DataFrame] = {}
-    for t in CORE:
+    for t in (*CORE, *WARN):
         p = f"{CACHE}/{t}/{code}.parquet"
         ft[t] = pd.read_parquet(p) if os.path.exists(p) else pd.DataFrame()
-    for t in WARN:
-        ft[t] = pd.DataFrame()
     return ft
 
 

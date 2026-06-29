@@ -5,9 +5,31 @@ from ashare_gauntlet.factor_model import (
     composite,
     factor_percentile,
     industry_neutralize,
+    momentum_return,
     percentile_rank,
     to_decile,
 )
+
+
+def test_momentum_rising_series_positive():
+    s = pd.Series([float(i) for i in range(1, 201)])  # 1..200 递增
+    assert momentum_return(s, lookback=120) > 0
+
+
+def test_momentum_falling_series_negative():
+    s = pd.Series([float(i) for i in range(200, 0, -1)])  # 200..1 递减
+    assert momentum_return(s, lookback=120) < 0
+
+
+def test_momentum_exact_ratio():
+    s = pd.Series([float(i) for i in range(1, 201)])
+    # 末值200 / 120日前(iloc[-121]=80) - 1 = 1.5
+    assert abs(momentum_return(s, lookback=120) - 1.5) < 1e-9
+
+
+def test_momentum_insufficient_history_none():
+    s = pd.Series([1.0, 2.0, 3.0])
+    assert momentum_return(s, lookback=120) is None
 
 
 def test_percentile_rank_orders_and_bounds():

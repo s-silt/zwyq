@@ -39,6 +39,20 @@ def composite(factor_ranks: pd.DataFrame) -> pd.Series:
     return factor_ranks.mean(axis=1, skipna=True)
 
 
+def momentum_return(adj_close: pd.Series, lookback: int = 120) -> float | None:
+    """动量(Carhart MOM):前复权收益率 = 最新 / lookback 个交易日前 − 1(默认 ~6 个月)。
+
+    用长周期(~6mo)而非短期:持续上行的趋势(如洁美 +49%)得高分,一日涨停脉冲对 6 月收益
+    贡献甚微——天然区分"趋势 vs 脉冲"。需前复权价(close×adj_factor)消除分红/送转。
+    历史不足返回 None(新上市)。是 Jegadeesh-Titman 1993 / Carhart 1997 的实证最稳健因子之一,
+    之前被错误排除(洁美 +49% 是收据),现补回。
+    """
+    s = adj_close.dropna()
+    if len(s) < lookback + 1:
+        return None
+    return float(s.iloc[-1] / s.iloc[-1 - lookback] - 1.0)
+
+
 def to_decile(s: pd.Series) -> pd.Series:
     """合成分 → 十分位 D1..D10(D10=最好)。只输出分桶,避免 1 分粒度伪精度。NaN 保持 NaN。"""
     ranks = s.rank(method="first")  # 先打破并列,保证 qcut 边界唯一

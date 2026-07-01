@@ -28,6 +28,37 @@ def information_coefficient(factor: pd.Series, fwd_return: pd.Series) -> float:
     return float(paired["f"].rank().corr(paired["r"].rank()))
 
 
+def adjusted_tstat(ic_series: pd.Series) -> "tuple[float, float, float]":
+    """IC 序列 → (ICIR, 自相关修正 t值, 有效样本 N_eff)。
+
+    朴素 t=ICIR·√N 假设各期 IC 独立;但 point-in-time 财务季度间被相邻月度换仓复用,
+    IC 序列有正自相关 → 会虚高显著性。用 AR(1) 估有效样本 N_eff=N·(1-ρ)/(1+ρ),
+    t=ICIR·√N_eff(Newey-West 的简化)。ρ 夹到 [-0.95,0.95] 防退化。
+    """
+    s = ic_series.dropna()
+    n = len(s)
+    if n < 4 or s.std() == 0:
+        return math.nan, math.nan, float(n)
+    icir = float(s.mean() / s.std())
+    rho = s.autocorr(1)
+    rho = 0.0 if (rho is None or math.isnan(rho)) else max(min(float(rho), 0.95), -0.95)
+    neff = max(n * (1.0 - rho) / (1.0 + rho), 1.0)
+    return icir, icir * math.sqrt(neff), neff
+
+
+def quantile_spread(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> float:
+    """可交易性检验:顶组减底组的未来收益(top-bottom spread),验因子是否单调可交易。
+
+    只看 IC(秩相关)不够——IC 显著但分组不单调/多空 spread 被成本吃光=不可交易。
+    按因子分 q 组,返回 最高组均值收益 − 最低组均值收益。样本不足返回 NaN。
+    """
+    df = pd.DataFrame({"f": factor.reset_index(drop=True), "r": fwd_return.reset_index(drop=True)}).dropna()
+    if len(df) < q * 5:
+        return math.nan
+    bucket = pd.qcut(df["f"].rank(method="first"), q, labels=False)
+    return float(df.loc[bucket == q - 1, "r"].mean() - df.loc[bucket == 0, "r"].mean())
+
+
 def point_in_time(hist: pd.DataFrame, asof: str, ann_col: str = "ann_date") -> "pd.Series | None":
     """防未来函数选期:返回截至 ``asof`` **已公告**(ann_date<=asof)的最新一期财务行。
 

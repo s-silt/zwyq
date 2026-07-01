@@ -15,6 +15,31 @@ from .portfolio import bucket_mean_return, long_short_spread
 from .signals import assign_quantile_buckets
 
 
+def information_coefficient(factor: pd.Series, fwd_return: pd.Series) -> float:
+    """横截面 IC = 因子值与未来收益的 Spearman 秩相关(一个换仓日、一个因子)。
+
+    用秩相关(非 Pearson)对肥尾稳健、不受单位影响;成对丢弃 NaN;有效对 <3 返回 NaN
+    (样本太小的相关无意义)。IC 均值衡量因子方向有效性,IC 均值/标准差(ICIR)衡量稳定性。
+    """
+    paired = pd.DataFrame({"f": factor.reset_index(drop=True), "r": fwd_return.reset_index(drop=True)}).dropna()
+    if len(paired) < 3:
+        return math.nan
+    # Spearman = 秩的 Pearson 相关(手算避免 scipy 依赖)
+    return float(paired["f"].rank().corr(paired["r"].rank()))
+
+
+def point_in_time(hist: pd.DataFrame, asof: str, ann_col: str = "ann_date") -> "pd.Series | None":
+    """防未来函数选期:返回截至 ``asof`` **已公告**(ann_date<=asof)的最新一期财务行。
+
+    回测的命门——在换仓日 t 只能用当时已披露的财报(否则偷看未来利润=虚假 IC)。
+    截至 asof 无任何已公告财报则返回 None(该股当日不入选)。
+    """
+    d = hist[hist[ann_col].astype(str) <= str(asof)]
+    if d.empty:
+        return None
+    return d.sort_values(ann_col).iloc[-1]
+
+
 def forward_return_from_next_open(
     opens: pd.Series,
     decision_idx: int,

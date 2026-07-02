@@ -145,11 +145,10 @@ def fetch_market_day(
     """
     path = Path(cache_dir) / endpoint / f"{trade_date}.parquet"
     must_be_nonempty = endpoint in NONEMPTY_MARKET_ENDPOINTS
-    fields = (
-        "ts_code,trade_date,turnover_rate,circ_mv,total_mv"
-        if endpoint == "daily_basic"
-        else ""
-    )
+    # daily_basic 不再窄化 fields:缓存键只有日期不含 fields,窄列表落盘后其它下游(pe_ttm/pb/
+    # dv_ttm)会静默读到缺列的旧 schema;全字段落盘 = 一份缓存服务所有下游(历史 daily_basic
+    # 不可变,是完美缓存对象)。
+    fields = ""
 
     def _pull() -> pd.DataFrame:
         method = getattr(pro, endpoint)

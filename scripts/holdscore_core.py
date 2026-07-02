@@ -21,7 +21,7 @@ from typing import cast
 import pandas as pd
 
 from ashare_gauntlet.data.env import load_env_local
-from ashare_gauntlet.data.fetch import call_with_retry
+from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import market_returns
 from ashare_gauntlet.record import build_record, compute_holdscore
@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
     _empty = daily.iloc[:0]
 
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
-    db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv"))
+    db = fetch_market_day(pro, "daily_basic", as_of, CACHE)  # 缓存版
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry"))
     db_d = {str(r["ts_code"]): r for _, r in db.iterrows()}
     name_d = dict(zip(sb["ts_code"], sb["name"]))

@@ -26,7 +26,7 @@ import pandas as pd
 
 from ashare_gauntlet.backtest import adjusted_tstat, information_coefficient, quantile_spread
 from ashare_gauntlet.data.env import load_env_local
-from ashare_gauntlet.data.fetch import call_with_retry
+from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import industry_neutralize
 from ashare_gauntlet.screen import board_of
@@ -121,7 +121,8 @@ def main(argv: list[str] | None = None) -> None:
         exit_ = win.ffill().iloc[-1]
         fwd = exit_ / entry - 1.0
         # 市值(size 中性)
-        db = call_with_retry(lambda tt=t: pro.daily_basic(trade_date=tt, fields="ts_code,total_mv"))
+        # 缓存版:历史 daily_basic 不可变,落盘后重跑回测零 API 调用、结果可复现
+        db = fetch_market_day(pro, "daily_basic", t, CACHE)
         mv = pd.to_numeric(db.set_index("ts_code")["total_mv"], errors="coerce").reindex(idx)
         logmv = np.log(mv.where(mv > 0))
         # 因子原值

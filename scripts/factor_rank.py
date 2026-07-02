@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from ashare_gauntlet.data.env import load_env_local
-from ashare_gauntlet.data.fetch import call_with_retry
+from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import composite, factor_percentile, momentum_return, to_decile
 from ashare_gauntlet.record import lean_tier
@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> None:
         last_d[str(code)] = float(cl.iloc[-1])
         # 距MA20 用**前复权价**算(XD 除息日的分红缺口不是跌——未复权会假破位,实盘已两次踩中)
         dma20_d[str(code)] = float(ac.iloc[-1] / ac.tail(20).mean() - 1.0) if len(ac) >= 20 else None
-    db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv")).set_index("ts_code")
+    db = fetch_market_day(pro, "daily_basic", as_of, CACHE).set_index("ts_code")  # 缓存版:全字段落盘,一份缓存服务所有下游
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry")).set_index("ts_code")
 
     idx = fina.index

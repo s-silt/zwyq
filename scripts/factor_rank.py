@@ -7,6 +7,11 @@
 - 方法:每因子 行业内中位数去均值 → 横截面百分位 → 等权合成 → 十分位(见 factor_model)。
 - 过滤:lean_tier 剔 🔴(三降/亏损),避免给恶化业务做"便宜"排序=价值陷阱;只对 🟢🟡 排。
 
+- 标注(同为零 magic number):⚡脉冲=近5个交易日内触及过涨停(daily.high 对照 stk_limit
+  涨停价——交易所规则常数,见 touched_limit_up),直接服务"新强名先问是不是涨停顶上来的"铁律;
+  趋势=MOM 当日横截面 top decile(复用 to_decile 十分位既有约定)。⚡ 优先于趋势展示,
+  JSON 输出 spike_limit 布尔列;此前的 ret5>15% / MOM>20% 手拍阈值已废除(审计点名)。
+
 诚实边界:① 回测(修正版,N=40 单一 regime,见 memory factor-backtest-a-share)显示仅 ACC 显著,
 EP/BP/ROE/GP 为文献先验保留、等权是无信息诚实先验(拒绝 N=40 拟合权重=过拟合);MOM 两版符号
 不稳已移出合成、仅作展示;② tushare 行业较细、
@@ -28,7 +33,13 @@ import pandas as pd
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.tushare_source import make_pro_api
-from ashare_gauntlet.factor_model import composite, factor_percentile, momentum_return, to_decile
+from ashare_gauntlet.factor_model import (
+    composite,
+    factor_percentile,
+    momentum_return,
+    to_decile,
+    touched_limit_up,
+)
 from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
 from scripts.backfill_fina import expected_min_end_date
@@ -76,7 +87,7 @@ def main(argv: list[str] | None = None) -> None:
     bs = latest_rows("balancesheet", ["total_assets"])
 
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
-    # 全历史日线+复权 → 前复权价(算动量 MOM / 近5日脉冲 / 距MA20)
+    # 全历史日线+复权 → 前复权价(算动量 MOM / 近5日收益 / 距MA20)
     da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "close"])
                     for f in sorted(glob.glob(f"{CACHE}/daily/*.parquet"))], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
@@ -107,6 +118,14 @@ def main(argv: list[str] | None = None) -> None:
         last_d[str(code)] = float(cl.iloc[-1])
         # 距MA20 用**前复权价**算(XD 除息日的分红缺口不是跌——未复权会假破位,实盘已两次踩中)
         dma20_d[str(code)] = float(ac.iloc[-1] / ac.tail(20).mean() - 1.0) if len(ac) >= 20 else None
+    # ⚡脉冲定义性锚:近5个交易日 high 对照 stk_limit 涨停价(交易所规则常数,fetch_market_day
+    # 自动按日缓存),触及即标——涨停触及是规则事件,替代 ret5>15% 手拍阈值
+    last5 = sorted(str(d) for d in px["trade_date"].unique())[-5:]
+    hi5 = pd.concat([fetch_market_day(pro, "daily", d, CACHE)[["ts_code", "trade_date", "high"]]
+                     for d in last5], ignore_index=True)
+    lim5 = pd.concat([fetch_market_day(pro, "stk_limit", d, CACHE)[["ts_code", "trade_date", "up_limit"]]
+                      for d in last5], ignore_index=True)
+    spike_codes = touched_limit_up(hi5, lim5)
     db = fetch_market_day(pro, "daily_basic", as_of, CACHE).set_index("ts_code")  # 缓存版:全字段落盘,一份缓存服务所有下游
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry")).set_index("ts_code")
 
@@ -123,9 +142,10 @@ def main(argv: list[str] | None = None) -> None:
     df["rev_yoy"] = _num(fina["tr_yoy"])
     df["ocfps"] = _num(fina["ocfps"])
     df["MOM"] = pd.Series(mom_d).reindex(idx)        # 动量:~6月前复权收益(仅展示,不入分)
-    df["ret5"] = pd.Series(ret5_d).reindex(idx)      # 近5日收益(脉冲检测)
+    df["ret5"] = pd.Series(ret5_d).reindex(idx)      # 近5日收益(仅展示;⚡改用触及涨停定义性锚)
     df["last"] = pd.Series(last_d).reindex(idx)
     df["dma20"] = pd.Series(dma20_d).reindex(idx)    # 距MA20(前复权口径,防XD假破位)
+    df["spike_limit"] = [str(i) in spike_codes for i in idx]  # ⚡近5交易日内触及过涨停
 
     rev = _num(inc["revenue"].reindex(idx))
     cogs = _num(inc["oper_cost"].reindex(idx))
@@ -167,24 +187,30 @@ def main(argv: list[str] | None = None) -> None:
     # 仅作位置/趋势展示。EP/ROE/GP 为文献先验保留(本地 2022-26 单 regime 实证仅 ACC 显著)。
     df["score"] = composite(df[["f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC"]])
     df["decile"] = to_decile(df["score"])
+    # 趋势标注 = MOM 当日横截面 top decile(复用 to_decile 十分位既有约定,零新常数;
+    # 替代 MOM>20% 手拍阈值)。NaN(历史不足)不标。
+    df["mom_top"] = to_decile(df["MOM"]).eq(10).fillna(False).astype(bool)
     df = df.sort_values("score", ascending=False)
 
     os.makedirs(OUT_DIR, exist_ok=True)
     keep = ["name", "industry", "tier", "pe", "pb", "roe", "mv", "decile", "score",
-            "f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "MOM", "ret5", "last", "dma20"]
+            "f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "MOM", "ret5", "last", "dma20",
+            "spike_limit"]
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)
 
     print(f"=== 横截面因子排序(价值×质量5因子·行业+市值双中性·MOM仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
     print("分位=双中性百分位(0-100);本地实证仅 ACC 显著(其余为文献先验);MOM 不入分;距MA20=前复权口径(防XD假破位)")
+    print("⚡脉冲=近5交易日内触及过涨停(stk_limit 规则价,优先展示);趋势=MOM 横截面 top decile(十分位约定)")
     print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'ROE':>4}{'GP':>3}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/趋势'}")
     pc = lambda x: f"{x*100:.0f}" if isinstance(x, (int, float)) and x == x else "—"
     nn = lambda x: f"{x:.0f}" if isinstance(x, (int, float)) and x == x else "—"
     for i, (code, r) in enumerate(df.head(a.top).iterrows(), 1):
-        dma20, ret5, mom = r.get("dma20"), r.get("ret5"), r.get("MOM")
+        dma20, mom = r.get("dma20"), r.get("MOM")
         dma = f"{dma20*100:+.0f}%" if isinstance(dma20, (int, float)) and dma20 == dma20 else "—"
-        spike = "⚡脉冲" if isinstance(ret5, (int, float)) and ret5 > 0.15 else (
-            f"趋势{mom*100:+.0f}%" if isinstance(mom, (int, float)) and mom > 0.2 else "")
+        # ⚡(触及涨停,规则事件)优先于趋势(MOM top decile);mom_top=True 蕴含 MOM 非 NaN
+        spike = "⚡脉冲(触涨停)" if bool(r.get("spike_limit")) else (
+            f"趋势{mom*100:+.0f}%" if bool(r.get("mom_top")) else "")
         print(f"{i:>2} {(int(r['decile']) if pd.notna(r['decile']) else 0):>2} {r['tier']:>2} "
               f"{str(r['name'])[:8]:<9}{str(r['industry'])[:6]:<7}"
               f"{pc(r['f_EP']):>3}{pc(r['f_BP']):>3}{pc(r['f_ROE']):>4}{pc(r['f_GPOA']):>3}{pc(r['f_ACC']):>4}{pc(r['f_MOM']):>4}"

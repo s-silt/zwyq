@@ -7,7 +7,10 @@
 ① diff:最近两期 factor json 的 D10 进/出名单(**新进票**正是动量陷阱高危,呼应
    memory momentum-screen-limitup"新强名先问是不是涨停顶上来的");
 ② 前向收益:对每期历史快照的 D10,算 快照日→今天 的前复权收益,对比全主板等权基准
-   (超额 = 命中率证据;纯测量,几个月后回答"这筛选器到底选得准不准")。
+   (超额 = 命中率证据;纯测量,几个月后回答"这筛选器到底选得准不准");
+③ 沪深300 双基准 + regime 读数:宇宙内等权基准量"选股能力",沪深300 量"配置效果"
+   (两者可背离:全主板齐跌时跑赢宇宙仍可能跑输 300);最近 20 交易日 300 涨跌
+   帮助解读 D10 跑输是 α(选股)问题还是 β(市场)问题。
 
 Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.pick_track
 """
@@ -18,11 +21,30 @@ import json
 import math
 import os
 import re
+from pathlib import Path
 
 import pandas as pd
 
+from ashare_gauntlet.data.fetch import call_with_retry
+
 CACHE = "data/cache"
 OUT_DIR = "data/holdscore"
+
+INDEX_CODE = "000300.SH"   # 沪深300 —— 配置基准(大盘宽基,主板宇宙的自然对照)
+# regime 窗口 = 20 交易日 ≈ 一个自然月,复用代码库既有约定(pct20/ret20/reversal n=20)
+REGIME_WINDOW = 20
+
+
+class EmptyIndexPullError(RuntimeError):
+    """指数日线整段拉取返回 0 行 —— 沪深300 在非空交易区间不可能没有数据,
+    空结果只能是拉取失败/权限问题;缓存它会毒化所有后续基准计算,fail-loud 不落盘。"""
+
+
+class IncompleteIndexPullError(RuntimeError):
+    """指数日线整段拉取中途丢行(实测:20260625 单日拉有、整段拉无 —— 即 fetch.py
+    注释记录的镜像大响应掉行毛病)。指数在每个 A 股交易日都必有收盘,对照个股 daily
+    缓存的交易日历校验;带洞序列会悄悄错移 regime 窗口/区间收益起点,fail-loud 不落盘,
+    下次运行自动重拉。"""
 
 
 def diff_picks(prev: list[str], curr: list[str]) -> dict[str, list[str]]:
@@ -51,16 +73,99 @@ def forward_returns(codes: list[str], snap_date: str, px: pd.DataFrame) -> dict[
     return out
 
 
+def index_return(idx_df: pd.DataFrame, snap_date: str) -> float:
+    """指数 快照日(或其后首个交易日)→ 表内最新日 的区间收益,与 forward_returns 同口径。
+
+    idx_df 列:trade_date / close(指数点位,无需复权)。快照日非交易日 → 用其后首个
+    交易日起算;快照日之后无数据(数据不足)→ NaN 不伪造;起点即最新日 → 0%。
+    """
+    c = idx_df[idx_df["trade_date"] >= snap_date].sort_values("trade_date")["close"].dropna()
+    if len(c) == 0:
+        return math.nan
+    return float(c.iloc[-1] / c.iloc[0] - 1.0) if len(c) >= 2 else 0.0
+
+
+def regime_return(idx_df: pd.DataFrame, n: int) -> float:
+    """regime 读数:最近 n 个交易日的指数涨跌 = close[-1]/close[-1-n] − 1。
+
+    需要 n+1 个收盘价(n 个日收益的复合);行数不足 → NaN 不伪造。
+    """
+    c = idx_df.sort_values("trade_date")["close"].dropna()
+    if len(c) < n + 1:
+        return math.nan
+    return float(c.iloc[-1] / c.iloc[-1 - n] - 1.0)
+
+
+def load_index_daily(pro: object, ts_code: str, start_date: str, end_date: str,
+                     cache_dir: str | Path = CACHE,
+                     expected_days: list[str] | None = None) -> pd.DataFrame:
+    """指数日线缓存:单文件 <cache_dir>/index_daily/<ts_code>.parquet,覆盖即用。
+
+    已有缓存的 [min, max] 覆盖 [start, end] 且无洞 → 直接用(零 API 调用);不覆盖或
+    有洞 → 整段重拉一次覆盖写(简单优先:单指数全区间也就千余行,一次调用拿完,避免
+    每快照重复调 API;带洞旧缓存借此自愈)。expected_days=区间内应有的交易日(来自
+    个股 daily 缓存日历),指数在每个 A 股交易日必有收盘:重拉后仍缺日 → fail-loud
+    不落盘(见 IncompleteIndexPullError);空拉同理(见 EmptyIndexPullError)。
+    """
+    path = Path(cache_dir) / "index_daily" / f"{ts_code}.parquet"
+
+    def _missing(df: pd.DataFrame) -> list[str]:
+        if expected_days is None:
+            return []
+        have = set(str(d) for d in df["trade_date"])
+        return [d for d in expected_days if d not in have]
+
+    if path.exists():
+        cached = pd.read_parquet(path)
+        if not cached.empty and str(cached["trade_date"].min()) <= start_date \
+                and str(cached["trade_date"].max()) >= end_date and not _missing(cached):
+            return cached.sort_values("trade_date").reset_index(drop=True)
+    df = call_with_retry(lambda: pro.index_daily(  # type: ignore[attr-defined]
+        ts_code=ts_code, start_date=start_date, end_date=end_date))
+    if df.empty:
+        raise EmptyIndexPullError(
+            f"index_daily {ts_code} 在 [{start_date}, {end_date}] 返回 0 行 —— "
+            f"非空交易区间不可能无指数数据,疑为拉取失败/接口权限问题;拒绝缓存空值")
+    holes = _missing(df)
+    if holes:
+        # 镜像大区间拉取会稳定漏个别日(实测 20260625:单日拉有、跨区间拉无)→
+        # 缺日逐日补拉(单日路径可靠,同源真数据非伪造);补完仍缺才 fail-loud
+        patches = [call_with_retry(lambda d=d: pro.index_daily(  # type: ignore[attr-defined]
+            ts_code=ts_code, start_date=d, end_date=d)) for d in holes]
+        df = pd.concat([df, *patches], ignore_index=True).drop_duplicates("trade_date")
+        still = _missing(df)
+        if still:
+            raise IncompleteIndexPullError(
+                f"index_daily {ts_code} 整段拉取 [{start_date}, {end_date}] 缺交易日 {holes},"
+                f"单日补拉后仍缺 {still} —— 带洞序列会错移 regime 窗口/区间收益;"
+                f"拒绝落盘,不把缺口当真值")
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    return df
+
+
 def main() -> None:
     snaps = sorted(glob.glob(f"{OUT_DIR}/*_factor.json"))
     if not snaps:
         raise SystemExit("无 factor 快照(先跑 scripts.factor_rank)")
 
-    # 价格面板(前复权)
+    # 交易日历(缓存文件名即交易日)与快照日期,先于面板算出 —— 面板只需从最早快照日
+    # 起读:forward_returns 只用 trade_date >= 快照日 的行,更早的 1000+ 个日文件读了
+    # 也全被过滤掉(纯 IO 瘦身,口径零变化;全量读曾让单次运行 10 分钟起步)
+    day_files = sorted(glob.glob(f"{CACHE}/daily/*.parquet"))
+    trade_days = [os.path.basename(f)[:8] for f in day_files]
+    snap_dates = [m.group(1) for p in snaps
+                  if (m := re.match(r"(\d{8})_factor\.json", os.path.basename(p)))]
+    first_snap = min(snap_dates) if snap_dates else trade_days[-1]
+
+    # 价格面板(前复权),仅最早快照日及之后
+    need = [f for f in day_files if os.path.basename(f)[:8] >= first_snap]
     da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "close"])
-                    for f in sorted(glob.glob(f"{CACHE}/daily/*.parquet"))], ignore_index=True)
+                    for f in need], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
-                    for f in sorted(glob.glob(f"{CACHE}/adj_factor/*.parquet"))], ignore_index=True)
+                    for f in sorted(glob.glob(f"{CACHE}/adj_factor/*.parquet"))
+                    if os.path.basename(f)[:8] >= first_snap], ignore_index=True)
     px = da.merge(aj, on=["ts_code", "trade_date"], how="left")
     px["adj_close"] = px["close"].astype(float) * px["adj_factor"].astype(float)
     latest = str(px["trade_date"].max())
@@ -68,6 +173,16 @@ def main() -> None:
     def load_d10(path: str) -> list[str]:
         rows = json.load(open(path, encoding="utf-8"))
         return [r["ts_code"] for r in rows if r.get("decile") == 10]
+
+    # 沪深300 日线(单文件缓存,一次拉够全区间:最早快照日 ∪ regime 窗口起点)
+    regime_start = trade_days[-(REGIME_WINDOW + 1)] if len(trade_days) > REGIME_WINDOW else trade_days[0]
+    idx_start = min(first_snap, regime_start)
+    from ashare_gauntlet.data.env import load_env_local
+    from ashare_gauntlet.data.tushare_source import make_pro_api
+    load_env_local()
+    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    idx = load_index_daily(pro, INDEX_CODE, start_date=idx_start, end_date=latest,
+                           expected_days=[d for d in trade_days if idx_start <= d <= latest])
 
     # ① 最近两期 diff(新进=动量陷阱高危,factcheck 优先核)
     if len(snaps) >= 2:
@@ -81,9 +196,10 @@ def main() -> None:
         print(f"  掉出 {len(d['dropped'])}: " + " ".join(f"{nm.get(c,'')}({c[:6]})" for c in d["dropped"][:15]))
         print(f"  留任 {len(d['stay'])}")
 
-    # ② 各历史快照 D10 的前向收益 vs 全主板等权基准(命中率证据,纯测量)
-    print(f"\n=== D10 前向收益 vs 全主板等权(至 {latest};样本外命中率证据,逐期积累)===")
-    print(f"{'快照日':>10}{'D10只数':>7}{'D10均收益':>10}{'基准均收益':>10}{'超额':>8}")
+    # ② 各历史快照 D10 的前向收益 vs 双基准(宇宙内等权=选股能力,沪深300=配置效果)
+    print(f"\n=== D10 前向收益 vs 双基准(至 {latest};样本外命中率证据,逐期积累)===")
+    print(f"{'快照日':>10}{'D10只数':>7}{'D10均收益':>10}{'基准均收益':>10}{'超额':>8}"
+          f"{'沪深300收益':>10}{'超额vs300':>9}")
     for p in snaps:
         m = re.match(r"(\d{8})_factor\.json", os.path.basename(p))
         if not m:
@@ -98,8 +214,15 @@ def main() -> None:
         fu = forward_returns(uni, snap, px)
         d10_m = pd.Series(fr).mean()
         uni_m = pd.Series(fu).mean()
-        print(f"{snap:>10}{len(d10):>7}{d10_m*100:>+9.1f}%{uni_m*100:>+9.1f}%{(d10_m-uni_m)*100:>+7.1f}%")
-    print("(超额>0=筛选器跑赢自己的宇宙;样本少时噪声大,别过度解读单期)")
+        hs = index_return(idx, snap)
+        print(f"{snap:>10}{len(d10):>7}{d10_m*100:>+9.1f}%{uni_m*100:>+9.1f}%{(d10_m-uni_m)*100:>+7.1f}%"
+              f"{hs*100:>+11.1f}%{(d10_m-hs)*100:>+10.1f}%")
+    print("(超额>0=跑赢自身宇宙=选股能力;超额vs300>0=跑赢配置基准;样本少时噪声大,别过度解读单期)")
+
+    # regime 读数:D10 跑输时先分清是 α(选股)还是 β(市场)的问题
+    rg = regime_return(idx, REGIME_WINDOW)
+    print(f"\nregime:最近{REGIME_WINDOW}交易日 沪深300 {rg*100:+.1f}%"
+          f"(D10 与 300 同跌=β 问题,300 涨而 D10 跌=α 问题)")
 
 
 if __name__ == "__main__":

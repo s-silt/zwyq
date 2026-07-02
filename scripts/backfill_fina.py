@@ -21,11 +21,17 @@ import argparse
 import os
 import sys
 import time
+from collections.abc import Mapping
 
 import pandas as pd
 
 from ashare_gauntlet.data.env import load_env_local
-from ashare_gauntlet.data.fetch import EmptyCoreTableError, call_with_retry, fetch_symbol_table
+from ashare_gauntlet.data.fetch import (
+    EmptyCoreTableError,
+    TokenExpiredError,
+    call_with_retry,
+    fetch_symbol_table,
+)
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.screen import board_of
 
@@ -56,6 +62,74 @@ def expected_min_end_date(today: str) -> str:
     return f"{int(y) - 1}0930"
 
 
+def latest_period_end(today: str) -> str:
+    """截至 ``today``(YYYYMMDD)最近一个**已结束**的报告期(季度末 0331/0630/0930/1231,日历常数)。
+
+    用途:``--refresh`` 披露表优先路径的查询键。法定截止(``expected_min_end_date``)
+    只给出"最迟必须已披露"的下限;而披露表(disclosure_date)能看到谁**提前**披露了
+    最新一期(如 7 月即出的半年报,法定截止 8/31)——对这些票立即刷新,不等截止日。
+    """
+    y, md = today[:4], today[4:]
+    if md >= "1231":
+        return f"{y}1231"
+    if md >= "0930":
+        return f"{y}0930"
+    if md >= "0630":
+        return f"{y}0630"
+    if md >= "0331":
+        return f"{y}0331"
+    return f"{int(y) - 1}1231"
+
+
+def disclosed_stale_codes(
+    disclosure: pd.DataFrame, local_max_end: Mapping[str, str], period: str
+) -> list[str]:
+    """纯函数:全市场披露表 + 本地新鲜度 → ``period`` 期需要重拉的代码列表(升序去重)。
+
+    入选须同时满足:
+      ① ``end_date == period``(防御:接口按期查询,仍过滤防混期);
+      ② ``actual_date`` 非空(**已实际披露**;只有拟披露日 pre_date 的票拉了也只有旧数据);
+      ③ 本地缓存 max(end_date) < period(缺缓存按 "" = 最旧,同样要拉)。
+    """
+    actual = disclosure["actual_date"]
+    disclosed = disclosure.loc[
+        (disclosure["end_date"].astype(str) == period)
+        & actual.notna()
+        & (actual.astype(str).str.strip() != ""),
+        "ts_code",
+    ]
+    return sorted({str(c) for c in disclosed if local_max_end.get(str(c), "") < period})
+
+
+def _fetch_disclosure(pro: object, period: str) -> pd.DataFrame | None:
+    """全市场披露表(``disclosure_date`` 不带 ts_code,一次一期)。
+
+    **不落缓存**:actual_date 每天都在增长(新披露不断填进来),按期缓存会把披露进度
+    冻结在首拉那天。拉不到/为空/缺列 → 打 warning 返回 None,调用方回退
+    ``expected_min_end_date`` 启发式(fail-loud 但不阻塞刷新)。TokenExpiredError
+    例外向上抛:额度耗尽是全局致命错,回退只会烧掉几千次注定失败的逐只调用。
+    """
+    try:
+        df = call_with_retry(lambda: pro.disclosure_date(end_date=period))
+    except TokenExpiredError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — 响亮降级:warning + 回退启发式,不静默
+        print(
+            f"警告:disclosure_date(end_date={period}) 拉取失败"
+            f"({type(exc).__name__}: {str(exc)[:80]})—— 回退 expected_min_end_date 启发式",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    if df.empty or not {"ts_code", "end_date", "actual_date"} <= set(df.columns):
+        print(
+            f"警告:disclosure_date(end_date={period}) 返回空/缺列"
+            f"(rows={len(df)}, cols={list(df.columns)})—— 回退 expected_min_end_date 启发式",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    return df
+
+
 def tables_for_mode(mode: str) -> tuple[str, ...]:
     """模式 → 要拉的表集(纯函数)。lean 只拉 fina_indicator;core 拉 4 核心财报表;full 拉核心+预警表。"""
     if mode == "lean":
@@ -67,16 +141,25 @@ def tables_for_mode(mode: str) -> tuple[str, ...]:
     raise ValueError(f"未知 mode={mode!r}(应为 lean / core / full)")
 
 
-def _is_fresh(code: str, target: str) -> bool:
-    """该股 fina_indicator 缓存是否已含 ``target`` 报告期(refresh 的跳过判据)。"""
+def _local_max_end(code: str) -> str:
+    """该股本地 fina_indicator 缓存的最新报告期(YYYYMMDD)。
+
+    无缓存/读不了/空表 → 返回 ""(排序上=最旧):读失败按"最旧"处理会触发整只重拉,
+    坏缓存被覆盖修复而非被静默消费。
+    """
     p = f"{CACHE}/fina_indicator/{code}.parquet"
     if not os.path.exists(p):
-        return False
+        return ""
     try:
         ed = pd.read_parquet(p, columns=["end_date"])["end_date"].astype(str)
-        return bool(len(ed)) and str(ed.max()) >= target
+        return str(ed.max()) if len(ed) else ""
     except Exception:
-        return False
+        return ""
+
+
+def _is_fresh(code: str, target: str) -> bool:
+    """该股 fina_indicator 缓存是否已含 ``target`` 报告期(refresh 的跳过判据)。"""
+    return _local_max_end(code) >= target
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -85,7 +168,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--board", default="main", choices=("main", "all"))
     ap.add_argument("--limit", type=int, default=0, help="只拉前 N 只(0=全部),用于试跑")
     ap.add_argument("--refresh", action="store_true",
-                    help="财报季刷新:按法定披露期判断,缓存缺最新报告期的票整只 force 重拉(否则缓存优先=永不更新)")
+                    help="财报季刷新:法定披露期判过期 + 披露表(disclosure_date)抓提前披露最新期的票,"
+                         "两者并集整只 force 重拉(否则缓存优先=永不更新)")
     a = ap.parse_args(argv)
 
     load_env_local()
@@ -100,9 +184,22 @@ def main(argv: list[str] | None = None) -> None:
     if a.limit:
         codes = codes[: a.limit]
 
-    target = expected_min_end_date(time.strftime("%Y%m%d")) if a.refresh else ""
+    today = time.strftime("%Y%m%d")
+    target = expected_min_end_date(today) if a.refresh else ""
+    early: set[str] = set()  # 披露表优先路径:已提前披露最新期、且本地缺该期的票
     if a.refresh:
         print(f"refresh 模式:法定应披露最新报告期 = {target},已含该期的票跳过、过期票整只重拉", flush=True)
+        # 优先路径:全市场拉一次披露表,把提前披露最新期(latest_period_end)的票也刷进来。
+        # 它是法定下限之上的**增量**(并集):法定下限保证"最迟必须已披露"的硬新鲜度,
+        # 披露表补上"谁提前出了下一期"——只用披露表会在无人披露时(如 7 月初查 0630)
+        # 让 --refresh 空转,连法定早该有的旧期都不补。拉不到披露表则仅剩启发式(有注明)。
+        period = latest_period_end(today)
+        disc = _fetch_disclosure(pro, period)
+        if disc is not None:
+            local_max = {c: _local_max_end(c) for c in codes}
+            early = set(disclosed_stale_codes(disc, local_max, period)) & set(codes)
+            print(f"披露表优先:end_date={period} 全市场 {len(disc)} 行,已实际披露且本地缺该期 "
+                  f"→ 额外重拉 {len(early)} 只(叠加在法定下限 {target} 的过期判断之上)", flush=True)
     print(f"mode={a.mode} board={a.board} | 待拉 {len(codes)} 只 × {len(tables)} 表 = {tables} "
           f"| {'刷新过期' if a.refresh else '缓存优先(已拉自动跳过)'}", flush=True)
     t0 = time.time()
@@ -110,11 +207,12 @@ def main(argv: list[str] | None = None) -> None:
     for code in codes:
         force = False
         if a.refresh:
-            if _is_fresh(code, target):
+            # 跳过判据:法定下限已满足 且 不在披露表的"提前披露待刷"名单里
+            if _is_fresh(code, target) and code not in early:
                 skipped += 1
                 done += 1
                 continue
-            force = True  # 过期:该股所有表整只重拉(接口返全历史,覆盖写一致)
+            force = True  # 过期/已披露新期:该股所有表整只重拉(接口返全历史,覆盖写一致)
         for table in tables:
             try:
                 fetch_symbol_table(pro, table, code, CACHE, force=force)

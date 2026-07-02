@@ -70,3 +70,27 @@ def to_decile(s: pd.Series) -> pd.Series:
     """合成分 → 十分位 D1..D10(D10=最好)。只输出分桶,避免 1 分粒度伪精度。NaN 保持 NaN。"""
     ranks = s.rank(method="first")  # 先打破并列,保证 qcut 边界唯一
     return pd.qcut(ranks, 10, labels=range(1, 11)).astype("Int64")
+
+
+def touched_limit_up(daily_5d: pd.DataFrame, stk_limit_5d: pd.DataFrame) -> set[str]:
+    """窗口内触及过涨停的票集合:同日 daily.high >= stk_limit.up_limit 即触及。
+
+    ⚡脉冲的定义性锚(替代 "ret5>15%" magic number):涨停价是交易所规则给出的监管常数
+    (主板 ±10%、ST ±5% 等,tushare stk_limit 已按规则算好),"触及涨停"直接服务
+    "新强名先问是不是涨停顶上来的"铁律(见 memory momentum-screen-limitup)。
+    按 (ts_code, trade_date) 同日配对,不跨日错配;窗口内任一日触及即入集合(之后回落也算)。
+    浮点比较容差 1e-6 远小于报价最小变动单位 0.01 元——纯数值容差,非可调阈值。
+    输入为空/缺列 fail-loud:静默返回空集会让 ⚡ 标注全体消失、看似"这几天没人涨停"。
+    """
+    if daily_5d.empty or stk_limit_5d.empty:
+        raise ValueError("touched_limit_up: daily/stk_limit 输入为空——上游缓存缺日,拒绝静默返回空集")
+    need_daily = {"ts_code", "trade_date", "high"}
+    need_limit = {"ts_code", "trade_date", "up_limit"}
+    missing = (need_daily - set(daily_5d.columns)) | (need_limit - set(stk_limit_5d.columns))
+    if missing:
+        raise ValueError(f"touched_limit_up: 输入缺列 {sorted(missing)}——拒绝静默当作无人触及")
+    m = daily_5d[["ts_code", "trade_date", "high"]].merge(
+        stk_limit_5d[["ts_code", "trade_date", "up_limit"]],
+        on=["ts_code", "trade_date"], how="inner")
+    hit = m["high"].astype(float) >= m["up_limit"].astype(float) - 1e-6
+    return set(m.loc[hit, "ts_code"].astype(str))

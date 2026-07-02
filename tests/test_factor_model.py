@@ -1,5 +1,6 @@
 """Tests for factor_model —— 横截面因子模型纯函数(零 magic number:中位数去均值+百分位+等权)。"""
 import pandas as pd
+import pytest
 
 from ashare_gauntlet.factor_model import (
     composite,
@@ -8,6 +9,7 @@ from ashare_gauntlet.factor_model import (
     momentum_return,
     percentile_rank,
     to_decile,
+    touched_limit_up,
 )
 
 
@@ -109,3 +111,62 @@ def test_to_decile_top_and_bottom():
     d = to_decile(pd.Series([float(i) for i in range(100)]))
     assert d.iloc[-1] == 10
     assert d.iloc[0] == 1
+
+
+# ---- touched_limit_up:⚡脉冲的定义性锚(近5交易日 high 触及 stk_limit 涨停价) ----
+
+def _daily(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["ts_code", "trade_date", "high"])
+
+
+def _limit(rows: list[tuple[str, str, float]]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["ts_code", "trade_date", "up_limit"])
+
+
+def test_touched_limit_up_hit_vs_miss():
+    # high==涨停价 → 触及;差 1 分钱 → 未触及
+    daily = _daily([("600000.SH", "20260701", 11.00), ("000001.SZ", "20260701", 10.99)])
+    lim = _limit([("600000.SH", "20260701", 11.00), ("000001.SZ", "20260701", 11.00)])
+    assert touched_limit_up(daily, lim) == {"600000.SH"}
+
+
+def test_touched_limit_up_float_tolerance():
+    # 浮点表示误差(如 21.45*1.1 存出 23.594999…)不应漏判:容差 1e-6 远小于报价最小变动 0.01
+    daily = _daily([("600000.SH", "20260701", 23.595 - 1e-9)])
+    lim = _limit([("600000.SH", "20260701", 23.595)])
+    assert touched_limit_up(daily, lim) == {"600000.SH"}
+
+
+def test_touched_limit_up_same_day_pairing():
+    # 涨停价按 (ts_code, trade_date) 同日配对,不跨日错配:
+    # 0630 high=11 只对 0630 的涨停价 12(未触及),不能拿去比 0701 的涨停价 11
+    daily = _daily([("600000.SH", "20260630", 11.00), ("600000.SH", "20260701", 10.00)])
+    lim = _limit([("600000.SH", "20260630", 12.00), ("600000.SH", "20260701", 11.00)])
+    assert touched_limit_up(daily, lim) == set()
+
+
+def test_touched_limit_up_any_day_in_window():
+    # 窗口内任一日触及即入集合(之后回落也算——"涨停顶上来的"正是要抓的形态)
+    daily = _daily([("600000.SH", "20260629", 11.00), ("600000.SH", "20260630", 10.20),
+                    ("600000.SH", "20260701", 10.10)])
+    lim = _limit([("600000.SH", "20260629", 11.00), ("600000.SH", "20260630", 12.10),
+                  ("600000.SH", "20260701", 11.22)])
+    assert touched_limit_up(daily, lim) == {"600000.SH"}
+
+
+def test_touched_limit_up_empty_input_fail_loud():
+    # 输入为空 → fail-loud:静默返回空集会让 ⚡ 全体消失、看似"这5天没人涨停"
+    daily = _daily([("600000.SH", "20260701", 11.00)])
+    lim = _limit([("600000.SH", "20260701", 11.00)])
+    with pytest.raises(ValueError):
+        touched_limit_up(daily.iloc[0:0], lim)
+    with pytest.raises(ValueError):
+        touched_limit_up(daily, lim.iloc[0:0])
+
+
+def test_touched_limit_up_missing_column_fail_loud():
+    # 缺关键列(如 up_limit)→ fail-loud,不静默当作没人触及
+    daily = _daily([("600000.SH", "20260701", 11.00)])
+    bad = pd.DataFrame([("600000.SH", "20260701")], columns=["ts_code", "trade_date"])
+    with pytest.raises(ValueError):
+        touched_limit_up(daily, bad)

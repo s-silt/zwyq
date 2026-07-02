@@ -129,17 +129,23 @@ def main(argv: list[str] | None = None) -> None:
         json.dump(recs, fh, ensure_ascii=False, indent=2, allow_nan=False)
 
     top = recs[: a.top]
-    last = daily[daily["trade_date"] == as_of].set_index("ts_code")["close"].astype(float)
     scope = f"{a.industry}板块" if a.industry else "全主板"
     print(f"\n=== 全市场质地排序·核心版({scope}, as_of={as_of}, {len(recs)}只过滤后)→ {OUT_DIR}/{as_of}_core.json ===")
     print(f"{'#':>2} {'分':>4} {'档':>2} {'票':<9}{'行业':<7}{'净/扣/营%':>15}{'净现比':>6}{'PE':>5}{'市值亿':>7}  位置")
     for i, r in enumerate(top, 1):
         f, v, q = r["fundamental"], r["valuation"], r["quality"]
         code = r["ts_code"]
-        px = last.get(code)
-        s = daily[daily["ts_code"] == code].sort_values("trade_date")["close"].astype(float)
-        ma20 = s.tail(20).mean() if len(s) >= 20 else float("nan")
-        pos = pos_flag(float(px), float(ma20)) if (px is not None and ma20 == ma20) else "—"
+        # 位置用**前复权价**算(daily close × adj_factor):XD 除息日的分红缺口不是跌,
+        # 未复权 MA20 会假破位(实盘已两次踩中:宁波/紫金除息)
+        g = daily_g.get(code)
+        ag = adj_g.get(code)
+        pos = "—"
+        if g is not None and ag is not None:
+            m = g[["trade_date", "close"]].merge(ag[["trade_date", "adj_factor"]], on="trade_date", how="inner")
+            ac = (m.sort_values("trade_date")["close"].astype(float)
+                  * m.sort_values("trade_date")["adj_factor"].astype(float)).dropna()
+            if len(ac) >= 20:
+                pos = pos_flag(float(ac.iloc[-1]), float(ac.tail(20).mean()))
         pp = lambda x: f"{x:+.0f}" if isinstance(x, (int, float)) else "—"
         nn = lambda x: f"{x:.0f}" if isinstance(x, (int, float)) else "—"
         ncr = q.get("net_cash_ratio")

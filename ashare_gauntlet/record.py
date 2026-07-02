@@ -196,7 +196,11 @@ def _build_flags(fund_tables: dict[str, pd.DataFrame], as_of: str, q_end: str) -
         flags.append({
             "type": "质押",
             "severity": "警示" if pr >= PLEDGE_WARN else "提示",
-            "fact": f"控股股东体系质押{pr:.1f}%",
+            # 口径:pledge_stat.pledge_ratio 是【公司整体】质押比例(全部质押股/总股本),
+            # 不是控股股东个人质押——个人质押(世纪华通王佶类)此表抓不到,归 factcheck
+            # (见 memory structured-data-governance-blindspot)。标签必须如实,否则会把
+            # 治理盲区伪装成"已覆盖"、诱导核实层跳过必查项。
+            "fact": f"公司整体质押{pr:.1f}%(≠控股股东个人质押,后者需factcheck)",
             "value": pr,  # 结构化数值:渲染器读这个,勿反解析 fact 字符串
             "date": as_of,
             "source": "pledge_stat接口",

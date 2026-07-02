@@ -218,6 +218,7 @@ def fetch_symbol_table(
     endpoint: str,
     ts_code: str,
     cache_dir: str | Path,
+    force: bool = False,
 ) -> pd.DataFrame:
     """Cached full-history per-symbol pull (no date window) — for the structured
     fundamentals/risk tables (``income``, ``fina_indicator``, ``share_float``,
@@ -225,6 +226,8 @@ def fetch_symbol_table(
 
     One parquet per (endpoint, ts_code); idempotent. The interface-first source
     for the analysis mode's step 3, replacing the web-scrape of Q1 业绩/风险旗标.
+    ``force=True`` 整只重拉覆盖(接口本就返回全历史,覆盖写天然一致)——财报季刷新用,
+    否则缓存优先会把财务永远冻结在旧报告期。
     """
     path = Path(cache_dir) / endpoint / f"{ts_code}.parquet"
     is_core = endpoint in CORE_SYMBOL_TABLES
@@ -241,7 +244,7 @@ def fetch_symbol_table(
             )
         return df
 
-    df = read_or_fetch(path, _pull)
+    df = read_or_fetch(path, _pull, force=force)
     # Also guard the cache-hit path: a legacy/partial empty parquet on disk for a
     # core table is just as poisonous as a fresh empty pull — surface it too.
     if is_core and df.empty:

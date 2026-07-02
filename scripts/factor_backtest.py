@@ -36,7 +36,9 @@ MAIN = ("沪主板", "深主板")
 
 
 def _load(ep: str, cols: list[str]) -> pd.DataFrame:
-    need = ["ts_code", "end_date", "ann_date"] + cols
+    # update_flag 参与排序:同 (end_date,ann_date) 的快照 vs 更正重述行,'1'=更正后(tushare 官方
+    # 语义)排最后,_pit 的 tail(1) 才确定性取到更正值(fina_indicator 缓存暂无此列,自动降级两键)。
+    need = ["ts_code", "end_date", "ann_date", "update_flag"] + cols
     out = []
     for f in glob.glob(f"{CACHE}/{ep}/*.parquet"):
         try:
@@ -49,7 +51,8 @@ def _load(ep: str, cols: list[str]) -> pd.DataFrame:
     df["end_date"] = df["end_date"].astype(str)
     for c in cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.sort_values(["ts_code", "end_date", "ann_date"])   # 先 end_date 再 ann_date
+    sort_keys = ["ts_code"] + [k for k in ("end_date", "ann_date", "update_flag") if k in df.columns]
+    return df.sort_values(sort_keys, kind="mergesort")
 
 
 def _pit(df: pd.DataFrame, asof: str) -> pd.DataFrame:

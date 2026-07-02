@@ -35,3 +35,24 @@ def test_lean_subset_of_core_subset_of_full():
 def test_invalid_mode_raises():
     with pytest.raises(ValueError):
         tables_for_mode("bogus")
+
+
+# ---- expected_min_end_date:法定披露截止日(监管常数,非 magic number)----
+from scripts.backfill_fina import expected_min_end_date
+
+
+def test_expected_after_q1_deadline():
+    assert expected_min_end_date("20260702") == "20260331"   # 4/30 后必有 Q1
+
+
+def test_expected_after_h1_deadline():
+    assert expected_min_end_date("20260901") == "20260630"   # 8/31 后必有 H1
+
+
+def test_expected_after_q3_deadline():
+    assert expected_min_end_date("20261101") == "20260930"   # 10/31 后必有 Q3
+
+
+def test_expected_before_annual_deadline_falls_back_to_prev_q3():
+    assert expected_min_end_date("20260430") == "20250930"   # 年报/Q1 截止日当天还没强制
+    assert expected_min_end_date("20260215") == "20250930"

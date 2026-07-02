@@ -28,10 +28,23 @@ def industry_neutralize(s: pd.Series, industry: pd.Series) -> pd.Series:
     return s - med
 
 
-def factor_percentile(s: pd.Series, industry: pd.Series, higher_is_better: bool = True) -> pd.Series:
-    """单因子 → 行业中性 → 百分位。higher_is_better=False(如应计利润)取负,使"好"恒映到高分位。"""
+def factor_percentile(s: pd.Series, industry: pd.Series, higher_is_better: bool = True,
+                      logmv: "pd.Series | None" = None) -> pd.Series:
+    """单因子 → 行业中性(可选:+市值中性)→ 百分位。higher_is_better=False(如应计)取负。
+
+    logmv 给定时做行业+市值**双中性**(市值十分位组内去中位)——与 factor_backtest 的
+    _neutralize 同一数学对象:回测(修正版)证明 BP 未去 size 就是小盘/低价代理,
+    生产因子必须与被验证的形态一致。十分位复用 to_decile 既有粒度约定,非新常数。
+    """
     raw = s if higher_is_better else -s
-    return percentile_rank(industry_neutralize(raw, industry))
+    neu = industry_neutralize(raw, industry)
+    if logmv is not None:
+        # rank(average):市值并列取同秩→落同一桶(method="first" 会把并列硬拆进单元素组、抹掉因子);
+        # qcut 退化(边界全并列→NaN 桶)时归单一组,保住组内因子序
+        sb = pd.qcut(logmv.reindex(neu.index).rank(method="average"), 10, labels=False, duplicates="drop")
+        sb = pd.Series(sb, index=neu.index).fillna(-1)
+        neu = neu - neu.groupby(sb).transform("median")
+    return percentile_rank(neu)
 
 
 def composite(factor_ranks: pd.DataFrame) -> pd.Series:

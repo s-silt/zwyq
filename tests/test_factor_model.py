@@ -69,6 +69,29 @@ def test_factor_percentile_lower_is_better_inverts():
     assert r.iloc[0] > r.iloc[2]
 
 
+def test_factor_percentile_size_neutral_removes_size_effect():
+    # 因子值与市值完全同向(纯小盘/大盘代理):做 size 中性后,组内应无差异 → 分位≈组内中位
+    # 20只:2个行业×流动市值梯度;因子=市值本身(极端代理情形)
+    n = 20
+    s = pd.Series([float(i) for i in range(n)])            # 因子=“市值”
+    ind = pd.Series(["A"] * (n // 2) + ["B"] * (n // 2))
+    logmv = pd.Series([float(i) for i in range(n)])        # 市值同序
+    r_no = factor_percentile(s, ind, higher_is_better=True)
+    r_sz = factor_percentile(s, ind, higher_is_better=True, logmv=logmv)
+    # 无 size 中性:最大市值票拿最高分位;有 size 中性:纯市值代理被去掉,顶部分位应下降
+    assert r_no.iloc[-1] == r_no.max()
+    assert r_sz.iloc[-1] < r_no.iloc[-1]
+
+
+def test_factor_percentile_size_neutral_keeps_within_size_ranking():
+    # 同一市值档内的真实因子差异应保留:市值同一档、因子不同 → 排序不变
+    s = pd.Series([1.0, 2.0, 3.0, 4.0])
+    ind = pd.Series(["A"] * 4)
+    logmv = pd.Series([10.0, 10.0, 10.0, 10.0])  # 市值全同 → size 中性不应扭曲因子序
+    r = factor_percentile(s, ind, higher_is_better=True, logmv=logmv)
+    assert r.iloc[3] > r.iloc[0]
+
+
 def test_composite_equal_weight_average():
     c = composite(pd.DataFrame({"f1": [0.8, 0.2], "f2": [0.6, 0.4]}))
     assert abs(c.iloc[0] - 0.7) < 1e-9

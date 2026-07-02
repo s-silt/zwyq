@@ -22,6 +22,8 @@ import os
 import sys
 import time
 
+import pandas as pd
+
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import EmptyCoreTableError, call_with_retry, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
@@ -37,6 +39,23 @@ FULL_TABLES: tuple[str, ...] = (
 MAIN_BOARDS = ("沪主板", "深主板")
 
 
+def expected_min_end_date(today: str) -> str:
+    """截至 ``today``(YYYYMMDD),法定必须已披露的最新报告期(监管常数,非 magic number)。
+
+    A股披露截止:年报+一季报 ≤4/30、半年报 ≤8/31、三季报 ≤10/31。
+    用途:① `--refresh` 判断哪些票的缓存已过期需重拉;② 读端(factor_rank 等)fail-loud
+    断言缓存新鲜度——否则财报季后整条管线会静默消费旧财报。
+    """
+    y, md = today[:4], today[4:]
+    if md >= "1101":
+        return f"{y}0930"
+    if md >= "0901":
+        return f"{y}0630"
+    if md >= "0501":
+        return f"{y}0331"
+    return f"{int(y) - 1}0930"
+
+
 def tables_for_mode(mode: str) -> tuple[str, ...]:
     """模式 → 要拉的表集(纯函数)。lean 只拉 fina_indicator;core 拉 4 核心财报表;full 拉核心+预警表。"""
     if mode == "lean":
@@ -48,11 +67,25 @@ def tables_for_mode(mode: str) -> tuple[str, ...]:
     raise ValueError(f"未知 mode={mode!r}(应为 lean / core / full)")
 
 
+def _is_fresh(code: str, target: str) -> bool:
+    """该股 fina_indicator 缓存是否已含 ``target`` 报告期(refresh 的跳过判据)。"""
+    p = f"{CACHE}/fina_indicator/{code}.parquet"
+    if not os.path.exists(p):
+        return False
+    try:
+        ed = pd.read_parquet(p, columns=["end_date"])["end_date"].astype(str)
+        return bool(len(ed)) and str(ed.max()) >= target
+    except Exception:
+        return False
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="lean", choices=("lean", "core", "full"))
     ap.add_argument("--board", default="main", choices=("main", "all"))
     ap.add_argument("--limit", type=int, default=0, help="只拉前 N 只(0=全部),用于试跑")
+    ap.add_argument("--refresh", action="store_true",
+                    help="财报季刷新:按法定披露期判断,缓存缺最新报告期的票整只 force 重拉(否则缓存优先=永不更新)")
     a = ap.parse_args(argv)
 
     load_env_local()
@@ -67,14 +100,24 @@ def main(argv: list[str] | None = None) -> None:
     if a.limit:
         codes = codes[: a.limit]
 
+    target = expected_min_end_date(time.strftime("%Y%m%d")) if a.refresh else ""
+    if a.refresh:
+        print(f"refresh 模式:法定应披露最新报告期 = {target},已含该期的票跳过、过期票整只重拉", flush=True)
     print(f"mode={a.mode} board={a.board} | 待拉 {len(codes)} 只 × {len(tables)} 表 = {tables} "
-          f"| 缓存优先(已拉自动跳过)", flush=True)
+          f"| {'刷新过期' if a.refresh else '缓存优先(已拉自动跳过)'}", flush=True)
     t0 = time.time()
-    done = empty = err = 0
+    done = empty = err = skipped = 0
     for code in codes:
+        force = False
+        if a.refresh:
+            if _is_fresh(code, target):
+                skipped += 1
+                done += 1
+                continue
+            force = True  # 过期:该股所有表整只重拉(接口返全历史,覆盖写一致)
         for table in tables:
             try:
-                fetch_symbol_table(pro, table, code, CACHE)
+                fetch_symbol_table(pro, table, code, CACHE, force=force)
             except EmptyCoreTableError:
                 empty += 1  # 新上市/无财报:正常,跳过(已响亮:不落盘)
             except Exception as e:  # 单只单表失败响亮上报、继续
@@ -83,7 +126,7 @@ def main(argv: list[str] | None = None) -> None:
         done += 1
         if done % 100 == 0:
             rate = done / max(time.time() - t0, 1) * 60
-            print(f"  …{done}/{len(codes)} ({rate:.0f}只/min, 空{empty} 错{err})", flush=True)
+            print(f"  …{done}/{len(codes)} ({rate:.0f}只/min, 空{empty} 错{err} 新鲜跳过{skipped})", flush=True)
 
     dt = time.time() - t0
     print(f"\n完成:{done} 只,空核心表 {empty} 次,失败 {err} 次,耗时 {dt/60:.1f} 分钟。", flush=True)

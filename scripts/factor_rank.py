@@ -7,7 +7,9 @@
 - 方法:每因子 行业内中位数去均值 → 横截面百分位 → 等权合成 → 十分位(见 factor_model)。
 - 过滤:lean_tier 剔 🔴(三降/亏损),避免给恶化业务做"便宜"排序=价值陷阱;只对 🟢🟡 排。
 
-诚实边界:① 仅 2026Q1 一个财报横截面,无法回测 IC → 等权(不伪造权重);② tushare 行业较细、
+诚实边界:① 回测(修正版,N=40 单一 regime,见 memory factor-backtest-a-share)显示仅 ACC 显著,
+EP/BP/ROE/GP 为文献先验保留、等权是无信息诚实先验(拒绝 N=40 拟合权重=过拟合);MOM 两版符号
+不稳已移出合成、仅作展示;② tushare 行业较细、
 小行业内中位数去均值偏噪;③ 金融业各因子语义特殊,已行业中性(同业内比)但跨行业合成仍需
 模式优先判断兜(见 model-aware-judgment);④ 输出十分位/分位,不报 1 分粒度绝对分(去伪精度)。
 
@@ -20,6 +22,7 @@ import glob
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 from ashare_gauntlet.data.env import load_env_local
@@ -28,6 +31,7 @@ from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import composite, factor_percentile, momentum_return, to_decile
 from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
+from scripts.backfill_fina import expected_min_end_date
 
 CACHE = "data/cache"
 OUT_DIR = "data/holdscore"
@@ -36,7 +40,10 @@ MAIN = ("沪主板", "深主板")
 
 def latest_rows(endpoint: str, cols: list[str]) -> pd.DataFrame:
     """每只取该表最新报告期一行(ts_code 为索引)。"""
-    need = ["ts_code", "end_date"] + cols
+    # ann_date/update_flag 参与排序:同 (end_date) 多行(快照 vs 更正重述)时必须确定性地取
+    # 最新更正值——update_flag='1' 是 tushare 更正后记录(官方语义),字符序恰排最后;
+    # 否则不稳定排序会随机取到更正前的错值(实测 600115 归母净利更正前后差 1.6 亿,直接进 ACC 分子)。
+    need = ["ts_code", "end_date", "ann_date", "update_flag"] + cols
     out: dict[str, pd.Series] = {}
     for f in glob.glob(f"{CACHE}/{endpoint}/*.parquet"):
         try:
@@ -46,7 +53,8 @@ def latest_rows(endpoint: str, cols: list[str]) -> pd.DataFrame:
             df = df[[c for c in need if c in df.columns]]
         if df.empty:
             continue
-        out[str(df.iloc[0]["ts_code"])] = df.sort_values("end_date").iloc[-1]
+        sort_keys = [k for k in ("end_date", "ann_date", "update_flag") if k in df.columns]
+        out[str(df.iloc[0]["ts_code"])] = df.sort_values(sort_keys, kind="mergesort").iloc[-1]
     return pd.DataFrame(out).T
 
 
@@ -75,18 +83,30 @@ def main(argv: list[str] | None = None) -> None:
                     for f in sorted(glob.glob(f"{CACHE}/adj_factor/*.parquet"))], ignore_index=True)
     as_of = str(da["trade_date"].max())
     px = da.merge(aj, on=["ts_code", "trade_date"], how="left")
+    # fail-loud ①:adj_factor 缺日会让全市场该日 adj_close=NaN 被静默 dropna 吞掉(MOM/MA20 悄悄错位)
+    _miss = px.loc[px["adj_factor"].isna(), "trade_date"].unique()
+    if len(_miss):
+        raise SystemExit(f"adj_factor 缺 {len(_miss)} 个交易日(如 {sorted(_miss)[:4]})——先 backfill 补齐,"
+                         "拒绝静默 NaN 传染")
+    # fail-loud ②:财务缓存新鲜度——法定披露期后必须已含新报告期(否则财报季后整条管线静默用旧财报)
+    _expected = expected_min_end_date(as_of)
+    _fina_max = str(fina["end_date"].astype(str).max()) if "end_date" in fina.columns and len(fina) else ""
+    if _fina_max < _expected:
+        raise SystemExit(f"财务缓存过期:横截面最新报告期 {_fina_max or '(空)'} < 法定应披露 {_expected}——"
+                         f"先跑 python -m scripts.backfill_fina --mode core --refresh")
     px["adj_close"] = px["close"].astype(float) * px["adj_factor"].astype(float)
     mom_d: dict[str, float | None] = {}
     ret5_d: dict[str, float | None] = {}
     last_d: dict[str, float] = {}
-    ma20_d: dict[str, float | None] = {}
+    dma20_d: dict[str, float | None] = {}
     for code, g in px.sort_values("trade_date").groupby("ts_code"):
         ac = g["adj_close"].dropna()
         cl = g["close"].astype(float)
         mom_d[str(code)] = momentum_return(ac, 120)
         ret5_d[str(code)] = float(ac.iloc[-1] / ac.iloc[-6] - 1.0) if len(ac) >= 6 else None
         last_d[str(code)] = float(cl.iloc[-1])
-        ma20_d[str(code)] = float(cl.tail(20).mean()) if len(cl) >= 20 else None
+        # 距MA20 用**前复权价**算(XD 除息日的分红缺口不是跌——未复权会假破位,实盘已两次踩中)
+        dma20_d[str(code)] = float(ac.iloc[-1] / ac.tail(20).mean() - 1.0) if len(ac) >= 20 else None
     db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv")).set_index("ts_code")
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry")).set_index("ts_code")
 
@@ -102,10 +122,10 @@ def main(argv: list[str] | None = None) -> None:
     df["dedt_yoy"] = _num(fina["dt_netprofit_yoy"])
     df["rev_yoy"] = _num(fina["tr_yoy"])
     df["ocfps"] = _num(fina["ocfps"])
-    df["MOM"] = pd.Series(mom_d).reindex(idx)        # 动量:~6月前复权收益
+    df["MOM"] = pd.Series(mom_d).reindex(idx)        # 动量:~6月前复权收益(仅展示,不入分)
     df["ret5"] = pd.Series(ret5_d).reindex(idx)      # 近5日收益(脉冲检测)
     df["last"] = pd.Series(last_d).reindex(idx)
-    df["ma20px"] = pd.Series(ma20_d).reindex(idx)
+    df["dma20"] = pd.Series(dma20_d).reindex(idx)    # 距MA20(前复权口径,防XD假破位)
 
     rev = _num(inc["revenue"].reindex(idx))
     cogs = _num(inc["oper_cost"].reindex(idx))
@@ -134,38 +154,41 @@ def main(argv: list[str] | None = None) -> None:
     df = df[sum(c.notna() for c in fcols0) >= 4]
 
     ind = df["industry"]
-    df["f_EP"] = factor_percentile(df["EP"], ind, higher_is_better=True)
-    df["f_BP"] = factor_percentile(df["BP"], ind, higher_is_better=True)
-    df["f_ROE"] = factor_percentile(df["roe"], ind, higher_is_better=True)
-    df["f_GPOA"] = factor_percentile(df["GPOA"], ind, higher_is_better=True)
-    df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False)  # 应计越低越好
-    df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True)   # 动量:越强越好(Carhart MOM)
-    # 6 因子等权合成:价值(EP/BP)+ 质量(ROE/GP/ACC)+ 动量(MOM)。动量补回后,
-    # 洁美这类"强趋势+真成长但高PE"不再被价值×质量埋到底。
-    df["score"] = composite(df[["f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC", "f_MOM"]])
+    logmv = np.log(df["mv"].where(df["mv"] > 0))   # size 中性:与回测 _neutralize 同一形态
+    df["f_EP"] = factor_percentile(df["EP"], ind, higher_is_better=True, logmv=logmv)
+    df["f_BP"] = factor_percentile(df["BP"], ind, higher_is_better=True, logmv=logmv)
+    df["f_ROE"] = factor_percentile(df["roe"], ind, higher_is_better=True, logmv=logmv)
+    df["f_GPOA"] = factor_percentile(df["GPOA"], ind, higher_is_better=True, logmv=logmv)
+    df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好
+    df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
+    # 5 因子等权合成(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
+    # MOM 不入分:本地回测两版符号均负且不显著(120日 t-2.91→12-1 t-1.63),等权纳入=隐含正向
+    # 先验、与本地证据矛盾、系统性给涨完的票抬分(见 memory factor-backtest-a-share);保留 f_MOM
+    # 仅作位置/趋势展示。EP/ROE/GP 为文献先验保留(本地 2022-26 单 regime 实证仅 ACC 显著)。
+    df["score"] = composite(df[["f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC"]])
     df["decile"] = to_decile(df["score"])
     df = df.sort_values("score", ascending=False)
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    keep = ["name", "industry", "tier", "pe", "pb", "roe", "decile", "score",
-            "f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "MOM", "ret5", "last", "ma20px"]
+    keep = ["name", "industry", "tier", "pe", "pb", "roe", "mv", "decile", "score",
+            "f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "MOM", "ret5", "last", "dma20"]
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)
 
-    print(f"=== 横截面因子排序(价值×质量×动量·行业中性·零magic number, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
-    print("分位=行业内百分位(0-100,越高越好);ACC=低应计;MOM=6月动量;趋势/脉冲:近5日涨>15%标⚡脉冲(防低基数炒作)")
-    print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'ROE':>4}{'GP':>3}{'ACC':>4}{'MOM':>4}{'PE':>5} {'位置/趋势'}")
+    print(f"=== 横截面因子排序(价值×质量5因子·行业+市值双中性·MOM仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
+    print("分位=双中性百分位(0-100);本地实证仅 ACC 显著(其余为文献先验);MOM 不入分;距MA20=前复权口径(防XD假破位)")
+    print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'ROE':>4}{'GP':>3}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/趋势'}")
     pc = lambda x: f"{x*100:.0f}" if isinstance(x, (int, float)) and x == x else "—"
     nn = lambda x: f"{x:.0f}" if isinstance(x, (int, float)) and x == x else "—"
     for i, (code, r) in enumerate(df.head(a.top).iterrows(), 1):
-        last, ma20px, ret5, mom = r.get("last"), r.get("ma20px"), r.get("ret5"), r.get("MOM")
-        dma = f"{(last/ma20px-1)*100:+.0f}%" if isinstance(last, (int, float)) and isinstance(ma20px, (int, float)) and ma20px else "—"
+        dma20, ret5, mom = r.get("dma20"), r.get("ret5"), r.get("MOM")
+        dma = f"{dma20*100:+.0f}%" if isinstance(dma20, (int, float)) and dma20 == dma20 else "—"
         spike = "⚡脉冲" if isinstance(ret5, (int, float)) and ret5 > 0.15 else (
             f"趋势{mom*100:+.0f}%" if isinstance(mom, (int, float)) and mom > 0.2 else "")
         print(f"{i:>2} {(int(r['decile']) if pd.notna(r['decile']) else 0):>2} {r['tier']:>2} "
               f"{str(r['name'])[:8]:<9}{str(r['industry'])[:6]:<7}"
               f"{pc(r['f_EP']):>3}{pc(r['f_BP']):>3}{pc(r['f_ROE']):>4}{pc(r['f_GPOA']):>3}{pc(r['f_ACC']):>4}{pc(r['f_MOM']):>4}"
-              f"{nn(r['pe']):>5} 距MA20{dma} {spike}")
+              f"{nn(r['pe']):>5}{nn(r.get('mv')):>7} 距MA20{dma} {spike}")
 
 
 if __name__ == "__main__":

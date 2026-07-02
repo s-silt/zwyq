@@ -27,6 +27,7 @@ from ashare_gauntlet.fundamentals import (
     latest_quarter,
     peg,
     pledge_ratio,
+    quarterly_ocf,
     receivables_ratio,
     recent_holder_trades,
     st_status,
@@ -109,7 +110,11 @@ def tier_of(rec: dict[str, Any]) -> dict[str, Any]:
     profitable = f.get("profitable")
     np_yoy, dedt_yoy, rev_yoy = f.get("np_yoy"), f.get("dedt_yoy"), f.get("rev_yoy")
     np_yi, dedt_yi = f.get("np_yi"), f.get("dedt_yi")
-    ocf = q.get("op_cashflow_yi")
+    # 现金门优先用**单季**口径(铁律:现金看单季——累计/年报为正会掩盖最新单季转负);
+    # 单季不可算(上一季行缺失)时退回年报口径,行为与历史一致、不因缺失误杀。
+    ocf_q = q.get("op_cashflow_q_yi")
+    ocf_src = "单季" if ocf_q is not None else "年报"
+    ocf = ocf_q if ocf_q is not None else q.get("op_cashflow_yi")
     gw, na = b.get("goodwill_yi"), b.get("net_assets_yi")
     is_st = bool(s.get("is_st"))
     warn_pledge = any(fl.get("type") == "质押" and fl.get("severity") == "警示" for fl in flags)
@@ -127,7 +132,13 @@ def tier_of(rec: dict[str, Any]) -> dict[str, Any]:
     if gw is not None and na is not None and na > 0 and gw / na * 100 > GOODWILL_WARN:
         mine.append(f"商誉占净资产>{GOODWILL_WARN:.0f}%")
     if mine:
-        return {"grade": "⛔", "reasons": mine, "needs_human": False}
+        # ⛔ 内两类认知性质不同的规则(审计):监管/算术事实(当前ST=交易所认定、资不抵债=会计
+        # 零点)否决安全 needs_human=False;量级判断(亏损、双降≤-40%、商誉>50% —— 后两个常数
+        # 无标定出处,亏损可能是单季/周期性)一票否决必须过人工复核,否则=无人复核的误杀
+        # (roll-up 商誉是模式特征≠暴雷,见 model-aware-judgment)。
+        factual = {"当前ST", "资不抵债(净资产≤0)"}
+        return {"grade": "⛔", "reasons": mine,
+                "needs_human": any(m not in factual for m in mine)}
 
     # 🔴 题材背离·警示(需配涨幅,人工复核)
     red: list[str] = []
@@ -152,7 +163,8 @@ def tier_of(rec: dict[str, Any]) -> dict[str, Any]:
         yellow.append("扣非绝对值缺失·无法核扣非背离")
         needs_human = True
     if ocf is not None and ocf < 0:
-        yellow.append("经营现金流<0(年报)" if profitable is not True else "盈利但经营现金流<0(年报)")
+        yellow.append(f"经营现金流<0({ocf_src})" if profitable is not True
+                      else f"盈利但经营现金流<0({ocf_src})")
     if np_yoy is not None and rev_yoy is not None and np_yoy > LOW_BASE_NP and rev_yoy < LOW_BASE_REV:
         yellow.append(f"疑低基数(净利+{np_yoy:.0f}% 营收+{rev_yoy:.0f}%)")
         needs_human = True
@@ -340,6 +352,10 @@ def build_record(
         }
     else:  # 年报缺失:三叶子无依据,全 None(不套固定 20251231 伪造年报期)
         quality = {"op_cashflow_yi": None, "net_cash_ratio": None, "accrual": None}
+    # 单季经营现金流(铁律:现金看单季;tier_of 现金门优先用它,累计为正掩盖不了单季转负)
+    qocf = quarterly_ocf(cashflow)
+    quality["op_cashflow_q_yi"] = qocf.get("ocf_q_yi")
+    quality["ocf_q_end"] = qocf.get("end_date")  # 口径标注:单季对应的报告期
 
     # ST 状态
     st = st_status(fund_tables["namechange"]) or {}

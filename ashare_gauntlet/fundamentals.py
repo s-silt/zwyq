@@ -43,7 +43,10 @@ def _period_row(df: pd.DataFrame | None, end_date: str | None = None) -> "pd.Ser
         d = d[d["report_type"].astype(str) == "1"]
     if d.empty:
         return None
-    d = cast(pd.DataFrame, d).sort_values("end_date").drop_duplicates("end_date", keep="last")
+    # 同 end_date 多行(快照 vs 更正重述):按 ann_date/update_flag 排序后 keep last 才确定性
+    # 取到更正后的值('1'=更正后,tushare 官方语义);单键排序 + 不稳定 quicksort 会随机取错行。
+    sort_keys = ["end_date"] + [k for k in ("ann_date", "update_flag") if k in d.columns]
+    d = cast(pd.DataFrame, d).sort_values(sort_keys, kind="mergesort").drop_duplicates("end_date", keep="last")
     if end_date is not None:
         sel = d[d["end_date"] == str(end_date)]
         return sel.iloc[-1] if not sel.empty else None
@@ -163,6 +166,34 @@ def cashflow_facts(cashflow: pd.DataFrame, end_date: str | None = None) -> dict[
     if r is None:
         return {}
     return {"end_date": str(r["end_date"]), "op_cashflow_yi": _yi(r.get("n_cashflow_act"))}
+
+
+_PRIOR_QUARTER_END = {"0630": "0331", "0930": "0630", "1231": "0930"}
+
+
+def quarterly_ocf(cashflow: pd.DataFrame, end_date: str | None = None) -> dict[str, Any]:
+    """最新(或指定)报告期的**单季**经营现金流(亿)——铁律"现金流看单季不看年报/累计"。
+
+    A股现金流量表是累计(YTD)口径:单季 = cum(本期) − cum(上一季末);Q1 单季即累计。
+    上一季行缺失 → ocf_q_yi=None(如实缺失,不拿累计冒充单季——年报"净现比"会骗人,
+    累计为正可掩盖最新单季转负,沪电 Q1 现金流-64% 一类信号只有单季口径抓得到)。
+    """
+    r = _period_row(cashflow, end_date)
+    if r is None:
+        return {}
+    end = str(r["end_date"])
+    cum = _yi(r.get("n_cashflow_act"))
+    if cum is None:
+        return {"end_date": end, "ocf_q_yi": None}
+    mmdd = end[4:]
+    if mmdd == "0331":
+        return {"end_date": end, "ocf_q_yi": cum}
+    prior_mmdd = _PRIOR_QUARTER_END.get(mmdd)
+    if prior_mmdd is None:  # 非标准季末(极少;不猜)
+        return {"end_date": end, "ocf_q_yi": None}
+    pr = _period_row(cashflow, end[:4] + prior_mmdd)
+    pcum = _yi(pr.get("n_cashflow_act")) if pr is not None else None
+    return {"end_date": end, "ocf_q_yi": (cum - pcum) if pcum is not None else None}
 
 
 def recent_holder_trades(stk_holdertrade: pd.DataFrame, as_of: str, within_days: int = 365) -> list[dict[str, Any]]:

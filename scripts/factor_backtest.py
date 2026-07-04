@@ -116,15 +116,13 @@ def one_word_limit_up(daily_1d: pd.DataFrame, stk_limit_1d: pd.DataFrame,
     lim["ts_code"] = lim["ts_code"].astype(str)
     m = d.merge(lim, on="ts_code", how="left")
     miss = m["up_limit"].isna()
-    if bool(miss.any()):
-        sample = m.loc[miss, "ts_code"].head(5).tolist()
-        raise ValueError(
-            f"one_word_limit_up: daily 有行但 stk_limit 缺涨停价 {int(miss.sum())} 只(如 {sample})"
-            f"——拒绝静默当作可成交,先补齐 stk_limit 缓存")
+    # 个券级涨停价缺行(数据商缺口,实测 001914.SZ 重组上市初期):**保守剔除**——
+    # 无法验证可成交的股不进多头样本(definitional:宁可少算不可伪造"可买"),
+    # 并入返回集合由调用方 surface 数量;整跑 raise 会让 1 只缺行掐死 149 期回测。
     o, h, low, c = (m[k].astype(float) for k in ("open", "high", "low", "close"))
     flat = (o == h) & (h == low) & (low == c)
     at_limit = h >= m["up_limit"].astype(float) - 1e-6
-    return set(m.loc[flat & at_limit, "ts_code"])
+    return set(m.loc[(flat & at_limit) | miss, "ts_code"])
 
 
 def main(argv: list[str] | None = None) -> None:

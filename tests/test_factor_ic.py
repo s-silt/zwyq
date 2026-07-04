@@ -155,12 +155,13 @@ def test_one_word_limit_up_restricts_to_codes_subset():
     assert one_word_limit_up(day, lim, ["600001.SH"]) == {"600001.SH"}
 
 
-def test_one_word_limit_up_missing_limit_pairing_fails_loud():
-    # 样本内 daily 有行但 stk_limit 缺涨停价 → fail-loud,拒绝静默当作可成交
+def test_one_word_limit_up_missing_limit_treated_as_untradable():
+    # 个券级涨停价缺行(数据商缺口,实测 001914.SZ 重组上市初期)→ **保守剔除**:
+    # 无法验证可成交的股并入剔除集合(宁可少算不可伪造"可买"),由调用方 surface 数量;
+    # 整跑 raise 会让 1 只缺行掐死 149 期回测(原 fail-loud 语义降级的原因)。
     day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0)])
     lim = _lim([("600999.SH", 9.9)])
-    with pytest.raises(ValueError, match="600001.SH"):
-        one_word_limit_up(day, lim, ["600001.SH"])
+    assert one_word_limit_up(day, lim, ["600001.SH"]) == {"600001.SH"}
 
 
 def test_one_word_limit_up_empty_input_fails_loud():

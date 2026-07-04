@@ -89,6 +89,17 @@ CORE_SYMBOL_TABLES: frozenset[str] = frozenset(
     {"income", "fina_indicator", "balancesheet", "cashflow"}
 )
 
+# 全市场逐日表的必需列 + 显式 fields 重试清单(镜像个别日期不带 fields 返回退化 schema,
+# 实测 20160630 daily_basic 只有 pe/pb/dv_ttm;显式请求可拿全)。
+REQUIRED_MARKET_COLUMNS: dict[str, tuple[str, ...]] = {
+    "daily_basic": ("total_mv", "pe_ttm", "pb"),
+}
+EXPLICIT_MARKET_FIELDS: dict[str, str] = {
+    "daily_basic": ("ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,"
+                    "pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm,total_share,float_share,"
+                    "free_share,total_mv,circ_mv"),
+}
+
 
 def trading_days_from_cal(trade_cal: pd.DataFrame) -> list[str]:
     """Open trading days (``cal_date`` strings) from a ``trade_cal`` pull, sorted."""
@@ -117,9 +128,12 @@ def call_with_retry(
             message = str(error)
             if any(marker in message for marker in _FATAL_MARKERS):
                 raise TokenExpiredError(message) from error
-            transient = isinstance(error, requests.exceptions.RequestException) or any(
-                marker in message.lower() for marker in (*_RATE_MARKERS, *_TRANSIENT_MARKERS)
-            )
+            # EmptyMarketDayError 也按 transient 重试:镜像对历史日偶发瞬时返回空
+            # (实测 20220630 daily_basic 首拉 0 行、复拉 4806 行)——重试几次可自愈;
+            # 真"当日未发布"多花几次调用后照样抛,语义不变。
+            transient = (isinstance(error, (requests.exceptions.RequestException, EmptyMarketDayError))
+                         or any(marker in message.lower()
+                                for marker in (*_RATE_MARKERS, *_TRANSIENT_MARKERS)))
             if not transient:
                 raise
             last_error = error
@@ -153,6 +167,17 @@ def fetch_market_day(
     def _pull() -> pd.DataFrame:
         method = getattr(pro, endpoint)
         df = method(trade_date=trade_date, fields=fields) if fields else method(trade_date=trade_date)
+        # 镜像怪癖(实测 20160630):个别日期不带 fields 会返回退化 schema(只有 pe/pb/dv_ttm,
+        # 缺 total_mv/pe_ttm)。必需列缺失 → 显式 fields 重试一次(实测显式请求可拿全),
+        # 仍缺才 raise——退化 schema 落盘会让下游 KeyError 或静默用错列。
+        required = REQUIRED_MARKET_COLUMNS.get(endpoint, ())
+        if required and not df.empty and any(c not in df.columns for c in required):
+            df = method(trade_date=trade_date, fields=EXPLICIT_MARKET_FIELDS[endpoint])
+            still = [c for c in required if c not in df.columns]
+            if still:
+                raise RuntimeError(
+                    f"market endpoint {endpoint!r} trade_date={trade_date!r} 显式 fields 重试后"
+                    f"仍缺必需列 {still} —— 源侧 schema 异常,拒绝缓存退化数据")
         # Guard *before* read_or_fetch caches it: an empty full-market pull must
         # never be written, or the idempotent backfill skips the date forever.
         if must_be_nonempty and df.empty:

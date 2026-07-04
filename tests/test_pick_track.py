@@ -1,10 +1,15 @@
 """Tests for pick_track —— 筛选器命中率闭环(D10 进出 diff + 前向收益),纯测量不打分。"""
+import math
+
 import pandas as pd
 import pytest
 
 from scripts.pick_track import (
+    COMMISSION_RATE,
+    SLIPPAGE_RATE,
     EmptyIndexPullError,
     IncompleteIndexPullError,
+    cost_adjusted_excess,
     diff_picks,
     forward_returns,
     index_return,
@@ -201,3 +206,32 @@ def test_load_index_daily_holey_cache_self_heals_by_refetch(tmp_path):
                           expected_days=["20260101", "20260102", "20260103", "20260106"])
     assert len(pro.calls) == 1  # 缓存有洞 → 重拉一次
     assert list(df["trade_date"]) == ["20260101", "20260102", "20260103", "20260106"]
+
+
+# ---------- 成本后超额vs300:round_trip 上界口径(与 factor_backtest 同默认同出处) ----------
+
+def test_cost_adjusted_excess_subtracts_round_trip_cost():
+    # 20260101(0.05% 印花税段):round_trip = 2×0.00025 + 2×0.0015 + 0.0005 = 0.004
+    v = cost_adjusted_excess(0.10, 0.04, "20260101", 0.00025, 0.0015)
+    assert abs(v - (0.10 - 0.004 - 0.04)) < 1e-12
+
+
+def test_cost_adjusted_excess_uses_snapshot_date_stamp_regime():
+    # 印花税 PIT 分段:税改前快照的成本多 0.05%(2023年第39号公告减半)
+    pre = cost_adjusted_excess(0.10, 0.04, "20230827", 0.00025, 0.0015)
+    post = cost_adjusted_excess(0.10, 0.04, "20230828", 0.00025, 0.0015)
+    assert abs((post - pre) - 0.0005) < 1e-12
+
+
+def test_cost_adjusted_excess_nan_propagates():
+    # 收益 NaN(数据不足)→ 成本后列也 NaN,不伪造
+    assert math.isnan(cost_adjusted_excess(float("nan"), 0.04, "20260101",
+                                           COMMISSION_RATE, SLIPPAGE_RATE))
+    assert math.isnan(cost_adjusted_excess(0.10, float("nan"), "20260101",
+                                           COMMISSION_RATE, SLIPPAGE_RATE))
+
+
+def test_default_cost_params_match_factor_backtest_provenance():
+    # 佣金万2.5(券商常见档,用户合同参数)/ 滑点15bp(LWZ 2022 JFE 中国市场实测下沿)
+    assert COMMISSION_RATE == 0.00025
+    assert SLIPPAGE_RATE == 0.0015

@@ -11,6 +11,9 @@
 ③ 沪深300 双基准 + regime 读数:宇宙内等权基准量"选股能力",沪深300 量"配置效果"
    (两者可背离:全主板齐跌时跑赢宇宙仍可能跑输 300);最近 20 交易日 300 涨跌
    帮助解读 D10 跑输是 α(选股)问题还是 β(市场)问题。
+④ 成本后超额vs300:扣一次 round_trip(2×佣金+2×滑点+快照日印花税,PIT 分段见
+   ashare_gauntlet.costs)的超额——无成本前向收益系统性虚高(五路文献研读结论);
+   上界口径(持仓未平时实际只发生买入侧),参数与 scripts.factor_backtest 同默认同出处。
 
 Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.pick_track
 """
@@ -25,6 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from ashare_gauntlet.costs import round_trip_cost_rate
 from ashare_gauntlet.data.fetch import call_with_retry
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
 
@@ -34,6 +38,11 @@ OUT_DIR = "data/holdscore"
 INDEX_CODE = "000300.SH"   # 沪深300 —— 配置基准(大盘宽基,主板宇宙的自然对照)
 # regime 窗口 = 20 交易日 ≈ 一个自然月,复用代码库既有约定(pct20/ret20/reversal n=20)
 REGIME_WINDOW = 20
+
+# 成本参数(与 scripts.factor_backtest --commission/--slippage **同默认同出处**,两处口径
+# 必须一致,否则回测与前向追踪的"成本后"不可比):
+COMMISSION_RATE = 0.00025   # 单边佣金率:券商常见万2.5(用户合同参数,非库常数)
+SLIPPAGE_RATE = 0.0015      # 单边滑点率:LWZ(2022 JFE)中国市场实测 15bp 取下沿
 
 
 class EmptyIndexPullError(RuntimeError):
@@ -84,6 +93,18 @@ def index_return(idx_df: pd.DataFrame, snap_date: str) -> float:
     if len(c) == 0:
         return math.nan
     return float(c.iloc[-1] / c.iloc[0] - 1.0) if len(c) >= 2 else 0.0
+
+
+def cost_adjusted_excess(port_ret: float, bench_ret: float, snap_date: str,
+                         commission_rate: float, slippage_rate: float) -> float:
+    """成本后超额 = 组合收益 − round_trip 成本率 − 基准收益(上界口径)。
+
+    round_trip = 2×佣金 + 2×滑点 + 快照日印花税(PIT 分段,见 ashare_gauntlet.costs);
+    把整段前向收益记**一次完整买卖**的成本——持仓未平时实际只发生买入侧,该列是保守
+    上界而非实际成本。基准(沪深300)不扣成本:它是"不动的对照",扣了会自夸。
+    收益 NaN(数据不足)→ 结果 NaN 传播,不伪造。
+    """
+    return port_ret - round_trip_cost_rate(snap_date, commission_rate, slippage_rate) - bench_ret
 
 
 def regime_return(idx_df: pd.DataFrame, n: int) -> float:
@@ -205,7 +226,7 @@ def main() -> None:
     # ② 各历史快照 D10 的前向收益 vs 双基准(宇宙内等权=选股能力,沪深300=配置效果)
     print(f"\n=== D10 前向收益 vs 双基准(至 {latest};样本外命中率证据,逐期积累)===")
     print(f"{'快照日':>10}{'D10只数':>7}{'D10均收益':>10}{'基准均收益':>10}{'超额':>8}"
-          f"{'沪深300收益':>10}{'超额vs300':>9}")
+          f"{'沪深300收益':>10}{'超额vs300':>9}{'成本后超额vs300':>12}")
     for p in snaps:
         m = re.match(r"(\d{8})_factor\.json", os.path.basename(p))
         if not m:
@@ -221,9 +242,13 @@ def main() -> None:
         d10_m = pd.Series(fr).mean()
         uni_m = pd.Series(fu).mean()
         hs = index_return(idx, snap)
+        net300 = cost_adjusted_excess(d10_m, hs, snap, COMMISSION_RATE, SLIPPAGE_RATE)
         print(f"{snap:>10}{len(d10):>7}{d10_m*100:>+9.1f}%{uni_m*100:>+9.1f}%{(d10_m-uni_m)*100:>+7.1f}%"
-              f"{hs*100:>+11.1f}%{(d10_m-hs)*100:>+10.1f}%")
+              f"{hs*100:>+11.1f}%{(d10_m-hs)*100:>+10.1f}%{net300*100:>+15.1f}%")
     print("(超额>0=跑赢自身宇宙=选股能力;超额vs300>0=跑赢配置基准;样本少时噪声大,别过度解读单期)")
+    print(f"(成本后超额vs300:扣一次 round_trip=2×佣金万{COMMISSION_RATE*10000:g}+2×滑点"
+          f"{SLIPPAGE_RATE*10000:g}bp+快照日印花税——上界口径,持仓未平实际成本更低;"
+          f"与 factor_backtest 同默认同出处)")
 
     # regime 读数:D10 跑输时先分清是 α(选股)还是 β(市场)的问题
     rg = regime_return(idx, REGIME_WINDOW)

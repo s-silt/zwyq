@@ -1,7 +1,8 @@
-"""Tests for factor IC backtest —— IC(秩相关)+ point-in-time 防未来函数选期。"""
+"""Tests for factor IC backtest —— IC(秩相关)+ point-in-time 防未来函数选期 + 可成交性过滤。"""
 import math
 
 import pandas as pd
+import pytest
 
 from ashare_gauntlet.backtest import (
     adjusted_tstat,
@@ -9,6 +10,7 @@ from ashare_gauntlet.backtest import (
     point_in_time,
     quantile_spread,
 )
+from scripts.factor_backtest import one_word_limit_up
 
 
 def test_adjusted_tstat_penalizes_autocorrelation():
@@ -109,3 +111,69 @@ def test_point_in_time_excludes_future_announcement():
 def test_point_in_time_none_when_nothing_announced_yet():
     hist = pd.DataFrame({"end_date": ["20250331"], "ann_date": ["20250428"], "roe": [5.0]})
     assert point_in_time(hist, "20250101") is None
+
+
+# ---------- 可成交性过滤:入场日一字涨停(买不进的股不进 IC/spread 样本) ----------
+
+def _day(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame([{"ts_code": c, "trade_date": "20260102",
+                          "open": o, "high": h, "low": lo, "close": cl}
+                         for c, o, h, lo, cl in rows])
+
+
+def _lim(rows: list[tuple[str, float]]) -> pd.DataFrame:
+    return pd.DataFrame([{"ts_code": c, "trade_date": "20260102", "up_limit": u}
+                         for c, u in rows])
+
+
+def test_one_word_limit_up_detects_flat_at_limit():
+    # 一字板:开=高=低=收 且 触及涨停价 → 买不进,进剔除集合
+    day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0)])
+    lim = _lim([("600001.SH", 11.0)])
+    assert one_word_limit_up(day, lim, ["600001.SH"]) == {"600001.SH"}
+
+
+def test_one_word_limit_up_excludes_intraday_touch_not_sealed():
+    # 盘中触板但非一字(low<high,有成交机会)→ 不剔除
+    day = _day([("600002.SH", 10.5, 11.0, 10.4, 11.0)])
+    lim = _lim([("600002.SH", 11.0)])
+    assert one_word_limit_up(day, lim, ["600002.SH"]) == set()
+
+
+def test_one_word_limit_up_excludes_flat_below_limit():
+    # 全天一价但未及涨停(如冷门股一笔成交)→ 可成交,不剔除
+    day = _day([("600003.SH", 10.0, 10.0, 10.0, 10.0)])
+    lim = _lim([("600003.SH", 11.0)])
+    assert one_word_limit_up(day, lim, ["600003.SH"]) == set()
+
+
+def test_one_word_limit_up_restricts_to_codes_subset():
+    # codes 之外的一字板不进集合(全市场 daily 传入、只判样本内)
+    day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0),
+                ("300999.SZ", 22.0, 22.0, 22.0, 22.0)])
+    lim = _lim([("600001.SH", 11.0), ("300999.SZ", 22.0)])
+    assert one_word_limit_up(day, lim, ["600001.SH"]) == {"600001.SH"}
+
+
+def test_one_word_limit_up_missing_limit_pairing_fails_loud():
+    # 样本内 daily 有行但 stk_limit 缺涨停价 → fail-loud,拒绝静默当作可成交
+    day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0)])
+    lim = _lim([("600999.SH", 9.9)])
+    with pytest.raises(ValueError, match="600001.SH"):
+        one_word_limit_up(day, lim, ["600001.SH"])
+
+
+def test_one_word_limit_up_empty_input_fails_loud():
+    day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0)])
+    with pytest.raises(ValueError):
+        one_word_limit_up(day.iloc[0:0], _lim([("600001.SH", 11.0)]), ["600001.SH"])
+    with pytest.raises(ValueError):
+        one_word_limit_up(day, _lim([]).reindex(columns=["ts_code", "trade_date", "up_limit"]),
+                          ["600001.SH"])
+
+
+def test_one_word_limit_up_suspended_stock_absent_from_daily_is_not_error():
+    # 停牌股 daily 无行(entry 天然 NaN,由上游收益口径处理)→ 不判定也不报错
+    day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0)])
+    lim = _lim([("600001.SH", 11.0)])
+    assert one_word_limit_up(day, lim, ["600001.SH", "600888.SH"]) == {"600001.SH"}

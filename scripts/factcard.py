@@ -15,7 +15,14 @@ import pandas as pd
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_history, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
-from ashare_gauntlet.lit_factors import accrual_ratio, earnings_yield, net_cash_ratio, reversal, volatility
+from ashare_gauntlet.lit_factors import (
+    accrual_ratio,
+    earnings_yield,
+    latest_annual_end,
+    net_cash_ratio,
+    reversal,
+    volatility,
+)
 from ashare_gauntlet.fundamentals import (
     balance_facts,
     cashflow_facts,
@@ -46,6 +53,26 @@ TIERS = [
     ("⛔ 地雷/重度恶化", ["001229.SZ", "603341.SH", "000733.SZ", "603328.SH", "002993.SZ", "605258.SH",
                     "002106.SZ", "002897.SZ"]),
 ]
+
+
+def annual_lit_factors(income: pd.DataFrame | None, cashflow: pd.DataFrame | None,
+                       balancesheet: pd.DataFrame | None) -> tuple[str | None, float | None, float | None]:
+    """动态取最近年报期并算净现比/应计,返回 (年报期, 净现比, 应计强度)。
+
+    P2-9:年报期不再硬编码,取自 latest_annual_end(跨表 max …1231);
+    取不到任何年报期 → (None, None, None),由渲染层标「年报缺失」,不套固定日期伪造。
+    """
+    end = latest_annual_end(income, cashflow, balancesheet)
+    if end is None:
+        return None, None, None
+    return end, net_cash_ratio(income, cashflow, end=end), accrual_ratio(income, cashflow, balancesheet, end=end)
+
+
+def lit_factor_label(annual_end: str | None) -> str:
+    """文献因子行的口径标注:按真实年报期渲染(如 '净现比/应计=2024年报'),缺失则明示。"""
+    if annual_end is None:
+        return "净现比/应计=年报缺失"
+    return f"净现比/应计={annual_end[:4]}年报"  # end_date 为 yyyymmdd,前4位即年份
 
 
 def _load(ep: str) -> pd.DataFrame:
@@ -160,8 +187,8 @@ def main() -> None:
             print("      " + (" / ".join(flags) if flags else "无质押/解禁/减持/ST旗标"))
 
             dsub, asub = daily[daily["ts_code"] == code], adj[adj["ts_code"] == code]
-            ncr = net_cash_ratio(tabs["income"], tabs["cashflow"])
-            acc = accrual_ratio(tabs["income"], tabs["cashflow"], tabs["balancesheet"])
+            # P2-9:年报期动态取自数据(latest_annual_end),不再依赖硬编码 20251231
+            a_end, ncr, acc = annual_lit_factors(tabs["income"], tabs["cashflow"], tabs["balancesheet"])
             ep = earnings_yield(float(pe) if pd.notna(pe) else None)
             rev20, vol60 = reversal(dsub, asub, 20), volatility(dsub, asub, 60)
             lf = [
@@ -171,7 +198,7 @@ def main() -> None:
                 f"近20反转{rev20 * 100:+.0f}%" if rev20 is not None else "反转-",
                 f"波动{vol60 * 100:.1f}%" if vol60 is not None else "波动-",
             ]
-            print("      📚文献因子(净现比/应计=25年报): " + " | ".join(lf) + "\n")
+            print(f"      📚文献因子({lit_factor_label(a_end)}): " + " | ".join(lf) + "\n")
         print()
 
 

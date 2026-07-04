@@ -32,28 +32,85 @@ def _adj(n: int, factor: float = 1.0) -> pd.DataFrame:
     return pd.DataFrame({"trade_date": [f"202601{i:02d}" for i in range(1, n + 1)], "adj_factor": [factor] * n})
 
 
-# ---- 净现比 = 2025年报经营现金流 / 归母净利 ----
+# ---- 净现比 = 年报经营现金流 / 归母净利(年报期由调用方显式传入,P2-9 后无硬编码默认) ----
 def test_net_cash_ratio_basic():
-    assert net_cash_ratio(_inc(10e8), _cf(12e8)) == pytest.approx(1.2)
+    assert net_cash_ratio(_inc(10e8), _cf(12e8), end="20251231") == pytest.approx(1.2)
 
 
 def test_net_cash_ratio_nonpositive_profit_returns_none():
     # 净利<=0 时净现比无意义(分母失真),返回 None 而非伪造
-    assert net_cash_ratio(_inc(-5e8), _cf(12e8)) is None
+    assert net_cash_ratio(_inc(-5e8), _cf(12e8), end="20251231") is None
 
 
 def test_net_cash_ratio_missing_annual_returns_none():
-    # 缺 2025 年报行 -> None(数据缺失不伪造默认值)
-    assert net_cash_ratio(_inc(10e8, ed="20241231"), _cf(12e8)) is None
+    # 请求的年报期在数据里缺行 -> None(数据缺失不伪造默认值)
+    assert net_cash_ratio(_inc(10e8, ed="20241231"), _cf(12e8), end="20251231") is None
 
 
 # ---- 应计强度 = (归母净利 - 经营现金流) / 总资产(越低/越负越干净) ----
 def test_accrual_ratio_basic():
-    assert accrual_ratio(_inc(10e8), _cf(12e8), _bs(100e8)) == pytest.approx(-0.02)
+    assert accrual_ratio(_inc(10e8), _cf(12e8), _bs(100e8), end="20251231") == pytest.approx(-0.02)
 
 
 def test_accrual_ratio_zero_assets_returns_none():
-    assert accrual_ratio(_inc(10e8), _cf(12e8), _bs(0)) is None  # 总资产为0不可除
+    assert accrual_ratio(_inc(10e8), _cf(12e8), _bs(0), end="20251231") is None  # 总资产为0不可除
+
+
+# ---- P2-9:年报期不再有硬编码默认值(公约:不硬编码年报期,期必须动态传入) ----
+def test_annual_constant_removed():
+    # 模块不得再暴露硬编码年报期常量 ANNUAL(防回归:滚年后常量与真实数据期不符)
+    import ashare_gauntlet.lit_factors as m
+    assert not hasattr(m, "ANNUAL")
+
+
+def test_net_cash_ratio_end_is_required():
+    # 不传年报期 → fail-loud(TypeError),不再静默落到硬编码 20251231
+    with pytest.raises(TypeError):
+        net_cash_ratio(_inc(10e8), _cf(12e8))
+
+
+def test_accrual_ratio_end_is_required():
+    with pytest.raises(TypeError):
+        accrual_ratio(_inc(10e8), _cf(12e8), _bs(100e8))
+
+
+def test_net_cash_ratio_none_end_fails_loud():
+    # 调用方把 latest_annual_end 的 None 直接透传 → 必须炸,不许静默返回 None 掩盖年报缺失
+    with pytest.raises(ValueError, match="年报期"):
+        net_cash_ratio(_inc(10e8), _cf(12e8), end=None)
+
+
+def test_accrual_ratio_none_end_fails_loud():
+    with pytest.raises(ValueError, match="年报期"):
+        accrual_ratio(_inc(10e8), _cf(12e8), _bs(100e8), end=None)
+
+
+# ---- P2-9:factcard 文献因子行按真实年报期渲染文案,不再硬打"25年报" ----
+def test_factcard_annual_lit_factors_dynamic_end():
+    from scripts.factcard import annual_lit_factors
+    inc, cf, bs = _inc(10e8, ed="20241231"), _cf(12e8, ed="20241231"), _bs(100e8, ed="20241231")
+    end, ncr, acc = annual_lit_factors(inc, cf, bs)
+    assert end == "20241231"  # 期动态取自数据,而非硬编码 20251231
+    assert ncr == pytest.approx(1.2)
+    assert acc == pytest.approx(-0.02)
+
+
+def test_factcard_annual_lit_factors_no_annual_returns_all_none():
+    from scripts.factcard import annual_lit_factors
+    inc = _inc(10e8, ed="20250331")  # 只有季报,无任何年报
+    end, ncr, acc = annual_lit_factors(inc, None, None)
+    assert end is None and ncr is None and acc is None  # 不套固定日期伪造年报期
+
+
+def test_factcard_lit_factor_label_renders_real_period():
+    from scripts.factcard import lit_factor_label
+    assert lit_factor_label("20241231") == "净现比/应计=2024年报"
+    assert lit_factor_label("20251231") == "净现比/应计=2025年报"
+
+
+def test_factcard_lit_factor_label_missing_annual():
+    from scripts.factcard import lit_factor_label
+    assert lit_factor_label(None) == "净现比/应计=年报缺失"
 
 
 # ---- EP 盈利收益率 = 1 / PE_TTM ----

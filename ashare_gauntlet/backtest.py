@@ -20,8 +20,12 @@ def information_coefficient(factor: pd.Series, fwd_return: pd.Series) -> float:
 
     用秩相关(非 Pearson)对肥尾稳健、不受单位影响;成对丢弃 NaN;有效对 <3 返回 NaN
     (样本太小的相关无意义)。IC 均值衡量因子方向有效性,IC 均值/标准差(ICIR)衡量稳定性。
+
+    **按索引 inner join 配对**(非 reset_index 位置配对):因子与收益都以 ts_code 为索引,
+    位置配对在两边顺序/成分稍有不同时会把 A 票的因子配到 B 票的收益上——静默错配出假 IC。
+    索引不交集的行(只有因子没收益、或反之)丢弃。
     """
-    paired = pd.DataFrame({"f": factor.reset_index(drop=True), "r": fwd_return.reset_index(drop=True)}).dropna()
+    paired = pd.concat({"f": factor, "r": fwd_return}, axis=1, join="inner").dropna()
     if len(paired) < 3:
         return math.nan
     # Spearman = 秩的 Pearson 相关(手算避免 scipy 依赖)
@@ -51,8 +55,9 @@ def quantile_spread(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> flo
 
     只看 IC(秩相关)不够——IC 显著但分组不单调/多空 spread 被成本吃光=不可交易。
     按因子分 q 组,返回 最高组均值收益 − 最低组均值收益。样本不足返回 NaN。
+    配对口径与 information_coefficient 相同:按索引 inner join,不按位置(防静默错配)。
     """
-    df = pd.DataFrame({"f": factor.reset_index(drop=True), "r": fwd_return.reset_index(drop=True)}).dropna()
+    df = pd.concat({"f": factor, "r": fwd_return}, axis=1, join="inner").dropna()
     if len(df) < q * 5:
         return math.nan
     bucket = pd.qcut(df["f"].rank(method="first"), q, labels=False)

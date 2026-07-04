@@ -13,6 +13,8 @@ from typing import cast
 
 import pandas as pd
 
+from ashare_gauntlet.data.partition import assert_adj_complete
+
 
 def universe_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
     """Derive a universe table from cached daily data when ``stock_basic`` is
@@ -56,12 +58,18 @@ def north_flow_signal(hk_hold: pd.DataFrame, k: int) -> pd.DataFrame:
 
 def add_adjusted_prices(daily: pd.DataFrame, adj: pd.DataFrame) -> pd.DataFrame:
     """Merge daily OHLC with adjustment factors and add back-adjusted
-    ``hfq_open`` / ``hfq_close`` (raw price x adj_factor)."""
+    ``hfq_open`` / ``hfq_close`` (raw price x adj_factor).
+
+    Fail-loud when any traded row lacks ``adj_factor`` (与 factor_rank 同一断言,
+    见 data.partition.assert_adj_complete):缺行会让 hfq 价 NaN,被下游
+    signal/fwd_ret 的 notna 过滤静默吞掉 —— 信号与前向收益悄悄错位而非报错。
+    """
     merged = daily.merge(
         adj[["ts_code", "trade_date", "adj_factor"]],
         on=["ts_code", "trade_date"],
         how="left",
     )
+    assert_adj_complete(merged)
     merged["hfq_close"] = merged["close"] * merged["adj_factor"]
     merged["hfq_open"] = merged["open"] * merged["adj_factor"]
     return merged

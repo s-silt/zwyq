@@ -46,6 +46,26 @@ def test_add_adjusted_prices_back_adjusts_open_and_close():
     assert out.loc["20240103", "hfq_close"] == pytest.approx(23.0)
 
 
+def test_add_adjusted_prices_fails_loud_on_missing_adj_factor():
+    # adj 缺 20240103 → 该日 hfq 价 NaN,会被下游 signal/fwd_ret 的 notna 过滤静默
+    # 吞掉(信号与前向收益悄悄错位)→ 与 factor_rank 同口径 fail-loud,拒绝 NaN 传染
+    daily = pd.DataFrame(
+        {
+            "ts_code": ["A", "A"],
+            "trade_date": ["20240102", "20240103"],
+            "open": [10.0, 11.0],
+            "close": [10.5, 11.5],
+            "amount": [1000.0, 2000.0],
+        }
+    )
+    adj = pd.DataFrame(
+        {"ts_code": ["A"], "trade_date": ["20240102"], "adj_factor": [2.0]}
+    )
+
+    with pytest.raises(SystemExit, match="20240103"):
+        add_adjusted_prices(daily, adj)
+
+
 def test_add_signal_and_forward_uses_past_close_and_next_open_window():
     n = 8
     df = pd.DataFrame(

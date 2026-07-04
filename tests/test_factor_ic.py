@@ -59,6 +59,33 @@ def test_ic_insufficient_pairs_returns_nan():
     assert math.isnan(information_coefficient(pd.Series([1.0, 2.0]), pd.Series([1.0, 2.0])))
 
 
+def test_ic_aligns_by_index_not_position():
+    # 同内容、乱序索引 → 必须按索引 join 配对(位置配对会把 A 票因子配到 B 票收益)
+    codes = ["600000.SH", "000001.SZ", "600519.SH", "000002.SZ", "601318.SH"]
+    f = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0], index=codes)
+    r = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0], index=codes)
+    shuffled = ["000002.SZ", "600519.SH", "601318.SH", "600000.SH", "000001.SZ"]
+    assert abs(information_coefficient(f, r.loc[shuffled]) - 1.0) < 1e-9
+    assert abs(information_coefficient(f, r.loc[shuffled]) - information_coefficient(f, r)) < 1e-9
+
+
+def test_ic_index_join_drops_unmatched_labels():
+    # 索引不交集的行(某票只有因子没有收益)按 inner join 丢弃,不错位配对
+    f = pd.Series([1.0, 2.0, 3.0, 4.0], index=["a", "b", "c", "d"])
+    r = pd.Series([1.0, 2.0, 3.0, 9.0], index=["a", "b", "c", "z"])  # d/z 不匹配
+    assert abs(information_coefficient(f, r) - 1.0) < 1e-9  # 只配 a,b,c
+
+
+def test_quantile_spread_aligns_by_index_not_position():
+    codes = [f"c{i}" for i in range(50)]
+    f = pd.Series([float(i) for i in range(50)], index=codes)
+    r = pd.Series([float(i) for i in range(50)], index=codes)  # 因子高→收益高
+    shuffled = list(reversed(codes))
+    aligned = quantile_spread(f, r, 5)
+    assert abs(quantile_spread(f, r.loc[shuffled], 5) - aligned) < 1e-9
+    assert quantile_spread(f, r.loc[shuffled], 5) > 0  # 位置配对会误算成反向
+
+
 def test_point_in_time_uses_latest_announced_before_asof():
     hist = pd.DataFrame({
         "end_date": ["20250331", "20250630", "20250930"],

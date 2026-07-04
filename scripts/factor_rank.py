@@ -32,6 +32,7 @@ import pandas as pd
 
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
+from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import (
     composite,
@@ -49,8 +50,14 @@ OUT_DIR = "data/holdscore"
 MAIN = ("沪主板", "深主板")
 
 
-def latest_rows(endpoint: str, cols: list[str]) -> pd.DataFrame:
-    """每只取该表最新报告期一行(ts_code 为索引)。"""
+def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
+    """每只取该表 **as_of 时点已公告** 的最新报告期一行(ts_code 为索引)。
+
+    as_of(YYYYMMDD)是 PIT 闸门:先过滤 ann_date<=as_of 再取最新——价格缓存停在
+    旧日而财务缓存已刷到新公告时,不带闸门会拿"未来财报"排旧日横截面(前视偏差)。
+    ann_date 缺失(NaN)的行无法证明其时点合法性,同样被过滤(字符序 'nan'/'None'
+    恒大于 8 位日期,PIT 从严);某票 as_of 时点无任何已公告行 → 如实不入横截面。
+    """
     # ann_date/update_flag 参与排序:同 (end_date) 多行(快照 vs 更正重述)时必须确定性地取
     # 最新更正值——update_flag='1' 是 tushare 更正后记录(官方语义),字符序恰排最后;
     # 否则不稳定排序会随机取到更正前的错值(实测 600115 归母净利更正前后差 1.6 亿,直接进 ACC 分子)。
@@ -64,6 +71,10 @@ def latest_rows(endpoint: str, cols: list[str]) -> pd.DataFrame:
             df = df[[c for c in need if c in df.columns]]
         if df.empty:
             continue
+        if "ann_date" in df.columns:
+            df = df[df["ann_date"].astype(str) <= str(as_of)]   # PIT:只用 as_of 已公告的行
+            if df.empty:
+                continue
         sort_keys = [k for k in ("end_date", "ann_date", "update_flag") if k in df.columns]
         out[str(df.iloc[0]["ts_code"])] = df.sort_values(sort_keys, kind="mergesort").iloc[-1]
     return pd.DataFrame(out).T
@@ -81,24 +92,27 @@ def main(argv: list[str] | None = None) -> None:
     a = ap.parse_args(argv)
     load_env_local()
 
-    fina = latest_rows("fina_indicator", ["roe", "netprofit_yoy", "dt_netprofit_yoy", "tr_yoy", "ocfps"])
-    inc = latest_rows("income", ["revenue", "oper_cost", "n_income_attr_p"])
-    cf = latest_rows("cashflow", ["n_cashflow_act"])
-    bs = latest_rows("balancesheet", ["total_assets"])
-
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
-    # 全历史日线+复权 → 前复权价(算动量 MOM / 近5日收益 / 距MA20)
+    # 全历史日线+复权 → 前复权价(算动量 MOM / 近5日收益 / 距MA20)。
+    # 走 date_partition_files:只认 ^\d{8}\.parquet$(daily/ 实际混入过整段拉取文件,
+    # 直接 glob 会污染交易日历与面板,见 data.partition 模块 docstring)
     da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "close"])
-                    for f in sorted(glob.glob(f"{CACHE}/daily/*.parquet"))], ignore_index=True)
+                    for f in date_partition_files(CACHE, "daily")], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
-                    for f in sorted(glob.glob(f"{CACHE}/adj_factor/*.parquet"))], ignore_index=True)
+                    for f in date_partition_files(CACHE, "adj_factor")], ignore_index=True)
     as_of = str(da["trade_date"].max())
     px = da.merge(aj, on=["ts_code", "trade_date"], how="left")
     # fail-loud ①:adj_factor 缺日会让全市场该日 adj_close=NaN 被静默 dropna 吞掉(MOM/MA20 悄悄错位)
-    _miss = px.loc[px["adj_factor"].isna(), "trade_date"].unique()
-    if len(_miss):
-        raise SystemExit(f"adj_factor 缺 {len(_miss)} 个交易日(如 {sorted(_miss)[:4]})——先 backfill 补齐,"
-                         "拒绝静默 NaN 传染")
+    assert_adj_complete(px)
+
+    # 财务横截面必须晚于 as_of 计算并以其为 PIT 闸门:价格缓存停在旧日而财务已刷到
+    # 新公告时,ann_date>as_of 的"未来财报"不得进入 as_of 日的横截面(前视偏差)
+    fina = latest_rows("fina_indicator", ["roe", "netprofit_yoy", "dt_netprofit_yoy", "tr_yoy", "ocfps"],
+                       as_of=as_of)
+    inc = latest_rows("income", ["revenue", "oper_cost", "n_income_attr_p"], as_of=as_of)
+    cf = latest_rows("cashflow", ["n_cashflow_act"], as_of=as_of)
+    bs = latest_rows("balancesheet", ["total_assets"], as_of=as_of)
+
     # fail-loud ②:财务缓存新鲜度——法定披露期后必须已含新报告期(否则财报季后整条管线静默用旧财报)
     _expected = expected_min_end_date(as_of)
     _fina_max = str(fina["end_date"].astype(str).max()) if "end_date" in fina.columns and len(fina) else ""

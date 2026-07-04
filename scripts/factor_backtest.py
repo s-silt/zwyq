@@ -10,6 +10,14 @@
 4. 【MOM horizon】用标准 **12-1 动量**(近 250 日、跳过最近 21 日)而非 120 日不跳月。
 5. _pit 先按 end_date 再按 ann_date 取最新期(防乱序重述选错期)。
 
+外部 review(2026-07)后的修正:
+6. 【EP/BP 口径】改用 daily_basic 的 1/pe_ttm、1/pb(与生产 factor_rank 同口径)。旧版
+   eps/bps ÷ **前复权价**(close×adj_factor)是错口径:复权乘数每只股票不同,横截面被
+   系统性扭曲,且与生产用的未复权估值口径不一致——回测验证的不是生产在用的因子。
+7. 【中性化统一】删本地 _neutralize,改调 factor_model.neutralize_industry_size
+   (生产/回测同一实现;缺市值行输出 NaN 不塞哨兵桶)。
+8. 【IC 配对】information_coefficient/quantile_spread 按索引 inner join,不再位置配对。
+
 诚实:样本仍仅 2022-26 一个 regime、单一市场,IC 是实证读数非跨周期保证。
 
 Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.factor_backtest [--board main] [--fwd 21]
@@ -28,7 +36,7 @@ from ashare_gauntlet.backtest import adjusted_tstat, information_coefficient, qu
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.tushare_source import make_pro_api
-from ashare_gauntlet.factor_model import industry_neutralize
+from ashare_gauntlet.factor_model import neutralize_industry_size
 from ashare_gauntlet.screen import board_of
 
 CACHE = "data/cache"
@@ -61,13 +69,6 @@ def _pit(df: pd.DataFrame, asof: str) -> pd.DataFrame:
     return d.groupby("ts_code", sort=False).tail(1).set_index("ts_code")
 
 
-def _neutralize(fac: pd.Series, ind: pd.Series, logmv: pd.Series) -> pd.Series:
-    """行业中位数去均值 + 市值十分位去均值(双中性:去掉行业与规模的水平效应)。"""
-    f1 = industry_neutralize(fac, ind)
-    sb = pd.qcut(logmv.reindex(fac.index).rank(method="first"), 10, labels=False, duplicates="drop")
-    return f1 - f1.groupby(sb).transform("median")
-
-
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--board", default="main")
@@ -76,7 +77,7 @@ def main(argv: list[str] | None = None) -> None:
     load_env_local()
     MOM_LB, MOM_SKIP = 250, 21   # 12-1 动量:近250日、跳最近21日
 
-    fina = _load("fina_indicator", ["eps", "bps", "roe"])
+    fina = _load("fina_indicator", ["roe"])
     inc = _load("income", ["revenue", "oper_cost", "n_income_attr_p"])
     cf = _load("cashflow", ["n_cashflow_act"])
     bs = _load("balancesheet", ["total_assets"])
@@ -114,24 +115,26 @@ def main(argv: list[str] | None = None) -> None:
         if len(codes) < 50:
             continue
         idx = pd.Index(codes)
-        price_t = close_p.loc[t, codes]
         # 未来收益:T+1 开盘买入 → 持有窗口内最后成交价(ffill,退市/停牌不丢崩盘收益)
         win = open_p.iloc[it + 1: it + 2 + a.fwd][codes]
         entry = win.iloc[0]
         exit_ = win.ffill().iloc[-1]
         fwd = exit_ / entry - 1.0
-        # 市值(size 中性)
+        # 市值(size 中性)+ 估值(EP/BP 与生产 factor_rank 同口径:1/pe_ttm、1/pb,
+        # 仅盈利/正净资产下有定义;旧版 eps/bps÷前复权价的复权乘数每只不同→横截面扭曲)
         # 缓存版:历史 daily_basic 不可变,落盘后重跑回测零 API 调用、结果可复现
-        db = fetch_market_day(pro, "daily_basic", t, CACHE)
-        mv = pd.to_numeric(db.set_index("ts_code")["total_mv"], errors="coerce").reindex(idx)
+        db = fetch_market_day(pro, "daily_basic", t, CACHE).set_index("ts_code")
+        mv = pd.to_numeric(db["total_mv"], errors="coerce").reindex(idx)
         logmv = np.log(mv.where(mv > 0))
+        pe_t = pd.to_numeric(db["pe_ttm"], errors="coerce").reindex(idx)
+        pb_t = pd.to_numeric(db["pb"], errors="coerce").reindex(idx)
         # 因子原值
         pf, pi, pc, pb = _pit(fina, t), _pit(inc, t), _pit(cf, t), _pit(bs, t)
         rev = pi["revenue"].reindex(idx); cogs = pi["oper_cost"].reindex(idx); ni = pi["n_income_attr_p"].reindex(idx)
         ocf = pc["n_cashflow_act"].reindex(idx); ta = pb["total_assets"].reindex(idx)
         raw = pd.DataFrame(index=idx)
-        raw["EP"] = pf["eps"].reindex(idx) / price_t
-        raw["BP"] = pf["bps"].reindex(idx) / price_t
+        raw["EP"] = (1.0 / pe_t).where(pe_t > 0)
+        raw["BP"] = (1.0 / pb_t).where(pb_t > 0)
         raw["ROE"] = pf["roe"].reindex(idx)
         raw["GP"] = (rev - cogs) / ta
         raw["ACC"] = -((ni - ocf) / ta)
@@ -139,7 +142,7 @@ def main(argv: list[str] | None = None) -> None:
         ind = ind_all.reindex(idx).fillna("其他")
         row: dict = {"date": t, "n": len(codes)}
         for fac in FACTORS:
-            neu = _neutralize(raw[fac], ind, logmv)
+            neu = neutralize_industry_size(raw[fac], ind, logmv)
             row["IC_" + fac] = information_coefficient(neu, fwd)
             row["SPR_" + fac] = quantile_spread(neu, fwd, 5)
         ic_rows.append(row)

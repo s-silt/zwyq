@@ -11,15 +11,13 @@
 """
 import pandas as pd
 
-ANNUAL = "20251231"
-
 
 def latest_annual_end(*dfs: pd.DataFrame | None) -> str | None:
     """从传入的财报表动态取「最近年报期」= max(end_date 以 '1231' 结尾)。
 
-    契约C3:'最近年报'不再硬编码 ``ANNUAL``。跨表(income/cashflow…)取并集里最大的
-    年报期;取不到任何 …1231 → 返回 ``None``(由调用方标「年报缺失」,**不**套固定日期
-    伪造一个年报期)。空表/None 安全跳过。
+    契约C3/P2-9:'最近年报'不硬编码固定日期(模块不再有 ANNUAL 常量)。跨表
+    (income/cashflow…)取并集里最大的年报期;取不到任何 …1231 → 返回 ``None``
+    (由调用方标「年报缺失」,**不**套固定日期伪造一个年报期)。空表/None 安全跳过。
     """
     ends: set[str] = set()
     for df in dfs:
@@ -28,6 +26,17 @@ def latest_annual_end(*dfs: pd.DataFrame | None) -> str | None:
         col = df["end_date"].astype(str)
         ends.update(col[col.str.endswith("1231")].tolist())
     return max(ends) if ends else None
+
+
+def _require_end(end: str | None) -> str:
+    """fail-loud:年报期必须显式给出(P2-9,不再有硬编码默认年份)。
+
+    ``latest_annual_end`` 取不到年报期时返回 ``None``,调用方应自行分支标注「年报缺失」;
+    把 None/空串直接透传进因子函数属调用方 bug → 抛 ``ValueError``,不许静默返回 None 掩盖。
+    """
+    if not end:
+        raise ValueError("年报期 end 缺失:请先用 latest_annual_end(...) 动态取期再传入;取不到年报期时由调用方标注缺失,不得伪造固定日期")
+    return end
 
 
 def _annual_value(df: pd.DataFrame | None, col: str, end: str) -> float | None:
@@ -44,8 +53,12 @@ def _annual_value(df: pd.DataFrame | None, col: str, end: str) -> float | None:
 
 
 def net_cash_ratio(income: pd.DataFrame | None, cashflow: pd.DataFrame | None,
-                   end: str = ANNUAL) -> float | None:
-    """净现比 = 经营活动现金流净额 / 归母净利(年报口径)。净利≤0 时无意义返回 None。"""
+                   end: str) -> float | None:
+    """净现比 = 经营活动现金流净额 / 归母净利(年报口径)。净利≤0 时无意义返回 None。
+
+    ``end`` 必传(P2-9 无硬编码默认),由调用方 ``latest_annual_end`` 动态取。
+    """
+    end = _require_end(end)
     ni = _annual_value(income, "n_income_attr_p", end)
     ocf = _annual_value(cashflow, "n_cashflow_act", end)
     if ni is None or ocf is None or ni <= 0:
@@ -54,8 +67,12 @@ def net_cash_ratio(income: pd.DataFrame | None, cashflow: pd.DataFrame | None,
 
 
 def accrual_ratio(income: pd.DataFrame | None, cashflow: pd.DataFrame | None,
-                  balancesheet: pd.DataFrame | None, end: str = ANNUAL) -> float | None:
-    """应计强度 = (归母净利 − 经营现金流) / 总资产(年报口径)。越低/越负越干净。"""
+                  balancesheet: pd.DataFrame | None, end: str) -> float | None:
+    """应计强度 = (归母净利 − 经营现金流) / 总资产(年报口径)。越低/越负越干净。
+
+    ``end`` 必传(P2-9 无硬编码默认),由调用方 ``latest_annual_end`` 动态取。
+    """
+    end = _require_end(end)
     ni = _annual_value(income, "n_income_attr_p", end)
     ocf = _annual_value(cashflow, "n_cashflow_act", end)
     ta = _annual_value(balancesheet, "total_assets", end)

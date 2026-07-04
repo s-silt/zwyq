@@ -7,6 +7,7 @@ from ashare_gauntlet.factor_model import (
     factor_percentile,
     industry_neutralize,
     momentum_return,
+    neutralize_industry_size,
     percentile_rank,
     to_decile,
     touched_limit_up,
@@ -94,6 +95,69 @@ def test_factor_percentile_size_neutral_keeps_within_size_ranking():
     assert r.iloc[3] > r.iloc[0]
 
 
+# ---- neutralize_industry_size:生产/回测共享的行业+市值双中性(单一实现,防口径漂移) ----
+
+def test_neutralize_industry_size_missing_mv_yields_nan():
+    # 缺市值 = 无法做 size 中性 → 该行输出 NaN,不塞哨兵桶继续评分(伪分)
+    s = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+    ind = pd.Series(["A"] * 5)
+    logmv = pd.Series([10.0, 11.0, None, 12.0, 13.0])
+    out = neutralize_industry_size(s, ind, logmv)
+    assert pd.isna(out.iloc[2])
+    assert out.drop(index=2).notna().all()
+
+
+def test_neutralize_industry_size_all_mv_missing_all_nan():
+    s = pd.Series([1.0, 2.0, 3.0])
+    ind = pd.Series(["A"] * 3)
+    logmv = pd.Series([None, None, None], dtype=float)
+    out = neutralize_industry_size(s, ind, logmv)
+    assert out.isna().all()
+
+
+def test_neutralize_industry_size_tied_mv_single_bucket_keeps_order():
+    # 市值全并列(qcut 退化)→ 归单一组,组内因子序保留、不被抹平
+    s = pd.Series([1.0, 2.0, 3.0, 4.0])
+    ind = pd.Series(["A"] * 4)
+    logmv = pd.Series([10.0] * 4)
+    out = neutralize_industry_size(s, ind, logmv)
+    assert out.notna().all()
+    assert out.iloc[3] > out.iloc[2] > out.iloc[1] > out.iloc[0]
+
+
+def test_neutralize_industry_size_removes_pure_size_proxy():
+    # 因子=市值本身(纯 size 代理):双中性后同市值档内应无系统性差异(顶部不再自动最高)
+    n = 20
+    s = pd.Series([float(i) for i in range(n)])
+    ind = pd.Series(["A"] * (n // 2) + ["B"] * (n // 2))
+    logmv = pd.Series([float(i) for i in range(n)])
+    out = neutralize_industry_size(s, ind, logmv)
+    # 每个市值十分位桶内去中位后,顶部值不应显著高于其它(纯代理被去掉)
+    assert out.iloc[-1] < s.iloc[-1]
+    assert abs(out.mean()) < 1.0
+
+
+def test_neutralize_industry_size_parity_production_vs_backtest():
+    # parity:生产(factor_percentile)与回测(直接调 neutralize_industry_size 后排名)
+    # 同输入必须同输出——两套实现曾漂移(rank first vs average / NaN 市值处理不同)
+    s = pd.Series([3.0, 1.0, 4.0, 1.5, 9.0, 2.6, 5.3, 5.8, 9.7, 9.3])
+    ind = pd.Series(["A", "A", "A", "B", "B", "B", "C", "C", "C", "C"])
+    logmv = pd.Series([10.0, 11.0, 12.0, 10.5, None, 11.5, 10.2, 12.2, 11.8, 10.8])
+    prod = factor_percentile(s, ind, higher_is_better=True, logmv=logmv)
+    bt = percentile_rank(neutralize_industry_size(s, ind, logmv))
+    pd.testing.assert_series_equal(prod, bt)
+
+
+def test_factor_percentile_missing_mv_yields_nan_not_sentinel_bucket():
+    # 生产口径:缺市值的票 → 因子分位 NaN(composite skipna 处理),不再 fillna(-1) 混桶
+    s = pd.Series([1.0, 2.0, 3.0, 4.0])
+    ind = pd.Series(["A"] * 4)
+    logmv = pd.Series([10.0, None, 11.0, 12.0])
+    r = factor_percentile(s, ind, higher_is_better=True, logmv=logmv)
+    assert pd.isna(r.iloc[1])
+    assert r.drop(index=1).notna().all()
+
+
 def test_composite_equal_weight_average():
     c = composite(pd.DataFrame({"f1": [0.8, 0.2], "f2": [0.6, 0.4]}))
     assert abs(c.iloc[0] - 0.7) < 1e-9
@@ -111,6 +175,26 @@ def test_to_decile_top_and_bottom():
     d = to_decile(pd.Series([float(i) for i in range(100)]))
     assert d.iloc[-1] == 10
     assert d.iloc[0] == 1
+
+
+def test_to_decile_small_sample_all_na():
+    # 非空样本 <10:没有"十分位"语义(5 只票硬标 D1/D10 是伪精度)→ 全返回 NA
+    d = to_decile(pd.Series([1.0, 2.0, 3.0, 4.0, 5.0]))
+    assert d.isna().all()
+    assert len(d) == 5
+
+
+def test_to_decile_small_nonnull_count_all_na_even_with_nan_padding():
+    # 长度 12 但非空只有 9 个 → 仍不足十分位样本 → 全 NA(按非空数判,不按长度)
+    d = to_decile(pd.Series([float(i) for i in range(9)] + [None, None, None]))
+    assert d.isna().all()
+
+
+def test_to_decile_exactly_ten_samples_full_range():
+    # 恰好 10 个非空 → 每票一档,D1..D10 齐全(十分位定义的最小样本)
+    d = to_decile(pd.Series([float(i) for i in range(10)]))
+    assert d.iloc[0] == 1 and d.iloc[-1] == 10
+    assert d.notna().all()
 
 
 # ---- touched_limit_up:⚡脉冲的定义性锚(近5交易日 high 触及 stk_limit 涨停价) ----
@@ -170,3 +254,19 @@ def test_touched_limit_up_missing_column_fail_loud():
     bad = pd.DataFrame([("600000.SH", "20260701")], columns=["ts_code", "trade_date"])
     with pytest.raises(ValueError):
         touched_limit_up(daily, bad)
+
+
+def test_touched_limit_up_missing_limit_row_fail_loud():
+    # daily 有行、stk_limit 缺该 (ts_code, trade_date) → fail-loud 并列出样例:
+    # inner join 会把这些行静默丢掉,看似"没人涨停"(⚡ 标注静默消失)
+    daily = _daily([("600000.SH", "20260701", 11.00), ("000001.SZ", "20260701", 10.99)])
+    lim = _limit([("600000.SH", "20260701", 11.00)])   # 000001.SZ 当日涨停价缺失
+    with pytest.raises(ValueError, match="000001.SZ"):
+        touched_limit_up(daily, lim)
+
+
+def test_touched_limit_up_extra_limit_rows_ok():
+    # stk_limit 多出 daily 没有的行(如停牌股仍有涨停价)不报错,不影响结果
+    daily = _daily([("600000.SH", "20260701", 11.00)])
+    lim = _limit([("600000.SH", "20260701", 11.00), ("000001.SZ", "20260701", 11.00)])
+    assert touched_limit_up(daily, lim) == {"600000.SH"}

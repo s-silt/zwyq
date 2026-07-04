@@ -147,8 +147,11 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"aggressive_pick: {fpath} 无 decile==10 且 🟢 的票 —— 上游输出异常,拒绝空排")
 
     # 扣非/营收增速:factor json 没有 dt_netprofit_yoy,从 fina_indicator 缓存最新报告期读
-    # (latest_rows 三键排序取最新更正值,与 factor_rank 同源同口径)
-    fina = latest_rows("fina_indicator", ["dt_netprofit_yoy", "tr_yoy"])
+    # (latest_rows 三键排序取最新更正值,与 factor_rank 同源同口径)。
+    # as_of=快照日作 PIT 闸门:快照日之后才公告的财报不得给该快照的池子排序(前视偏差,
+    # 与 factor_rank 同一防线)
+    as_of = os.path.basename(fpath)[:8]
+    fina = latest_rows("fina_indicator", ["dt_netprofit_yoy", "tr_yoy"], as_of=as_of)
     if fina.empty:
         raise SystemExit("aggressive_pick: fina_indicator 缓存为空 —— 先跑 scripts.backfill_fina")
     growth_map = _yoy_map(fina, "dt_netprofit_yoy")
@@ -159,7 +162,6 @@ def main(argv: list[str] | None = None) -> None:
     if not ranked:
         raise SystemExit("aggressive_pick: 硬排除后候选池为空 —— 排除口径覆盖了整个 D10🟢 池,须人工复核")
 
-    as_of = os.path.basename(fpath)[:8]
     print(f"=== aggressive_pick(as_of={as_of},D10🟢地板 {len(pool)} 只 → 硬排除后 {len(ranked)} 只)===")
     print(f"硬排除行业(用户基金前十大推导,基金变了同步改):{'/'.join(sorted(EXCLUDED_INDUSTRIES))};"
           f"另排除已持仓 {len(held)} 只")

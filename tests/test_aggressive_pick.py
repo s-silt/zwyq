@@ -10,6 +10,8 @@
 """
 import math
 
+import pandas as pd
+
 from scripts.aggressive_pick import EXCLUDED_INDUSTRIES, aggressive_rank, quality_floor
 
 
@@ -96,3 +98,53 @@ def test_excluded_industries_matches_fund_topten_derivation():
     # 出处:用户场外基金(华泰柏瑞质量精选/质量成长、易方达远见成长)前十大重仓
     # 所属 tushare 行业推导 —— 基金持仓变了必须同步改常量与本测试
     assert EXCLUDED_INDUSTRIES == {"通信设备", "元器件", "半导体", "IT设备"}
+
+
+# ---------- latest_rows PIT(as_of):未来公告不得混入横截面 ----------
+# 场景是真实风险:价格缓存停在旧日、财务缓存已刷到新公告 → 不带 as_of 会拿"未来财报"
+# 排今天的横截面(前视偏差)。aggressive_pick 与 factor_rank 同用 latest_rows,在此钉口径。
+
+def _fina_cache(tmp_path) -> None:
+    d = tmp_path / "fina_indicator"
+    d.mkdir(parents=True)
+    pd.DataFrame([
+        {"ts_code": "600000.SH", "end_date": "20250331", "ann_date": "20250428",
+         "update_flag": "0", "dt_netprofit_yoy": 10.0, "tr_yoy": 5.0},
+        {"ts_code": "600000.SH", "end_date": "20250630", "ann_date": "20250815",
+         "update_flag": "0", "dt_netprofit_yoy": 99.0, "tr_yoy": 50.0},
+    ]).to_parquet(d / "600000.SH.parquet", index=False)
+
+
+def test_latest_rows_pit_excludes_future_announcements(tmp_path, monkeypatch):
+    import scripts.factor_rank as fr
+    _fina_cache(tmp_path)
+    monkeypatch.setattr(fr, "CACHE", str(tmp_path))
+    # 价格缓存停在 20250701:Q2 财报 8/15 才公告,是未来信息 → 必须取 Q1
+    out = fr.latest_rows("fina_indicator", ["dt_netprofit_yoy", "tr_yoy"], as_of="20250701")
+    assert str(out.loc["600000.SH", "end_date"]) == "20250331"
+    assert float(out.loc["600000.SH", "dt_netprofit_yoy"]) == 10.0
+
+
+def test_latest_rows_pit_includes_rows_announced_on_or_before_as_of(tmp_path, monkeypatch):
+    import scripts.factor_rank as fr
+    _fina_cache(tmp_path)
+    monkeypatch.setattr(fr, "CACHE", str(tmp_path))
+    # as_of 恰为 Q2 公告日(<= 含当日)→ 正常取 Q2 最新报告期
+    out = fr.latest_rows("fina_indicator", ["dt_netprofit_yoy", "tr_yoy"], as_of="20250815")
+    assert str(out.loc["600000.SH", "end_date"]) == "20250630"
+    assert float(out.loc["600000.SH", "dt_netprofit_yoy"]) == 99.0
+
+
+def test_latest_rows_pit_code_with_no_announced_rows_excluded(tmp_path, monkeypatch):
+    import scripts.factor_rank as fr
+    _fina_cache(tmp_path)
+    d = tmp_path / "fina_indicator"
+    pd.DataFrame([
+        {"ts_code": "600001.SH", "end_date": "20250630", "ann_date": "20250815",
+         "update_flag": "0", "dt_netprofit_yoy": 1.0, "tr_yoy": 1.0},
+    ]).to_parquet(d / "600001.SH.parquet", index=False)
+    monkeypatch.setattr(fr, "CACHE", str(tmp_path))
+    # 某票在 as_of 时点尚无任何已公告行 → 如实不入横截面,不拿未来行凑数
+    out = fr.latest_rows("fina_indicator", ["dt_netprofit_yoy", "tr_yoy"], as_of="20250401")
+    assert "600001.SH" not in out.index
+    assert "600000.SH" not in out.index   # 600000 的 Q1 也是 4/28 才公告

@@ -13,12 +13,12 @@ Usage: PYTHONIOENCODING=utf-8 python scripts/screen.py
 """
 
 import argparse
-import glob
 import os
 from typing import cast
 
 import pandas as pd
 
+from ashare_gauntlet.data.partition import date_partition_files
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
 from ashare_gauntlet.screen import board_of, screen_candidates
 
@@ -34,7 +34,9 @@ _SORT = {"pct20": ("pct20", False), "pe_ttm": ("pe_ttm", True),
 
 
 def _load(cache_dir: str, endpoint: str) -> pd.DataFrame:
-    files = glob.glob(f"{cache_dir}/{endpoint}/*.parquet")
+    # 只认日分区文件(^\d{8}\.parquet$):daily/ 实际混入过整段拉取文件,直接 glob
+    # 会把重复行读进面板污染横截面(见 ashare_gauntlet.data.partition)
+    files = date_partition_files(cache_dir, endpoint)
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True) if files else pd.DataFrame()
 
 

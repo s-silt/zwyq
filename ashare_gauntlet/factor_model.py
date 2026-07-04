@@ -28,22 +28,47 @@ def industry_neutralize(s: pd.Series, industry: pd.Series) -> pd.Series:
     return s - med
 
 
+def neutralize_industry_size(s: pd.Series, industry: pd.Series, logmv: pd.Series) -> pd.Series:
+    """行业+市值双中性:行业内中位数去均值 → 市值十分位组内去中位。返回中性化后的**原值**。
+
+    生产(factor_percentile)与回测(scripts/factor_backtest)共享的**唯一实现**——
+    此前两处各写一套曾出现口径漂移(rank first vs average、NaN 市值一边塞 -1 桶一边天然 NaN),
+    "回测验证的形态"与"生产使用的形态"必须是同一个数学对象。
+    - tie 用 rank(method="average"):市值并列取同秩→落同一桶(method="first" 会把并列
+      硬拆进单元素组、组内中位=自身、因子被抹零);
+    - **logmv 为 NaN 的行输出 NaN**:缺市值=无法做 size 中性化,塞哨兵桶继续评分是
+      无依据的伪分——保持 NaN 交给下游(percentile_rank/IC/composite 均已保 NaN 语义);
+    - qcut 完全退化(全体市值并列→边界去重后无区间→全 NaN 桶)时归单一组,保住组内因子序;
+    - 十分位复用 to_decile 既有粒度约定,非新常数。
+    """
+    neu = industry_neutralize(s, industry)
+    mv = logmv.reindex(neu.index)
+    out = pd.Series(float("nan"), index=neu.index, dtype=float)
+    valid = mv.notna()
+    if not bool(valid.any()):
+        return out                       # 全体缺市值:无一行可中性化
+    sb = pd.qcut(mv[valid].rank(method="average"), 10, labels=False, duplicates="drop")
+    sb = pd.Series(sb, index=mv.index[valid])
+    if sb.isna().any():
+        sb = sb.fillna(0)                # 完全退化(全并列):唯一组标签,定义性非阈值
+    sub = neu[valid]
+    out[valid] = sub - sub.groupby(sb).transform("median")
+    return out
+
+
 def factor_percentile(s: pd.Series, industry: pd.Series, higher_is_better: bool = True,
                       logmv: "pd.Series | None" = None) -> pd.Series:
     """单因子 → 行业中性(可选:+市值中性)→ 百分位。higher_is_better=False(如应计)取负。
 
-    logmv 给定时做行业+市值**双中性**(市值十分位组内去中位)——与 factor_backtest 的
-    _neutralize 同一数学对象:回测(修正版)证明 BP 未去 size 就是小盘/低价代理,
-    生产因子必须与被验证的形态一致。十分位复用 to_decile 既有粒度约定,非新常数。
+    logmv 给定时调 neutralize_industry_size 做行业+市值**双中性**(与 factor_backtest
+    同一实现):回测(修正版)证明 BP 未去 size 就是小盘/低价代理,生产因子必须与被验证
+    的形态一致。缺市值的行输出 NaN(见 neutralize_industry_size),不再 fillna(-1) 混桶。
     """
     raw = s if higher_is_better else -s
-    neu = industry_neutralize(raw, industry)
-    if logmv is not None:
-        # rank(average):市值并列取同秩→落同一桶(method="first" 会把并列硬拆进单元素组、抹掉因子);
-        # qcut 退化(边界全并列→NaN 桶)时归单一组,保住组内因子序
-        sb = pd.qcut(logmv.reindex(neu.index).rank(method="average"), 10, labels=False, duplicates="drop")
-        sb = pd.Series(sb, index=neu.index).fillna(-1)
-        neu = neu - neu.groupby(sb).transform("median")
+    if logmv is None:
+        neu = industry_neutralize(raw, industry)
+    else:
+        neu = neutralize_industry_size(raw, industry, logmv)
     return percentile_rank(neu)
 
 
@@ -67,9 +92,16 @@ def momentum_return(adj_close: pd.Series, lookback: int = 120) -> float | None:
 
 
 def to_decile(s: pd.Series) -> pd.Series:
-    """合成分 → 十分位 D1..D10(D10=最好)。只输出分桶,避免 1 分粒度伪精度。NaN 保持 NaN。"""
+    """合成分 → 十分位 D1..D10(D10=最好)。只输出分桶,避免 1 分粒度伪精度。NaN 保持 NaN。
+
+    非空样本 < 10(=十分位的定义性桶数,非新常数)时全返回 NA:不足 10 个样本没有
+    "十分位"语义,qcut 硬分只会给 5 只票也标出 D1/D10 的伪精度档位。
+    """
+    q = 10
+    if int(s.notna().sum()) < q:
+        return pd.Series(pd.NA, index=s.index, dtype="Int64")
     ranks = s.rank(method="first")  # 先打破并列,保证 qcut 边界唯一
-    return pd.qcut(ranks, 10, labels=range(1, 11)).astype("Int64")
+    return pd.qcut(ranks, q, labels=range(1, q + 1)).astype("Int64")
 
 
 def touched_limit_up(daily_5d: pd.DataFrame, stk_limit_5d: pd.DataFrame) -> set[str]:
@@ -89,8 +121,17 @@ def touched_limit_up(daily_5d: pd.DataFrame, stk_limit_5d: pd.DataFrame) -> set[
     missing = (need_daily - set(daily_5d.columns)) | (need_limit - set(stk_limit_5d.columns))
     if missing:
         raise ValueError(f"touched_limit_up: 输入缺列 {sorted(missing)}——拒绝静默当作无人触及")
+    # left merge + 缺配对 fail-loud:inner join 会把 stk_limit 缺行的 (ts_code, trade_date)
+    # 静默丢掉——该票该日"看似没涨停",⚡ 标注静默消失。样例截断仅为展示,非评分常数。
     m = daily_5d[["ts_code", "trade_date", "high"]].merge(
         stk_limit_5d[["ts_code", "trade_date", "up_limit"]],
-        on=["ts_code", "trade_date"], how="inner")
+        on=["ts_code", "trade_date"], how="left")
+    miss = m["up_limit"].isna()
+    if bool(miss.any()):
+        sample = [f"{r.ts_code}@{r.trade_date}"
+                  for r in m.loc[miss, ["ts_code", "trade_date"]].head(5).itertuples()]
+        raise ValueError(
+            f"touched_limit_up: daily 有行但 stk_limit 缺涨停价 {int(miss.sum())} 行"
+            f"(如 {sample})——拒绝静默丢行当作无人触及,先补齐 stk_limit 缓存")
     hit = m["high"].astype(float) >= m["up_limit"].astype(float) - 1e-6
     return set(m.loc[hit, "ts_code"].astype(str))

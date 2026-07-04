@@ -26,6 +26,7 @@ from pathlib import Path
 import pandas as pd
 
 from ashare_gauntlet.data.fetch import call_with_retry
+from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
 
 CACHE = "data/cache"
 OUT_DIR = "data/holdscore"
@@ -150,10 +151,12 @@ def main() -> None:
     if not snaps:
         raise SystemExit("无 factor 快照(先跑 scripts.factor_rank)")
 
-    # 交易日历(缓存文件名即交易日)与快照日期,先于面板算出 —— 面板只需从最早快照日
+    # 交易日历(日分区文件名即交易日)与快照日期,先于面板算出 —— 面板只需从最早快照日
     # 起读:forward_returns 只用 trade_date >= 快照日 的行,更早的 1000+ 个日文件读了
-    # 也全被过滤掉(纯 IO 瘦身,口径零变化;全量读曾让单次运行 10 分钟起步)
-    day_files = sorted(glob.glob(f"{CACHE}/daily/*.parquet"))
+    # 也全被过滤掉(纯 IO 瘦身,口径零变化;全量读曾让单次运行 10 分钟起步)。
+    # 走 date_partition_files:daily/ 实际混入过整段拉取文件,直接 glob 会把污染文件名
+    # 当交易日、把重复行读进面板(见 data.partition 模块 docstring)
+    day_files = date_partition_files(CACHE, "daily")
     trade_days = [os.path.basename(f)[:8] for f in day_files]
     snap_dates = [m.group(1) for p in snaps
                   if (m := re.match(r"(\d{8})_factor\.json", os.path.basename(p)))]
@@ -164,9 +167,12 @@ def main() -> None:
     da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "close"])
                     for f in need], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
-                    for f in sorted(glob.glob(f"{CACHE}/adj_factor/*.parquet"))
+                    for f in date_partition_files(CACHE, "adj_factor")
                     if os.path.basename(f)[:8] >= first_snap], ignore_index=True)
     px = da.merge(aj, on=["ts_code", "trade_date"], how="left")
+    # fail-loud:adj_factor 缺日会让该日 adj_close=NaN 被 forward_returns 的 dropna 静默
+    # 吞掉(前向收益起终点悄悄错位)—— 与 factor_rank 同一断言(data.partition)
+    assert_adj_complete(px)
     px["adj_close"] = px["close"].astype(float) * px["adj_factor"].astype(float)
     latest = str(px["trade_date"].max())
 

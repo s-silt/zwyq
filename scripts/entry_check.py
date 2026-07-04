@@ -20,7 +20,6 @@ Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.entry_check \
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 from pathlib import Path
 
@@ -28,6 +27,7 @@ import pandas as pd
 
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import fetch_market_day
+from ashare_gauntlet.data.partition import date_partition_files
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.execution import MIN_BARS, entry_readiness, position_size
 from ashare_gauntlet.factor_model import touched_limit_up
@@ -60,8 +60,12 @@ def _make_pro() -> object:
 
 
 def _trade_dates(cache_dir: str) -> list[str]:
-    """本地 daily 缓存的交易日历(文件名即交易日),升序。空缓存 fail-loud。"""
-    days = sorted(os.path.basename(f)[:8] for f in glob.glob(f"{cache_dir}/daily/*.parquet"))
+    """本地 daily 缓存的交易日历(日分区文件名即交易日),升序。空缓存 fail-loud。
+
+    走 date_partition_files:daily/ 实际混入过整段拉取的 <code>_<start>_<end>.parquet,
+    直接 glob 会把污染文件名前 8 位当"交易日"(见 ashare_gauntlet.data.partition)。
+    """
+    days = [os.path.basename(f)[:8] for f in date_partition_files(cache_dir, "daily")]
     if not days:
         raise SystemExit(f"entry_check: {cache_dir}/daily 无缓存 —— 先跑 scripts.refresh 回填")
     return days

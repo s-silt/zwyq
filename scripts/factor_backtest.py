@@ -125,10 +125,24 @@ def one_word_limit_up(daily_1d: pd.DataFrame, stk_limit_1d: pd.DataFrame,
     return set(m.loc[(flat & at_limit) | miss, "ts_code"])
 
 
+def exclude_shell(mv: pd.Series) -> list[str]:
+    """LSY(Liu-Stambaugh-Yuan 2019 JFE, CH-3)剔壳:剔除当期市值最小 30% 的股票。
+
+    A股壳价值污染:微盘股价格含"被借壳"期权价值,系统性抬高价值因子(高BP)多头腿的
+    表观收益;30% 为文献常数(LSY 报告对 25-40% cutoff 稳健)。市值 NaN 无法排除
+    壳嫌疑 → 保守剔除。用于 --ex-shell30 稳健性开关:BP 若剔壳后塌掉=壳噪声,存活=真价值。
+    """
+    v = mv.dropna()
+    cut = v.quantile(0.30)
+    return [str(i) for i in v[v > cut].index]
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--board", default="main")
     ap.add_argument("--fwd", type=int, default=21)
+    ap.add_argument("--ex-shell30", action="store_true", dest="ex_shell30",
+                    help="剔除市值最小30%(LSY 2019 壳价值稳健性开关)后重算 IC")
     # 成本参数是用户合同/实测值而非库常数(ashare_gauntlet.costs 不写默认),默认值出处:
     ap.add_argument("--commission", type=float, default=0.00025,
                     help="单边佣金率;默认 0.00025=券商常见万2.5,按用户合同可覆盖")
@@ -169,8 +183,11 @@ def main(argv: list[str] | None = None) -> None:
         rebal = [d for d in rebal if d >= a.start]
 
     FACTORS = ["EP", "BP", "ROE", "GP", "ACC", "MOM"]
-    print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)…", flush=True)
+    print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)"
+          f"{'·剔壳30%' if a.ex_shell30 else ''}…", flush=True)
     ic_rows: list[dict] = []
+    corr_sum = None   # 因子横截面 Spearman 相关矩阵逐期累计(冗余审查)
+    corr_n = 0
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()]
@@ -195,6 +212,11 @@ def main(argv: list[str] | None = None) -> None:
         # 缓存版:历史 daily_basic 不可变,落盘后重跑回测零 API 调用、结果可复现
         db = fetch_market_day(pro, "daily_basic", t, CACHE).set_index("ts_code")
         mv = pd.to_numeric(db["total_mv"], errors="coerce").reindex(idx)
+        if a.ex_shell30:
+            kept = set(exclude_shell(mv))
+            idx = pd.Index([c for c in codes if c in kept])
+            fwd = fwd.reindex(idx)
+            mv = mv.reindex(idx)
         logmv = np.log(mv.where(mv > 0))
         pe_t = pd.to_numeric(db["pe_ttm"], errors="coerce").reindex(idx)
         pb_t = pd.to_numeric(db["pb"], errors="coerce").reindex(idx)
@@ -208,16 +230,26 @@ def main(argv: list[str] | None = None) -> None:
         raw["ROE"] = pf["roe"].reindex(idx)
         raw["GP"] = (rev - cogs) / ta
         raw["ACC"] = -((ni - ocf) / ta)
-        raw["MOM"] = close_p.iloc[it - MOM_SKIP][codes] / close_p.iloc[it - MOM_LB][codes] - 1.0
+        raw["MOM"] = (close_p.iloc[it - MOM_SKIP][list(idx)] / close_p.iloc[it - MOM_LB][list(idx)] - 1.0)
         ind = ind_all.reindex(idx).fillna("其他")
-        row: dict = {"date": t, "n": len(codes), "excl_limit_up": len(locked),
+        row: dict = {"date": t, "n": len(idx), "excl_limit_up": len(locked),
                      # round_trip 成本率(2×佣金+2×滑点+当期印花税,PIT 分段)——
                      # "成本后月差"的上界口径:假设月度全换手(每期整仓一买一卖)
                      "cost_rt": round_trip_cost_rate(t, a.commission, a.slippage)}
+        # 中性化后的因子值攒成一张表:算 IC 之外顺带累计因子横截面相关矩阵
+        # (冗余审查:相关>0.65 触发合并/剔除评估——华泰FFScore 口径)
+        neu_df = pd.DataFrame({fac: neutralize_industry_size(raw[fac], ind, logmv) for fac in FACTORS})
         for fac in FACTORS:
-            neu = neutralize_industry_size(raw[fac], ind, logmv)
-            row["IC_" + fac] = information_coefficient(neu, fwd)
-            row["SPR_" + fac] = quantile_spread(neu, fwd, 5)
+            row["IC_" + fac] = information_coefficient(neu_df[fac], fwd)
+            row["SPR_" + fac] = quantile_spread(neu_df[fac], fwd, 5)
+        c = neu_df.corr(method="spearman")
+        # 逐单元格 skipna 累计:某期某因子全缺 → 该期该行/列 NaN,直接相加会把 NaN
+        # 传染到全样本平均;按"有值单元格计数"分母平均
+        if corr_sum is None:
+            corr_sum, corr_cnt = c.fillna(0.0), c.notna().astype(int)
+        else:
+            corr_sum, corr_cnt = corr_sum + c.fillna(0.0), corr_cnt + c.notna().astype(int)
+        corr_n += 1
         ic_rows.append(row)
 
     res = pd.DataFrame(ic_rows)
@@ -242,6 +274,10 @@ def main(argv: list[str] | None = None) -> None:
         sign = "(反转)" if m < -0.02 else ""
         print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{neff:>6.0f}{spr:>+8.2f}%{net:>+8.2f}%{hit:>5.0f}%  {v}{sign}")
     os.makedirs("data/holdscore", exist_ok=True)
+    if corr_sum is not None and corr_n:
+        avg_corr = corr_sum / corr_cnt.replace(0, pd.NA)
+        print(f"\n=== 因子横截面 Spearman 相关(逐期平均,N={corr_n};冗余审查:>0.65 触发合并/剔除评估)===")
+        print(avg_corr.astype(float).round(2).to_string())
     res.to_json("data/holdscore/factor_ic_backtest.json", orient="records", force_ascii=False, indent=2)
     print("→ 明细 data/holdscore/factor_ic_backtest.json")
 

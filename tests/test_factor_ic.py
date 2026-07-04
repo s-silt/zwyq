@@ -178,3 +178,22 @@ def test_one_word_limit_up_suspended_stock_absent_from_daily_is_not_error():
     day = _day([("600001.SH", 11.0, 11.0, 11.0, 11.0)])
     lim = _lim([("600001.SH", 11.0)])
     assert one_word_limit_up(day, lim, ["600001.SH", "600888.SH"]) == {"600001.SH"}
+
+
+# ---------- 剔壳过滤:LSY(2019 JFE, CH-3)——剔除市值最小30%(壳价值污染) ----------
+
+def test_exclude_shell_bottom30():
+    import pandas as pd
+    from scripts.factor_backtest import exclude_shell
+    mv = pd.Series({f"c{i}": float(i) for i in range(1, 11)})  # c1..c10 市值 1..10
+    kept = exclude_shell(mv)
+    # 最小30%(c1,c2,c3)被剔;30分位点=定义性文献常数(LSY 对 25-40% 稳健)
+    assert set(kept) == {f"c{i}" for i in range(4, 11)}
+
+
+def test_exclude_shell_nan_mv_excluded():
+    import pandas as pd
+    from scripts.factor_backtest import exclude_shell
+    mv = pd.Series({"a": 10.0, "b": float("nan"), "c": 20.0, "d": 30.0})
+    kept = exclude_shell(mv)
+    assert "b" not in kept  # 市值缺失=无法排除壳嫌疑,保守剔除

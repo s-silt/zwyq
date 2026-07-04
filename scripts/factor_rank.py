@@ -1,10 +1,12 @@
 """横截面因子排序(B 路)—— 用 factor_model 对全主板做"质量×价值"因子打分,替掉数值持有分。
 
 为什么是这套(对照审计 scoring-needs-theory):每个因子映射公认 anomaly、全程零 magic number。
-- 因子:EP=1/PE(Basu 1977/FF 价值)、BP=1/PB(FF 1992)、ROE(盈利能力)、
-  GP/A=(营收−营业成本)/总资产(Novy-Marx 2013 gross profitability)、
-  ACC=(归母净利−经营现金流)/总资产(Sloan 1996 应计,**越低越好**=低应计高质量)。
-- 方法:每因子 行业内中位数去均值 → 横截面百分位 → 等权合成 → 十分位(见 factor_model)。
+- 入分因子(COMPOSITE_FACTORS):EP=1/PE(Basu 1977/FF 价值)、BP=1/PB(FF 1992)、
+  ACC=(归母净利−经营现金流)/总资产(Sloan 1996 应计,**越低越好**=低应计高质量)——
+  三者均经本地 12.5 年回测(N=149,成本后+剔壳稳健)验证。
+- 展示因子(不入分):ROE、GP/A=(营收−营业成本)/总资产(Novy-Marx 2013)——12 年噪声
+  (t<1)+ 互相冗余(0.63);MOM——反转向且成本后为负。保留 f_ 列供判断层参考。
+- 方法:每因子 行业+市值双中性 → 横截面百分位 → 等权合成 → 十分位(见 factor_model)。
 - 过滤:lean_tier 剔 🔴(三降/亏损),避免给恶化业务做"便宜"排序=价值陷阱;只对 🟢🟡 排。
 
 - 标注(同为零 magic number):⚡脉冲=近5个交易日内触及过涨停(daily.high 对照 stk_limit
@@ -12,9 +14,8 @@
   趋势=MOM 当日横截面 top decile(复用 to_decile 十分位既有约定)。⚡ 优先于趋势展示,
   JSON 输出 spike_limit 布尔列;此前的 ret5>15% / MOM>20% 手拍阈值已废除(审计点名)。
 
-诚实边界:① 回测(修正版,N=40 单一 regime,见 memory factor-backtest-a-share)显示仅 ACC 显著,
-EP/BP/ROE/GP 为文献先验保留、等权是无信息诚实先验(拒绝 N=40 拟合权重=过拟合);MOM 两版符号
-不稳已移出合成、仅作展示;② tushare 行业较细、
+诚实边界:① 三因子等权仍是无信息先验(拒绝用同一份回测拟合权重=数据窥探);ACC 成本后
+月差为负(其价值在信息正交,非独立可交易);② tushare 行业较细、
 小行业内中位数去均值偏噪;③ 金融业各因子语义特殊,已行业中性(同业内比)但跨行业合成仍需
 模式优先判断兜(见 model-aware-judgment);④ 输出十分位/分位,不报 1 分粒度绝对分(去伪精度)。
 
@@ -48,6 +49,17 @@ from scripts.backfill_fina import expected_min_end_date
 CACHE = "data/cache"
 OUT_DIR = "data/holdscore"
 MAIN = ("沪主板", "深主板")
+
+# 入分因子 = 本地 12.5 年实证过的三个(N=149, 2014-2026, 成本后+剔壳稳健):
+# EP t4.9/BP t6.8 可交易有效,ACC t3.0 且与一切正交。ROE/GP 12 年噪声(t<1)
+# + 互相冗余(相关 0.63)+ ROE 半被 EP 吸收(0.49)→ 降为展示列(与 MOM 同待遇),
+# 不再以"文献先验"名义占据 2/5 权重稀释被验证的信号(见 memory factor-backtest-a-share)。
+COMPOSITE_FACTORS = ("f_EP", "f_BP", "f_ACC")
+
+
+def composite_score(factor_cols: pd.DataFrame) -> pd.Series:
+    """三因子等权合成(EP+BP+ACC)。展示列(f_ROE/f_GPOA/f_MOM)不入分。"""
+    return composite(factor_cols[list(COMPOSITE_FACTORS)])
 
 
 def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
@@ -195,11 +207,10 @@ def main(argv: list[str] | None = None) -> None:
     df["f_GPOA"] = factor_percentile(df["GPOA"], ind, higher_is_better=True, logmv=logmv)
     df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好
     df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
-    # 5 因子等权合成(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
-    # MOM 不入分:本地回测两版符号均负且不显著(120日 t-2.91→12-1 t-1.63),等权纳入=隐含正向
-    # 先验、与本地证据矛盾、系统性给涨完的票抬分(见 memory factor-backtest-a-share);保留 f_MOM
-    # 仅作位置/趋势展示。EP/ROE/GP 为文献先验保留(本地 2022-26 单 regime 实证仅 ACC 显著)。
-    df["score"] = composite(df[["f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC"]])
+    # 三因子等权合成 EP+BP+ACC(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
+    # ROE/GP 不入分:12 年噪声(t<1)+ 互相冗余 0.63 + ROE 半被 EP 吸收;MOM 不入分:反转向
+    # 且成本后为负——三者均保留 f_ 列作展示/判断层参考(见 COMPOSITE_FACTORS 注)。
+    df["score"] = composite_score(df)
     df["decile"] = to_decile(df["score"])
     # 趋势标注 = MOM 当日横截面 top decile(复用 to_decile 十分位既有约定,零新常数;
     # 替代 MOM>20% 手拍阈值)。NaN(历史不足)不标。
@@ -213,8 +224,8 @@ def main(argv: list[str] | None = None) -> None:
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)
 
-    print(f"=== 横截面因子排序(价值×质量5因子·行业+市值双中性·MOM仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
-    print("分位=双中性百分位(0-100);本地实证仅 ACC 显著(其余为文献先验);MOM 不入分;距MA20=前复权口径(防XD假破位)")
+    print(f"=== 横截面因子排序(EP+BP+ACC 三因子入分·行业+市值双中性·ROE/GP/MOM 仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
+    print("分位=双中性百分位(0-100);入分三因子=12.5年实证(N=149,成本后+剔壳稳健);距MA20=前复权口径(防XD假破位)")
     print("⚡脉冲=近5交易日内触及过涨停(stk_limit 规则价,优先展示);趋势=MOM 横截面 top decile(十分位约定)")
     print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'ROE':>4}{'GP':>3}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/趋势'}")
     pc = lambda x: f"{x*100:.0f}" if isinstance(x, (int, float)) and x == x else "—"

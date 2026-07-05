@@ -96,15 +96,19 @@ def index_return(idx_df: pd.DataFrame, snap_date: str) -> float:
 
 
 def cost_adjusted_excess(port_ret: float, bench_ret: float, snap_date: str,
-                         commission_rate: float, slippage_rate: float) -> float:
+                         commission_rate: float, slippage_rate: float,
+                         sell_date: "str | None" = None) -> float:
     """成本后超额 = 组合收益 − round_trip 成本率 − 基准收益(上界口径)。
 
-    round_trip = 2×佣金 + 2×滑点 + 快照日印花税(PIT 分段,见 ashare_gauntlet.costs);
+    round_trip = 2×佣金 + 2×滑点 + 印花税(PIT 分段,见 ashare_gauntlet.costs);
+    印花税按 ``sell_date``(前向收益的计量终点=假想卖出日)取段——快照日在税改前而
+    终点在税改后时,用快照日会错扣旧税率(外部 review 点名);缺省回退快照日。
     把整段前向收益记**一次完整买卖**的成本——持仓未平时实际只发生买入侧,该列是保守
     上界而非实际成本。基准(沪深300)不扣成本:它是"不动的对照",扣了会自夸。
     收益 NaN(数据不足)→ 结果 NaN 传播,不伪造。
     """
-    return port_ret - round_trip_cost_rate(snap_date, commission_rate, slippage_rate) - bench_ret
+    return port_ret - round_trip_cost_rate(snap_date, commission_rate, slippage_rate,
+                                           sell_date=sell_date) - bench_ret
 
 
 def regime_return(idx_df: pd.DataFrame, n: int) -> float:
@@ -242,7 +246,8 @@ def main() -> None:
         d10_m = pd.Series(fr).mean()
         uni_m = pd.Series(fu).mean()
         hs = index_return(idx, snap)
-        net300 = cost_adjusted_excess(d10_m, hs, snap, COMMISSION_RATE, SLIPPAGE_RATE)
+        net300 = cost_adjusted_excess(d10_m, hs, snap, COMMISSION_RATE, SLIPPAGE_RATE,
+                                      sell_date=latest)   # 计量终点=假想卖出日(印花税取段)
         print(f"{snap:>10}{len(d10):>7}{d10_m*100:>+9.1f}%{uni_m*100:>+9.1f}%{(d10_m-uni_m)*100:>+7.1f}%"
               f"{hs*100:>+11.1f}%{(d10_m-hs)*100:>+10.1f}%{net300*100:>+15.1f}%")
     print("(超额>0=跑赢自身宇宙=选股能力;超额vs300>0=跑赢配置基准;样本少时噪声大,别过度解读单期)")

@@ -50,6 +50,34 @@ def adjusted_tstat(ic_series: pd.Series) -> "tuple[float, float, float]":
     return icir, icir * math.sqrt(neff), neff
 
 
+def newey_west_tstat(ic_series: pd.Series, lag: "int | None" = None) -> "tuple[float, float, int]":
+    """IC 序列 → (ICIR, 真 Newey-West HAC t 值, 所用 lag)。
+
+    对 IC 均值做 HAC 方差:S = γ0 + 2·Σ_{k=1..q}(1 − k/(q+1))·γk(Bartlett 核,
+    保证 S 半正定),t = mean / √(S/N)。γk 用 1/N 分母(NW 原式)。
+    lag 缺省用 NW(1994) 自动带宽 q = ⌊4·(N/100)^{2/9}⌋——文献公式非手拍常数。
+
+    与 :func:`adjusted_tstat`(AR(1) N_eff 近似)的差别:AR(1) 只吸收一阶自相关,
+    IC 存在 lag2/lag3 相关(重叠持仓/财报季复用)时会低估标准误、虚高 t;
+    此前回测输出列名标 "NW" 实为 AR(1) 近似(外部 review 点名),本函数是名实相符版。
+    """
+    s = ic_series.dropna().astype(float)
+    n = len(s)
+    if n < 4 or s.std() == 0:
+        return math.nan, math.nan, 0
+    icir = float(s.mean() / s.std())
+    q = int(math.floor(4.0 * (n / 100.0) ** (2.0 / 9.0))) if lag is None else int(lag)
+    q = max(0, min(q, n - 2))
+    x = (s - s.mean()).to_numpy()
+    S = float((x * x).sum() / n)                       # γ0
+    for k in range(1, q + 1):
+        gk = float((x[k:] * x[:-k]).sum() / n)         # γk,1/N 分母(NW 原式)
+        S += 2.0 * (1.0 - k / (q + 1.0)) * gk
+    if S <= 0:                                          # Bartlett 核下仅数值零可能触发
+        return icir, math.nan, q
+    return icir, float(s.mean() / math.sqrt(S / n)), q
+
+
 def quantile_spread(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> float:
     """可交易性检验:顶组减底组的未来收益(top-bottom spread),验因子是否单调可交易。
 

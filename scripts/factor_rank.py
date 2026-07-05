@@ -62,6 +62,18 @@ def composite_score(factor_cols: pd.DataFrame) -> pd.Series:
     return composite(factor_cols[list(COMPOSITE_FACTORS)])
 
 
+def composite_inputs_complete(df: pd.DataFrame) -> pd.Series:
+    """入池门槛:三个入分因子**原值**(EP/BP/ACC)全齐。
+
+    展示列(roe/GPOA/MOM)不参与门槛——旧"至少4/5因子"门槛在 composite 改三因子后
+    产生两类错误(外部 review 点名):EP/BP/ACC 齐但 ROE+GPOA 缺 → 错杀;ACC 缺但
+    ROE/GPOA 齐 → 错放(score 实际只剩 EP/BP,与他票不是同一数学对象)。要求全齐
+    (而非 ≥2/3)是定义性选择:每只入榜票的 score 必须是同一个三因子等权对象,
+    composite 的 skipna 均值只兜"极端缺列仍出数"的下游安全,不作为入池许可。
+    """
+    return df[["EP", "BP", "ACC"]].notna().all(axis=1)
+
+
 def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
     """每只取该表 **as_of 时点已公告** 的最新报告期一行(ts_code 为索引)。
 
@@ -195,9 +207,8 @@ def main(argv: list[str] | None = None) -> None:
     df = df[df["tier"].isin(["🟢", "🟡"])]            # 剔 🔴(恶化),只对干净/瑕疵档做因子排序
     df = df[~df["name"].astype(str).str.contains("ST", na=False)]  # 剔退市风险警示(定义性)
     df = df[df["pe"] > 0]                             # 仅盈利:EP/BP 价值因子在 E>0 下才有定义
-    # 至少 4/5 因子可得才排(避免少数因子撑起的不可靠合成)
-    fcols0 = [df["EP"], df["BP"], df["roe"], df["GPOA"], df["ACC"]]
-    df = df[sum(c.notna() for c in fcols0) >= 4]
+    # 入池门槛:三个入分因子原值全齐(展示列不参与门槛,见 composite_inputs_complete)
+    df = df[composite_inputs_complete(df)]
 
     ind = df["industry"]
     logmv = np.log(df["mv"].where(df["mv"] > 0))   # size 中性:与回测 _neutralize 同一形态

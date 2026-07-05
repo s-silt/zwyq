@@ -6,7 +6,8 @@
 对抗式审计(2026-07-01)后的修正:
 1. 【survivorship】退市/停牌股 exit 用持有窗口内**最后成交价(ffill)**,退市前暴跌收益不再被丢 NaN。
 2. 【size 中性】拉 daily_basic.total_mv,因子在 **行业+市值** 双中性后再算 IC(排除"BP=小盘代理")。
-3. 【t 虚高】用 AR(1) 自相关修正的 N_eff 算 t(adjusted_tstat),不再 iid 高估。
+3. 【t 虚高】真 Newey-West HAC t(Bartlett 核+NW1994 自动带宽,newey_west_tstat);
+   初版用 AR(1) N_eff 近似且错标 "NW",外部 review(2026-07-05)点名后换真 HAC。
 4. 【MOM horizon】用标准 **12-1 动量**(近 250 日、跳过最近 21 日)而非 120 日不跳月。
 5. _pit 先按 end_date 再按 ann_date 取最新期(防乱序重述选错期)。
 
@@ -44,10 +45,11 @@ import os
 import numpy as np
 import pandas as pd
 
-from ashare_gauntlet.backtest import adjusted_tstat, information_coefficient, quantile_spread
+from ashare_gauntlet.backtest import information_coefficient, newey_west_tstat, quantile_spread
 from ashare_gauntlet.costs import round_trip_cost_rate
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
+from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import neutralize_industry_size
 from ashare_gauntlet.screen import board_of
@@ -163,11 +165,16 @@ def main(argv: list[str] | None = None) -> None:
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,industry")).set_index("ts_code")
     ind_all = sb["industry"].fillna("其他")
 
+    # date_partition_files:只认 ^\d{8}\.parquet$(daily/ 实际混入过整段拉取文件,直接
+    # glob 会把重复 (trade_date, ts_code) 行读进面板,pivot_table 静默聚合改写价格);
+    # assert_adj_complete:adj_factor 缺日 fail-loud,不让 NaN 复权价被 dropna 静默吞
+    # (与 factor_rank/pick_track 同口径,外部 review 点名回测侧遗漏)
     da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "open", "close"])
-                    for f in sorted(glob.glob(f"{CACHE}/daily/*.parquet"))], ignore_index=True)
+                    for f in date_partition_files(CACHE, "daily")], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
-                    for f in sorted(glob.glob(f"{CACHE}/adj_factor/*.parquet"))], ignore_index=True)
+                    for f in date_partition_files(CACHE, "adj_factor")], ignore_index=True)
     px = da.merge(aj, on=["ts_code", "trade_date"], how="left")
+    assert_adj_complete(px)
     px["aclose"] = px["close"].astype(float) * px["adj_factor"].astype(float)
     px["aopen"] = px["open"].astype(float) * px["adj_factor"].astype(float)
     dates = sorted(px["trade_date"].unique())
@@ -233,9 +240,11 @@ def main(argv: list[str] | None = None) -> None:
         raw["MOM"] = (close_p.iloc[it - MOM_SKIP][list(idx)] / close_p.iloc[it - MOM_LB][list(idx)] - 1.0)
         ind = ind_all.reindex(idx).fillna("其他")
         row: dict = {"date": t, "n": len(idx), "excl_limit_up": len(locked),
-                     # round_trip 成本率(2×佣金+2×滑点+当期印花税,PIT 分段)——
-                     # "成本后月差"的上界口径:假设月度全换手(每期整仓一买一卖)
-                     "cost_rt": round_trip_cost_rate(t, a.commission, a.slippage)}
+                     # round_trip 成本率(2×佣金+2×滑点+印花税,PIT 分段)——上界口径:
+                     # 假设月度全换手。印花税按**持有窗口末=卖出日**取段(税是卖出时缴的,
+                     # 窗口跨税改日时用信号日会错扣——外部 review 点名)
+                     "cost_rt": round_trip_cost_rate(entry_date, a.commission, a.slippage,
+                                                     sell_date=dates[it + 1 + a.fwd])}
         # 中性化后的因子值攒成一张表:算 IC 之外顺带累计因子横截面相关矩阵
         # (冗余审查:相关>0.65 触发合并/剔除评估——华泰FFScore 口径)
         neu_df = pd.DataFrame({fac: neutralize_industry_size(raw[fac], ind, logmv) for fac in FACTORS})
@@ -260,10 +269,12 @@ def main(argv: list[str] | None = None) -> None:
           f" | 一字涨停均剔除{res['excl_limit_up'].mean():.1f}只/期")
     print(f"成本口径:佣金万{a.commission * 10000:g}+滑点{a.slippage * 10000:g}bp(单边)+卖出印花税(PIT分段);"
           f"成本后月差=Q5-Q1−round_trip(上界:假设月度全换手,实际换手更低则成本更低)")
-    print(f"{'因子':>5}{'IC均值':>8}{'ICIR':>7}{'t值(NW)':>8}{'Neff':>6}{'Q5-Q1月%':>9}{'成本后月%':>9}{'胜率':>6}  判定")
+    print(f"{'因子':>5}{'IC均值':>8}{'ICIR':>7}{'t值(NW)':>8}{'lag':>5}{'Q5-Q1月%':>9}{'成本后月%':>9}{'胜率':>6}  判定")
     for fac in FACTORS:
         ic = res["IC_" + fac].dropna()
-        icir, tnw, neff = adjusted_tstat(ic)
+        # 真 Newey-West HAC(Bartlett核,NW1994 自动带宽):旧版 adjusted_tstat 是 AR(1)
+        # N_eff 近似却错标 "NW"(外部 review 点名)——多阶自相关下 AR(1) 低估标准误
+        icir, tnw, nwlag = newey_west_tstat(ic)
         spr = res["SPR_" + fac].dropna().mean() * 100
         # 成本后月差:逐期 SPR−当期 round_trip(印花税分段随期变),再取均值——
         # 比"均值−均成本"更诚实(样本跨税改日时两者不等)
@@ -272,7 +283,7 @@ def main(argv: list[str] | None = None) -> None:
         m = ic.mean()
         v = "✓有效" if abs(tnw) > 2 and abs(m) > 0.02 else ("~弱" if abs(tnw) > 1.5 else "✗噪声")
         sign = "(反转)" if m < -0.02 else ""
-        print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{neff:>6.0f}{spr:>+8.2f}%{net:>+8.2f}%{hit:>5.0f}%  {v}{sign}")
+        print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{nwlag:>5d}{spr:>+8.2f}%{net:>+8.2f}%{hit:>5.0f}%  {v}{sign}")
     os.makedirs("data/holdscore", exist_ok=True)
     if corr_sum is not None and corr_n:
         avg_corr = corr_sum / corr_cnt.replace(0, pd.NA)

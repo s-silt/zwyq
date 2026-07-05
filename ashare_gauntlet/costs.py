@@ -71,22 +71,31 @@ def stamp_duty(trade_date: str, sell_amount: float) -> float:
 
 
 def _require_nonneg_rates(commission_rate: float, slippage_rate: float) -> None:
-    if commission_rate < 0 or slippage_rate < 0:
-        raise ValueError(
-            f"commission_rate/slippage_rate 不可为负(得到 {commission_rate!r}/{slippage_rate!r})"
-            f"——负费率无经济含义,多半是调用方传参错误")
+    # isfinite 同时拦 NaN/±inf:NaN 费率会让成本后列整列静默变 NaN(外部 review 点名)
+    for name, r in (("commission_rate", commission_rate), ("slippage_rate", slippage_rate)):
+        if not isinstance(r, (int, float)) or not math.isfinite(r) or r < 0:
+            raise ValueError(
+                f"{name} 需为非负有限数,得到 {r!r}——负/NaN/inf 费率无经济含义,多半是调用方传参错误")
 
 
-def round_trip_cost_rate(trade_date: str, commission_rate: float, slippage_rate: float) -> float:
-    """单次**完整买卖**(一买一卖)的总费率 = 2×佣金 + 2×滑点 + 当期印花税(卖出侧)。
+def round_trip_cost_rate(trade_date: str, commission_rate: float, slippage_rate: float,
+                         sell_date: "str | None" = None) -> float:
+    """单次**完整买卖**(一买一卖)的总费率 = 2×佣金 + 2×滑点 + 印花税(卖出侧)。
 
     commission_rate(单边佣金率)与 slippage_rate(单边滑点率)由调用方传入并注明出处
-    (用户合同/实测参数,非库常数);印花税按 ``trade_date`` PIT 取段。
+    (用户合同/实测参数,非库常数)。印花税按**卖出日** ``sell_date`` PIT 取段——
+    税是卖出时缴的,持有期跨税改日(如 2023-08-28 减半)时用买入/信号日取段会错扣
+    (外部 review 点名);``sell_date`` 缺省回退 ``trade_date``(当日往返/未知卖出日
+    的保守近似)。sell_date 早于 trade_date 无经济含义,fail-loud。
     比率口径忽略 5 元佣金地板(地板依赖绝对金额,见 :func:`trade_cost`)——对小仓位
     该口径**低估**成本,大额组合层面无碍。
     """
     _require_nonneg_rates(commission_rate, slippage_rate)
-    return 2.0 * commission_rate + 2.0 * slippage_rate + stamp_duty_rate(trade_date)
+    sd = trade_date if sell_date is None else sell_date
+    _require_yyyymmdd(sd)
+    if sd < trade_date:
+        raise ValueError(f"sell_date={sd} 早于 trade_date={trade_date}——卖先于买无经济含义")
+    return 2.0 * commission_rate + 2.0 * slippage_rate + stamp_duty_rate(sd)
 
 
 def trade_cost(trade_date: str, side: str, amount: float, commission_rate: float,

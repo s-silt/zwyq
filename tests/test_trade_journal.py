@@ -171,18 +171,26 @@ def test_load_bad_shape_fails_loud(tmp_path):
 # ---------- 种子数据:data/trade_journal.json 完整性 + 真实统计值 ----------
 
 def test_seed_journal_schema_and_stats():
+    # journal 是**活数据文件**(实盘交易持续追加),测试只钉两件不许腐的事:
+    # ① 全量 schema 完整 + bucket 合法;② 种子历史(制度前·2026-07-02 之前的 6 笔,
+    # 已定格的回忆口径)统计值不变。整体笔数只做"追加不减"下界,不写死
+    # (此前 ==7 在 7/3 实盘三笔开仓入账后误报,钉活文件行数=测试腐坏)。
     trades = load_journal(JOURNAL_PATH)
-    assert len(trades) == 7
+    assert len(trades) >= 7                  # 追加不减(种子7笔是历史下界)
     keys = {"code", "name", "bucket", "entry_date", "entry_px", "shares",
             "exit_date", "exit_px", "pnl_pct", "hold_days", "reason", "approx"}
     for t in trades:
         assert set(t) == keys, t
-        assert t["bucket"] == "制度前"       # 双仓制 2026-07-03 才生效,种子全是制度前
-        assert t["approx"] is True           # 历史回忆口径,全部标 approx
+        assert t["bucket"] in BUCKETS, t
 
-    # 已平仓且有盈亏的 5 笔:春秋+3.8 / 世纪华通-0.3 / 海康+4.3 / 韵升+6.65 / 富联v1-18.2
-    # (甬金 exit 有但 pnl 未记录、富联v2 持有中 → 不进统计)
-    s = stats(trades)
+    # 种子=制度前 & 入场早于 20260702(富联v2 及之后为实盘期,不属定格历史)
+    seeds = [t for t in trades if t["bucket"] == "制度前" and t["entry_date"] < "20260702"]
+    assert len(seeds) == 6
+    assert all(t["approx"] is True for t in seeds)   # 历史回忆口径,全部标 approx
+
+    # 种子已平仓且有盈亏的 5 笔:春秋+3.8 / 世纪华通-0.3 / 海康+4.3 / 韵升+6.65 / 富联v1-18.2
+    # (甬金 exit 有但 pnl 未记录 → 不进统计)
+    s = stats(seeds)
     assert s["n"] == 5
     assert abs(s["win_rate"] - 0.6) < 1e-9
     assert abs(s["avg_win_pct"] - (3.8 + 4.3 + 6.65) / 3) < 1e-9

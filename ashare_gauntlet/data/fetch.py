@@ -197,6 +197,18 @@ def fetch_market_day(
             f"cached market endpoint {endpoint!r} is empty (0 rows) for trade_date={trade_date!r} "
             f"at {path} — refusing to serve an empty full-market pull as a real value"
         )
+    # 缓存命中路径同样校验必需列(外部 review 点名):退化 schema 若已在早年落盘
+    # (加固前写入,实测 20160630 缺 total_mv),命中缓存直接返回会让显式 fields 重试
+    # 永不触发、下游 KeyError/错口径。force 重拉自愈并覆盖(_pull 内部自带显式 fields
+    # 重试,重拉后仍缺列会在 _pull 里 fail-loud)。
+    required = REQUIRED_MARKET_COLUMNS.get(endpoint, ())
+    if required and not df.empty and any(c not in df.columns for c in required):
+        df = read_or_fetch(path, lambda: call_with_retry(_pull), force=True)
+        still = [c for c in required if c not in df.columns]
+        if still:   # 防御:_pull 应已 raise,此处兜底不让退化数据流出
+            raise RuntimeError(
+                f"market endpoint {endpoint!r} trade_date={trade_date!r} 缓存退化重拉后"
+                f"仍缺必需列 {still}——拒绝供给退化数据")
     return df
 
 

@@ -86,3 +86,20 @@ def test_first_sellable_none_when_data_ends():
     # 数据尽头仍不可卖(退市终局)→ None,调用方保持 ffill 最后成交价并 surface
     opens = pd.Series([10.0, float("nan"), float("nan")])
     assert first_sellable_open(opens, 1, lambda j: False) is None
+
+
+def test_defer_note_no_deferral_empty():
+    from scripts.factor_backtest import defer_note
+    assert defer_note(0, 0, 0) == ""
+
+
+def test_defer_note_unresolved_only_no_division():
+    # 顺延0只但未解>0(全退市终局的期)——曾除零崩掉 fwd=10 整跑
+    from scripts.factor_backtest import defer_note
+    s = defer_note(0, 0, 3)
+    assert "未解3" in s and "均" not in s
+
+
+def test_defer_note_with_average():
+    from scripts.factor_backtest import defer_note
+    assert "均2.5日" in defer_note(4, 10, 1)

@@ -204,6 +204,15 @@ def quantile_legs(factor: pd.Series, q: int = 5) -> "tuple[set[str], set[str]]":
             set(f.index[bucket == q - 1].astype(str)))
 
 
+def defer_note(n_deferred: int, defer_days: int, n_unresolved: int) -> str:
+    """退出顺延的每期 surface 文案。均值只在有顺延时才有定义(n_deferred=0 而
+    n_unresolved>0 的期——如全是退市终局——曾除零崩掉 fwd=10 整跑)。"""
+    if not n_deferred and not n_unresolved:
+        return ""
+    avg = f"均{defer_days / n_deferred:.1f}日," if n_deferred else ""
+    return f" 退出顺延{n_deferred}只({avg}未解{n_unresolved})"
+
+
 def exclude_shell(mv: pd.Series) -> list[str]:
     """LSY(Liu-Stambaugh-Yuan 2019 JFE, CH-3)剔壳:剔除当期市值最小 30% 的股票。
 
@@ -323,9 +332,8 @@ def main(argv: list[str] | None = None) -> None:
                 n_deferred += 1
                 defer_days += r[1] + 1       # +1:从退出日顺延到可卖日至少隔 1 个交易日
         fwd = exit_ / entry - 1.0
-        extra = (f" 退出顺延{n_deferred}只(均{defer_days / n_deferred:.1f}日,未解{n_unresolved})"
-                 if n_deferred or n_unresolved else "")
-        print(f"  {k + 1}/{len(rebal)} {t} 入场{entry_date} 一字涨停剔除{len(locked)}只{extra}", flush=True)
+        print(f"  {k + 1}/{len(rebal)} {t} 入场{entry_date} 一字涨停剔除{len(locked)}只"
+              f"{defer_note(n_deferred, defer_days, n_unresolved)}", flush=True)
         # 市值(size 中性)+ 估值(EP/BP 与生产 factor_rank 同口径:1/pe_ttm、1/pb,
         # 仅盈利/正净资产下有定义;旧版 eps/bps÷前复权价的复权乘数每只不同→横截面扭曲)
         # 缓存版:历史 daily_basic 不可变,落盘后重跑回测零 API 调用、结果可复现

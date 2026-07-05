@@ -51,7 +51,7 @@ from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
 from ashare_gauntlet.data.tushare_source import make_pro_api
-from ashare_gauntlet.factor_model import neutralize_industry_size
+from ashare_gauntlet.factor_model import ivol_capm, max_daily_ret, neutralize_industry_size
 from ashare_gauntlet.screen import board_of
 
 CACHE = "data/cache"
@@ -205,37 +205,9 @@ def quantile_legs(factor: pd.Series, q: int = 5) -> "tuple[set[str], set[str]]":
 
 
 # ---------- P1 交易行为族候选因子(先过门禁再谈入分;窗口 月=21/年=252 与 MOM 同惯例) ----------
-
-def max_daily_ret(ret: pd.DataFrame, window: int) -> pd.Series:
-    """MAX(Bali-Cakici-Whitelaw 2011 彩票需求):近 window 日最大单日收益。
-
-    行=交易日升序(末行=信号日)、列=股票。面板历史不足 window → 全 NaN 不伪造;
-    窗内个别停牌日(NaN)按可得日取最大(经济含义:出现过的最大单日暴涨),全缺自然 NaN。
-    """
-    if len(ret) < window:
-        return pd.Series(math.nan, index=ret.columns, dtype=float)
-    return ret.tail(window).max()
-
-
-def ivol_capm(ret: pd.DataFrame, mkt: pd.Series, window: int) -> pd.Series:
-    """IVOL(Ang-Hodrick-Xing-Zhang 2006):市场模型残差的日波动,近 window 日。
-
-    **口径显式标注:CAPM(单因子市场模型)残差,非 FF3/CH-3 残差**(对抗轮 B3:
-    不许拿总波动冒充;CAPM 残差是文献承认的最简因子模型口径)。mkt=宇宙等权日收益。
-    β 用窗内 OLS;面板历史不足 → 全 NaN。
-    """
-    if len(ret) < window or len(mkt) < window:
-        return pd.Series(math.nan, index=ret.columns, dtype=float)
-    w = ret.tail(window).reset_index(drop=True)
-    m = mkt.tail(window).reset_index(drop=True).astype(float)
-    mc = m - m.mean()
-    denom = float((mc ** 2).sum())
-    if denom <= 0:
-        return pd.Series(math.nan, index=ret.columns, dtype=float)
-    beta = w.sub(w.mean()).mul(mc, axis=0).sum() / denom
-    resid = w.sub(w.mean()) - pd.DataFrame(np.outer(mc, beta), columns=w.columns)
-    return resid.std()
-
+# max_daily_ret / ivol_capm 已上移 ashare_gauntlet.factor_model(IVOL 入 composite +
+# 🎰标签后成为生产/回测共用实现,同 neutralize_industry_size 先例);此处 re-export
+# 保持既有导入路径(tests/test_candidate_factors 等)不破。
 
 def amihud_illiq(ret: pd.DataFrame, amount: pd.DataFrame, window: int) -> pd.Series:
     """ILLIQ(Amihud 2002):mean(|日收益| / 成交额) 近 window 日。

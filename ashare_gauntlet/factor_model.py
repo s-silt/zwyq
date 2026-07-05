@@ -14,6 +14,9 @@ ROE(盈利能力)、毛利/总资产(Novy-Marx 2013)、应计 (净利−经营�
 """
 from __future__ import annotations
 
+import math
+
+import numpy as np
 import pandas as pd
 
 
@@ -89,6 +92,39 @@ def momentum_return(adj_close: pd.Series, lookback: int = 120) -> float | None:
     if len(s) < lookback + 1:
         return None
     return float(s.iloc[-1] / s.iloc[-1 - lookback] - 1.0)
+
+
+def max_daily_ret(ret: pd.DataFrame, window: int) -> pd.Series:
+    """MAX(Bali-Cakici-Whitelaw 2011 彩票需求):近 window 日最大单日收益。
+
+    行=交易日升序(末行=信号日)、列=股票。面板历史不足 window → 全 NaN 不伪造;
+    窗内个别停牌日(NaN)按可得日取最大,全缺自然 NaN。生产(🎰标签)与回测
+    (--candidates 门禁)共用同一实现——被验证的形态=生产使用的形态。
+    """
+    if len(ret) < window:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    return ret.tail(window).max()
+
+
+def ivol_capm(ret: pd.DataFrame, mkt: pd.Series, window: int) -> pd.Series:
+    """IVOL(Ang-Hodrick-Xing-Zhang 2006):市场模型残差的日波动,近 window 日。
+
+    **口径显式标注:CAPM(单因子市场模型)残差,非 FF3/CH-3 残差**。mkt=宇宙等权
+    日收益。β 用窗内 OLS;面板历史不足 → 全 NaN。P1 门禁全过(N=149:NW t-14.7、
+    13折 LOYO 无变号、涨跌市同号、多头腿成本后+0.34%/期)后入 composite(负向),
+    生产/回测共用同一实现。
+    """
+    if len(ret) < window or len(mkt) < window:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    w = ret.tail(window).reset_index(drop=True)
+    m = mkt.tail(window).reset_index(drop=True).astype(float)
+    mc = m - m.mean()
+    denom = float((mc ** 2).sum())
+    if denom <= 0:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    beta = w.sub(w.mean()).mul(mc, axis=0).sum() / denom
+    resid = w.sub(w.mean()) - pd.DataFrame(np.outer(mc, beta), columns=w.columns)
+    return resid.std()
 
 
 def to_decile(s: pd.Series) -> pd.Series:

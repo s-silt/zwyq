@@ -28,6 +28,7 @@ import argparse
 import glob
 import json
 import os
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,8 @@ from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import (
     composite,
     factor_percentile,
+    ivol_capm,
+    max_daily_ret,
     momentum_return,
     to_decile,
     touched_limit_up,
@@ -51,28 +54,44 @@ CACHE = "data/cache"
 OUT_DIR = "data/holdscore"
 MAIN = ("沪主板", "深主板")
 
-# 入分因子 = P0 三修(退出侧卖出约束/真实换手/退市股财务回填)后仍站住的两个
-# (N=149, 2014-2026):EP t4.36 真实净+0.65%/月、BP t7.14 +0.93%/月(换手仅13-16%)。
-# 降级史(证据见 memory factor-backtest-a-share):ROE/GP 12年噪声+互相冗余0.62;
-# ACC 退市股补入后现形(t 3.27→2.36、IC 0.008、真实净≈0,按自家标准仅"~弱"——
-# 死掉的高应计公司缺席曾吹高它),盈利含金量由质地关(现金流方向/净现比)独立把守。
-# 新因子入 composite 须过准入纪律:NW t>3 + 成本后>0 + 方向稳定 + 年度切片。
-COMPOSITE_FACTORS = ("f_EP", "f_BP")
+# 入分因子(证据链见 memory factor-backtest-a-share,N=149 / 2014-2026):
+# EP t4.36 真实净+0.65%/月、BP t7.14 +0.93%/月(换手仅13-16%);
+# IVOL(负向,CAPM残差口径)t-14.7、13折LOYO无变号、涨跌市同号、**多头腿成本后
+# +0.34%/期**(纯多头拿得到的部分),与 EP/BP 相关仅-0.2/-0.3——P1 完整门禁全过。
+# 降级史:ROE/GP 12年噪声+冗余0.62;ACC 退市股补入后现形(t2.36/真实净≈0);
+# MOM 过四门但多头腿-0.28%(反转的钱在空头腿,散户拿不到)——腿分解自此为准入必查。
+# 同族 MAX/NLIMIT/TURN 多头腿≈0 → 🎰风险标签层(spec_crowd_flags),不入分。
+COMPOSITE_FACTORS = ("f_EP", "f_BP", "f_IVOL")
+
+IVOL_WINDOW = 21   # 月窗(交易日),与回测门禁被验证的形态同一常识惯例(月=21)
 
 
 def composite_score(factor_cols: pd.DataFrame) -> pd.Series:
-    """双因子等权合成(EP+BP)。展示列(f_ACC/f_ROE/f_GPOA/f_MOM)不入分。"""
+    """三因子等权合成(EP+BP+IVOL负向)。展示列(f_ACC/f_ROE/f_GPOA/f_MOM)不入分。"""
     return composite(factor_cols[list(COMPOSITE_FACTORS)])
 
 
 def composite_inputs_complete(df: pd.DataFrame) -> pd.Series:
-    """入池门槛:入分因子**原值**(EP/BP)全齐;展示列(ACC/roe/GPOA/MOM)不参与门槛。
+    """入池门槛:入分因子**原值**(EP/BP/IVOL)全齐;展示列不参与门槛。
 
     全齐(而非部分可得)是定义性选择:每只入榜票的 score 必须是同一个等权数学对象
-    (外部 review 点名的门槛原则);composite 的 skipna 均值只兜"极端缺列仍出数"的
-    下游安全,不作为入池许可。
+    (外部 review 点名的门槛原则);IVOL 缺失=上市不足 21 个交易日,如实清退。
     """
-    return df[["EP", "BP"]].notna().all(axis=1)
+    return df[["EP", "BP", "IVOL"]].notna().all(axis=1)
+
+
+def spec_crowd_flags(ivol: pd.Series, mx: pd.Series, nlimit: pd.Series) -> pd.Series:
+    """🎰投机拥挤标签:IVOL/MAX/近月涨停次数任一处于当日横截面 top decile。
+
+    P1 腿分解结论:该族 spread 的钱在空头腿(高投机票崩),散户做不了空 → 不入分,
+    转为终判警示("不追彩票票"铁律的定量化)。to_decile==10 复用十分位既有约定、
+    union 为定义性聚合,零新常数;**原值口径**(非中性化)——标签回答"这票现在
+    是不是彩票票",人类可读性优先(中性化口径已由 f_IVOL 入分承担)。
+    """
+    # s.gt(0) 守卫:NLIMIT 这类计数序列大量并列 0,to_decile 的 rank(first) 破并列会把
+    # 随机的 0 值票顶进 top decile——零值不具"拥挤"语义,一律不标(定义性,非阈值)
+    tops = [(to_decile(s).eq(10).fillna(False) & s.gt(0)) for s in (ivol, mx, nlimit)]
+    return (tops[0] | tops[1] | tops[2]).astype(bool)
 
 
 def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
@@ -157,14 +176,23 @@ def main(argv: list[str] | None = None) -> None:
         last_d[str(code)] = float(cl.iloc[-1])
         # 距MA20 用**前复权价**算(XD 除息日的分红缺口不是跌——未复权会假破位,实盘已两次踩中)
         dma20_d[str(code)] = float(ac.iloc[-1] / ac.tail(20).mean() - 1.0) if len(ac) >= 20 else None
-    # ⚡脉冲定义性锚:近5个交易日 high 对照 stk_limit 涨停价(交易所规则常数,fetch_market_day
-    # 自动按日缓存),触及即标——涨停触及是规则事件,替代 ret5>15% 手拍阈值
-    last5 = sorted(str(d) for d in px["trade_date"].unique())[-5:]
-    hi5 = pd.concat([fetch_market_day(pro, "daily", d, CACHE)[["ts_code", "trade_date", "high"]]
-                     for d in last5], ignore_index=True)
-    lim5 = pd.concat([fetch_market_day(pro, "stk_limit", d, CACHE)[["ts_code", "trade_date", "up_limit"]]
-                      for d in last5], ignore_index=True)
-    spike_codes = touched_limit_up(hi5, lim5)
+    # ⚡近5日触及 + 🎰近月涨停次数(NLIMIT):同一规则价数据双用途,逐日取触及集合
+    # (⚡=近5日任一日触及;NLIMIT=近21日触及天数,喂 spec_crowd 标签)
+    all_days = sorted(str(d) for d in px["trade_date"].unique())
+    last21 = all_days[-IVOL_WINDOW:]
+    touched_by_day: dict[str, set] = {}
+    for d in last21:
+        touched_by_day[d] = touched_limit_up(
+            fetch_market_day(pro, "daily", d, CACHE)[["ts_code", "trade_date", "high"]],
+            fetch_market_day(pro, "stk_limit", d, CACHE)[["ts_code", "trade_date", "up_limit"]])
+    spike_codes = set().union(*(touched_by_day[d] for d in last21[-5:]))
+    nlimit_cnt = Counter(c for s in touched_by_day.values() for c in s)
+    # IVOL/MAX(IVOL 入分负向 + 两者喂 🎰):近21日前复权日收益面板,市场=宇宙等权
+    sub = px[px["trade_date"].astype(str).isin(all_days[-(IVOL_WINDOW + 1):])]
+    ac_p = sub.pivot_table(index="trade_date", columns="ts_code", values="adj_close")
+    ret_p = ac_p.pct_change().iloc[1:]
+    ivol_s = ivol_capm(ret_p, ret_p.mean(axis=1), IVOL_WINDOW)
+    max_s = max_daily_ret(ret_p, IVOL_WINDOW)
     db = fetch_market_day(pro, "daily_basic", as_of, CACHE).set_index("ts_code")  # 缓存版:全字段落盘,一份缓存服务所有下游
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry")).set_index("ts_code")
 
@@ -197,6 +225,10 @@ def main(argv: list[str] | None = None) -> None:
     df["BP"] = (1.0 / df["pb"]).where(df["pb"] > 0)
     df["GPOA"] = (rev - cogs) / ta
     df["ACC"] = (ni - ocf) / ta
+    df["IVOL"] = ivol_s.reindex(idx)                 # CAPM残差月波动(入分,负向)
+    df["MAX"] = max_s.reindex(idx)                   # 近月最大单日收益(🎰标签用)
+    df["NLIMIT"] = pd.Series(nlimit_cnt, dtype=float).reindex(idx).fillna(0.0)  # 无触及=0(定义性计数)
+    df["spec_crowd"] = spec_crowd_flags(df["IVOL"], df["MAX"], df["NLIMIT"])
 
     df["tier"] = [lean_tier(df["np_yoy"].iat[k], df["dedt_yoy"].iat[k], df["rev_yoy"].iat[k],
                             ocfps=df["ocfps"].iat[k], roe=df["roe"].iat[k]) for k in range(len(df))]
@@ -217,7 +249,8 @@ def main(argv: list[str] | None = None) -> None:
     df["f_BP"] = factor_percentile(df["BP"], ind, higher_is_better=True, logmv=logmv)
     df["f_ROE"] = factor_percentile(df["roe"], ind, higher_is_better=True, logmv=logmv)
     df["f_GPOA"] = factor_percentile(df["GPOA"], ind, higher_is_better=True, logmv=logmv)
-    df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好
+    df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好(展示)
+    df["f_IVOL"] = factor_percentile(df["IVOL"], ind, higher_is_better=False, logmv=logmv)  # 低波=高分(入分)
     df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
     # 双因子等权合成 EP+BP(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
     # ACC/ROE/GP/MOM 不入分(降级证据见 COMPOSITE_FACTORS 注),保留 f_ 列作展示/判断层参考。
@@ -230,27 +263,30 @@ def main(argv: list[str] | None = None) -> None:
 
     os.makedirs(OUT_DIR, exist_ok=True)
     keep = ["name", "industry", "tier", "pe", "pb", "roe", "mv", "decile", "score",
-            "f_EP", "f_BP", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "MOM", "ret5", "last", "dma20",
+            "f_EP", "f_BP", "f_IVOL", "f_ROE", "f_GPOA", "f_ACC", "f_MOM",
+            "IVOL", "MAX", "NLIMIT", "spec_crowd", "MOM", "ret5", "last", "dma20",
             "spike_limit"]
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)
 
-    print(f"=== 横截面因子排序(EP+BP 双因子入分·行业+市值双中性·ACC/ROE/GP/MOM 仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
-    print("分位=双中性百分位(0-100);入分双因子=12.5年实证+P0三修(真实净+0.65/+0.93%月,换手13-16%);距MA20=前复权口径(防XD假破位)")
-    print("⚡脉冲=近5交易日内触及过涨停(stk_limit 规则价,优先展示);趋势=MOM 横截面 top decile(十分位约定)")
-    print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'ROE':>4}{'GP':>3}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/趋势'}")
+    print(f"=== 横截面因子排序(EP+BP+IVOL 三因子入分·行业+市值双中性·ACC/ROE/GP/MOM 仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
+    print("分位=双中性百分位(0-100);入分=12.5年实证+P0三修+P1门禁(EP/BP 真实净+0.65/+0.93%月;IVOL 负向 t-14.7 多头腿+0.34%);距MA20=前复权口径")
+    print("⚡=近5日触涨停;🎰=投机拥挤(IVOL/MAX/近月涨停次数任一 top decile,腿分解定性:该族的钱在空头腿,散户规避即所得);趋势=MOM top decile")
+    print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'IVOL':>5}{'ROE':>4}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/标签'}")
     pc = lambda x: f"{x*100:.0f}" if isinstance(x, (int, float)) and x == x else "—"
     nn = lambda x: f"{x:.0f}" if isinstance(x, (int, float)) and x == x else "—"
     for i, (code, r) in enumerate(df.head(a.top).iterrows(), 1):
         dma20, mom = r.get("dma20"), r.get("MOM")
         dma = f"{dma20*100:+.0f}%" if isinstance(dma20, (int, float)) and dma20 == dma20 else "—"
-        # ⚡(触及涨停,规则事件)优先于趋势(MOM top decile);mom_top=True 蕴含 MOM 非 NaN
-        spike = "⚡脉冲(触涨停)" if bool(r.get("spike_limit")) else (
-            f"趋势{mom*100:+.0f}%" if bool(r.get("mom_top")) else "")
+        # 标签优先级:🎰投机拥挤 > ⚡触涨停 > 趋势(mom_top=True 蕴含 MOM 非 NaN)
+        tags = ("🎰投机拥挤" if bool(r.get("spec_crowd")) else "") + \
+               ("⚡触涨停" if bool(r.get("spike_limit")) else "")
+        if not tags and bool(r.get("mom_top")):
+            tags = f"趋势{mom*100:+.0f}%"
         print(f"{i:>2} {(int(r['decile']) if pd.notna(r['decile']) else 0):>2} {r['tier']:>2} "
               f"{str(r['name'])[:8]:<9}{str(r['industry'])[:6]:<7}"
-              f"{pc(r['f_EP']):>3}{pc(r['f_BP']):>3}{pc(r['f_ROE']):>4}{pc(r['f_GPOA']):>3}{pc(r['f_ACC']):>4}{pc(r['f_MOM']):>4}"
-              f"{nn(r['pe']):>5}{nn(r.get('mv')):>7} 距MA20{dma} {spike}")
+              f"{pc(r['f_EP']):>3}{pc(r['f_BP']):>3}{pc(r['f_IVOL']):>5}{pc(r['f_ROE']):>4}{pc(r['f_ACC']):>4}{pc(r['f_MOM']):>4}"
+              f"{nn(r['pe']):>5}{nn(r.get('mv')):>7} 距MA20{dma} {tags}")
 
 
 if __name__ == "__main__":

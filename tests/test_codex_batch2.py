@@ -81,9 +81,9 @@ def test_fetch_market_day_healthy_cache_untouched(tmp_path):
 
 def test_composite_inputs_complete_gate():
     # 门槛原则(review 点名):入分因子原值全齐、展示列缺失不清退;因子集随
-    # COMPOSITE_FACTORS 演进(当前 EP+BP,ACC 已降展示,见 test_factor_rank_composite)
+    # COMPOSITE_FACTORS 演进(当前 EP+BP+IVOL,见 test_factor_rank_composite)
     df = pd.DataFrame({
-        "EP": [0.10, None], "BP": [0.50, 0.50],
+        "EP": [0.10, None], "BP": [0.50, 0.50], "IVOL": [0.02, 0.02],
         "ACC": [None, 0.02], "roe": [None, 9.9], "GPOA": [None, 0.30]})
     assert composite_inputs_complete(df).tolist() == [True, False]
 

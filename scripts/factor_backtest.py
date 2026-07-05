@@ -176,6 +176,34 @@ def first_sellable_open(opens: pd.Series, start: int, locked) -> "tuple[float, i
     return None
 
 
+def leg_turnover(prev: "set[str] | None", cur: set[str]) -> float:
+    """单腿组合换手率 τ = 1 − |前后期交集| / |当期|(定义性,无参数)。
+
+    真实成本折扣(吸纳终榜 P0②):现有"成本后月差"按全换手扣一次完整 round_trip 是
+    上界;实际只有被替换的 τ 部分付成本(卖旧+买新各半个往返≈τ×round_trip)。
+    首期无前期组合 → NaN(建仓是一次性成本,不属月度维持换手);当期空腿 → NaN。
+    """
+    if prev is None or not prev or not cur:
+        return math.nan     # 无前期/前期空腿(重建)/当期空腿:维持换手无定义
+    return 1.0 - len(prev & cur) / len(cur)
+
+
+def quantile_legs(factor: pd.Series, q: int = 5) -> "tuple[set[str], set[str]]":
+    """组合形成时点的 (低腿, 高腿) 成员集合——按因子分 q 组的底/顶组。
+
+    与 quantile_spread 同约定(rank method="first" 破并列 + qcut + len<q*5 门槛),
+    差别:这里只按**因子**分组不配对收益——组合是在 t 日按当时可得因子形成的,
+    配对收益分组是评价口径、不是形成口径,算换手必须用形成口径。
+    样本不足 → 空腿(调用方 leg_turnover 得 NaN,不造伪组合)。
+    """
+    f = factor.dropna()
+    if len(f) < q * 5:
+        return set(), set()
+    bucket = pd.qcut(f.rank(method="first"), q, labels=False)
+    return (set(f.index[bucket == 0].astype(str)),
+            set(f.index[bucket == q - 1].astype(str)))
+
+
 def exclude_shell(mv: pd.Series) -> list[str]:
     """LSY(Liu-Stambaugh-Yuan 2019 JFE, CH-3)剔壳:剔除当期市值最小 30% 的股票。
 
@@ -201,6 +229,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="单边滑点率;默认 0.0015=LWZ(2022 JFE)中国市场实测 15bp 取下沿,可覆盖")
     ap.add_argument("--start", default=None,
                     help="YYYYMMDD,只跑该日及之后的换仓日(默认不截;回填完 2013 数据后跑长样本用)")
+    ap.add_argument("--every", type=int, default=1,
+                    help="每第 N 个月末取一个换仓日(默认1=月度)。fwd=63 配 --every 3 得"
+                         "非重叠季度采样——月度采样 63 日收益强重叠,均值 t 会虚高(对抗轮点名)")
     a = ap.parse_args(argv)
     load_env_local()
     MOM_LB, MOM_SKIP = 250, 21   # 12-1 动量:近250日、跳最近21日
@@ -237,6 +268,7 @@ def main(argv: list[str] | None = None) -> None:
     rebal = [d for d in month_last.values() if di[d] >= MOM_LB and di[d] + 1 + a.fwd < len(dates)]
     if a.start:
         rebal = [d for d in rebal if d >= a.start]
+    rebal = rebal[::max(a.every, 1)]
 
     FACTORS = ["EP", "BP", "ROE", "GP", "ACC", "MOM"]
     print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)"
@@ -244,6 +276,7 @@ def main(argv: list[str] | None = None) -> None:
     ic_rows: list[dict] = []
     corr_sum = None   # 因子横截面 Spearman 相关矩阵逐期累计(冗余审查)
     corr_n = 0
+    prev_legs: dict[str, "tuple[set[str], set[str]] | None"] = {}   # P0② 换手追踪
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()]
@@ -331,6 +364,12 @@ def main(argv: list[str] | None = None) -> None:
         for fac in FACTORS:
             row["IC_" + fac] = information_coefficient(neu_df[fac], fwd)
             row["SPR_" + fac] = quantile_spread(neu_df[fac], fwd, 5)
+            # 真实换手折扣(P0②):τ=两腿平均换手,真实成本≈τ×round_trip(全换手上界的替代)
+            low, high = quantile_legs(neu_df[fac], 5)
+            pl = prev_legs.get(fac)
+            row["TO_" + fac] = float(pd.Series([leg_turnover(pl[0] if pl else None, low),
+                                                leg_turnover(pl[1] if pl else None, high)]).mean())
+            prev_legs[fac] = (low, high)
         c = neu_df.corr(method="spearman")
         # 逐单元格 skipna 累计:某期某因子全缺 → 该期该行/列 NaN,直接相加会把 NaN
         # 传染到全样本平均;按"有值单元格计数"分母平均
@@ -349,21 +388,24 @@ def main(argv: list[str] | None = None) -> None:
           f" | 一字涨停均剔除{res['excl_limit_up'].mean():.1f}只/期")
     print(f"成本口径:佣金万{a.commission * 10000:g}+滑点{a.slippage * 10000:g}bp(单边)+卖出印花税(PIT分段);"
           f"成本后月差=Q5-Q1−round_trip(上界:假设月度全换手,实际换手更低则成本更低)")
-    print(f"{'因子':>5}{'IC均值':>8}{'ICIR':>7}{'t值(NW)':>8}{'lag':>5}{'Q5-Q1月%':>9}{'成本后月%':>9}{'胜率':>6}  判定")
+    print(f"{'因子':>5}{'IC均值':>8}{'ICIR':>7}{'t值(NW)':>8}{'lag':>5}{'Q5-Q1月%':>9}{'上界净%':>8}{'换手':>6}{'真实净%':>8}{'胜率':>6}  判定")
     for fac in FACTORS:
         ic = res["IC_" + fac].dropna()
         # 真 Newey-West HAC(Bartlett核,NW1994 自动带宽):旧版 adjusted_tstat 是 AR(1)
         # N_eff 近似却错标 "NW"(外部 review 点名)——多阶自相关下 AR(1) 低估标准误
         icir, tnw, nwlag = newey_west_tstat(ic)
         spr = res["SPR_" + fac].dropna().mean() * 100
-        # 成本后月差:逐期 SPR−当期 round_trip(印花税分段随期变),再取均值——
-        # 比"均值−均成本"更诚实(样本跨税改日时两者不等)
+        # 成本后月差两口径,逐期扣当期 round_trip(印花税分段随期变)再取均值:
+        # 上界净=全换手(每期整仓一买一卖);真实净=τ×rt(P0②,只有被替换部分付成本)
         net = (res["SPR_" + fac] - res["cost_rt"]).dropna().mean() * 100
+        to = res["TO_" + fac]
+        real_net = (res["SPR_" + fac] - to * res["cost_rt"]).dropna().mean() * 100
         hit = (ic > 0).mean() * 100
         m = ic.mean()
         v = "✓有效" if abs(tnw) > 2 and abs(m) > 0.02 else ("~弱" if abs(tnw) > 1.5 else "✗噪声")
         sign = "(反转)" if m < -0.02 else ""
-        print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{nwlag:>5d}{spr:>+8.2f}%{net:>+8.2f}%{hit:>5.0f}%  {v}{sign}")
+        print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{nwlag:>5d}{spr:>+8.2f}%{net:>+7.2f}%"
+              f"{to.mean():>6.0%}{real_net:>+7.2f}%{hit:>5.0f}%  {v}{sign}")
     os.makedirs("data/holdscore", exist_ok=True)
     if corr_sum is not None and corr_n:
         avg_corr = corr_sum / corr_cnt.replace(0, pd.NA)

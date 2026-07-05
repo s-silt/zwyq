@@ -78,13 +78,12 @@ def test_fetch_market_day_healthy_cache_untouched(tmp_path):
 # ---------- 2. 入池门槛围绕 COMPOSITE_FACTORS ----------
 
 def test_composite_inputs_complete_gate():
-    # 三个入分因子(EP/BP/ACC)原值全齐才入池;展示列(roe/GPOA)缺失不清退。
-    # 旧 4/5 门槛的两类错误:EP/BP/ACC 齐但 ROE+GPOA 缺 → 错杀;
-    # ACC 缺但 ROE/GPOA 齐 → 错放(score 实际只剩 EP/BP 撑起,与他票不是同一数学对象)
+    # 门槛原则(review 点名):入分因子原值全齐、展示列缺失不清退;因子集随
+    # COMPOSITE_FACTORS 演进(当前 EP+BP,ACC 已降展示,见 test_factor_rank_composite)
     df = pd.DataFrame({
-        "EP": [0.10, 0.10, None], "BP": [0.50, 0.50, 0.50], "ACC": [0.02, None, 0.02],
-        "roe": [None, 9.9, 9.9], "GPOA": [None, 0.30, 0.30]})
-    assert composite_inputs_complete(df).tolist() == [True, False, False]
+        "EP": [0.10, None], "BP": [0.50, 0.50],
+        "ACC": [None, 0.02], "roe": [None, 9.9], "GPOA": [None, 0.30]})
+    assert composite_inputs_complete(df).tolist() == [True, False]
 
 
 # ---------- 3. 印花税按卖出日取段 ----------

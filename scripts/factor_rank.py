@@ -1,11 +1,12 @@
 """横截面因子排序(B 路)—— 用 factor_model 对全主板做"质量×价值"因子打分,替掉数值持有分。
 
 为什么是这套(对照审计 scoring-needs-theory):每个因子映射公认 anomaly、全程零 magic number。
-- 入分因子(COMPOSITE_FACTORS):EP=1/PE(Basu 1977/FF 价值)、BP=1/PB(FF 1992)、
-  ACC=(归母净利−经营现金流)/总资产(Sloan 1996 应计,**越低越好**=低应计高质量)——
-  三者均经本地 12.5 年回测(N=149,成本后+剔壳稳健)验证。
-- 展示因子(不入分):ROE、GP/A=(营收−营业成本)/总资产(Novy-Marx 2013)——12 年噪声
-  (t<1)+ 互相冗余(0.63);MOM——反转向且成本后为负。保留 f_ 列供判断层参考。
+- 入分因子(COMPOSITE_FACTORS):EP=1/PE(Basu 1977/FF 价值)、BP=1/PB(FF 1992)——
+  经本地 12.5 年回测(N=149)+P0 三修(退出侧卖出约束/真实换手/退市股财务回填)验证,
+  真实净 +0.65%/+0.93% 月、换手仅 13-16%。
+- 展示因子(不入分):ACC(Sloan 1996 应计)——退市股补入后 t 2.36/IC 0.008/真实净≈0
+  (高应计爆雷公司缺席曾吹高它);ROE、GP/A(Novy-Marx 2013)——12 年噪声+互相冗余
+  0.62;MOM——反转向且成本后为负。保留 f_ 列供判断层参考。
 - 方法:每因子 行业+市值双中性 → 横截面百分位 → 等权合成 → 十分位(见 factor_model)。
 - 过滤:lean_tier 剔 🔴(三降/亏损),避免给恶化业务做"便宜"排序=价值陷阱;只对 🟢🟡 排。
 
@@ -50,28 +51,28 @@ CACHE = "data/cache"
 OUT_DIR = "data/holdscore"
 MAIN = ("沪主板", "深主板")
 
-# 入分因子 = 本地 12.5 年实证过的三个(N=149, 2014-2026, 成本后+剔壳稳健):
-# EP t4.9/BP t6.8 可交易有效,ACC t3.0 且与一切正交。ROE/GP 12 年噪声(t<1)
-# + 互相冗余(相关 0.63)+ ROE 半被 EP 吸收(0.49)→ 降为展示列(与 MOM 同待遇),
-# 不再以"文献先验"名义占据 2/5 权重稀释被验证的信号(见 memory factor-backtest-a-share)。
-COMPOSITE_FACTORS = ("f_EP", "f_BP", "f_ACC")
+# 入分因子 = P0 三修(退出侧卖出约束/真实换手/退市股财务回填)后仍站住的两个
+# (N=149, 2014-2026):EP t4.36 真实净+0.65%/月、BP t7.14 +0.93%/月(换手仅13-16%)。
+# 降级史(证据见 memory factor-backtest-a-share):ROE/GP 12年噪声+互相冗余0.62;
+# ACC 退市股补入后现形(t 3.27→2.36、IC 0.008、真实净≈0,按自家标准仅"~弱"——
+# 死掉的高应计公司缺席曾吹高它),盈利含金量由质地关(现金流方向/净现比)独立把守。
+# 新因子入 composite 须过准入纪律:NW t>3 + 成本后>0 + 方向稳定 + 年度切片。
+COMPOSITE_FACTORS = ("f_EP", "f_BP")
 
 
 def composite_score(factor_cols: pd.DataFrame) -> pd.Series:
-    """三因子等权合成(EP+BP+ACC)。展示列(f_ROE/f_GPOA/f_MOM)不入分。"""
+    """双因子等权合成(EP+BP)。展示列(f_ACC/f_ROE/f_GPOA/f_MOM)不入分。"""
     return composite(factor_cols[list(COMPOSITE_FACTORS)])
 
 
 def composite_inputs_complete(df: pd.DataFrame) -> pd.Series:
-    """入池门槛:三个入分因子**原值**(EP/BP/ACC)全齐。
+    """入池门槛:入分因子**原值**(EP/BP)全齐;展示列(ACC/roe/GPOA/MOM)不参与门槛。
 
-    展示列(roe/GPOA/MOM)不参与门槛——旧"至少4/5因子"门槛在 composite 改三因子后
-    产生两类错误(外部 review 点名):EP/BP/ACC 齐但 ROE+GPOA 缺 → 错杀;ACC 缺但
-    ROE/GPOA 齐 → 错放(score 实际只剩 EP/BP,与他票不是同一数学对象)。要求全齐
-    (而非 ≥2/3)是定义性选择:每只入榜票的 score 必须是同一个三因子等权对象,
-    composite 的 skipna 均值只兜"极端缺列仍出数"的下游安全,不作为入池许可。
+    全齐(而非部分可得)是定义性选择:每只入榜票的 score 必须是同一个等权数学对象
+    (外部 review 点名的门槛原则);composite 的 skipna 均值只兜"极端缺列仍出数"的
+    下游安全,不作为入池许可。
     """
-    return df[["EP", "BP", "ACC"]].notna().all(axis=1)
+    return df[["EP", "BP"]].notna().all(axis=1)
 
 
 def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
@@ -218,9 +219,8 @@ def main(argv: list[str] | None = None) -> None:
     df["f_GPOA"] = factor_percentile(df["GPOA"], ind, higher_is_better=True, logmv=logmv)
     df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好
     df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
-    # 三因子等权合成 EP+BP+ACC(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
-    # ROE/GP 不入分:12 年噪声(t<1)+ 互相冗余 0.63 + ROE 半被 EP 吸收;MOM 不入分:反转向
-    # 且成本后为负——三者均保留 f_ 列作展示/判断层参考(见 COMPOSITE_FACTORS 注)。
+    # 双因子等权合成 EP+BP(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
+    # ACC/ROE/GP/MOM 不入分(降级证据见 COMPOSITE_FACTORS 注),保留 f_ 列作展示/判断层参考。
     df["score"] = composite_score(df)
     df["decile"] = to_decile(df["score"])
     # 趋势标注 = MOM 当日横截面 top decile(复用 to_decile 十分位既有约定,零新常数;
@@ -235,8 +235,8 @@ def main(argv: list[str] | None = None) -> None:
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)
 
-    print(f"=== 横截面因子排序(EP+BP+ACC 三因子入分·行业+市值双中性·ROE/GP/MOM 仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
-    print("分位=双中性百分位(0-100);入分三因子=12.5年实证(N=149,成本后+剔壳稳健);距MA20=前复权口径(防XD假破位)")
+    print(f"=== 横截面因子排序(EP+BP 双因子入分·行业+市值双中性·ACC/ROE/GP/MOM 仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
+    print("分位=双中性百分位(0-100);入分双因子=12.5年实证+P0三修(真实净+0.65/+0.93%月,换手13-16%);距MA20=前复权口径(防XD假破位)")
     print("⚡脉冲=近5交易日内触及过涨停(stk_limit 规则价,优先展示);趋势=MOM 横截面 top decile(十分位约定)")
     print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'ROE':>4}{'GP':>3}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/趋势'}")
     pc = lambda x: f"{x*100:.0f}" if isinstance(x, (int, float)) and x == x else "—"

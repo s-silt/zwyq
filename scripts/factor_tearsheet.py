@@ -48,6 +48,19 @@ def state_split(res: pd.DataFrame, ic_col: str) -> tuple[float, float]:
     return float(up.mean()), float(down.mean())
 
 
+def tradable_real_net(res: pd.DataFrame, fac: str) -> float:
+    """**可交易方向**的真实净:sign(IC 均值)×SPR_t − τ_t×cost_t 的均值。
+
+    方向盲区(P1 实跑发现):反转向因子(IVOL/MAX/TURN 等,IC<0)的 SPR 恒为负——
+    那是"做多高投机腿"的方向,没人会这么交易;可交易方向是做多低因子腿(规避彩票票),
+    净值 = |SPR| − 成本。按原始方向算会把整个反转族在"真实净>0"门机械误杀。
+    """
+    ic_mean = res["IC_" + fac].dropna().mean()
+    sign = 1.0 if ic_mean >= 0 else -1.0
+    net = sign * res["SPR_" + fac] - res["TO_" + fac] * res["cost_rt"]
+    return float(net.dropna().mean())
+
+
 def admission_verdict(full_t: float, real_net: float, loyo: dict[str, float],
                       up_ic: float, down_ic: float) -> tuple[bool, list[str]]:
     """入 composite 准入判定:四门全过 → (True, []);否则 (False, 未过理由)。
@@ -82,15 +95,23 @@ def main() -> None:
             print(f"\n◆ {fac}: 无有效 IC(数据窗不足),跳过")
             continue
         _, full_t, _ = newey_west_tstat(ic)
-        to = res.get("TO_" + fac)
-        real_net = float((res["SPR_" + fac] - to * res["cost_rt"]).dropna().mean()) if to is not None else float("nan")
+        real_net = tradable_real_net(res, fac) if "TO_" + fac in res.columns else float("nan")
         loyo = loyo_tstats(res, "IC_" + fac)
         up_ic, down_ic = state_split(res, "IC_" + fac)
         ok, reasons = admission_verdict(full_t, real_net, loyo, up_ic, down_ic)
         worst_year = min(loyo, key=lambda k: abs(loyo[k]))
-        print(f"\n◆ {fac}: IC {ic.mean():+.3f} | NW t {full_t:+.2f} | 真实净 {real_net * 100:+.2f}%/期"
+        print(f"\n◆ {fac}: IC {ic.mean():+.3f} | NW t {full_t:+.2f} | 可交易向真实净 {real_net * 100:+.2f}%/期"
               f" | 涨市 {up_ic:+.3f}/跌市 {down_ic:+.3f}"
               f" | LOYO 最弱折 {worst_year}(t {loyo[worst_year]:+.2f})")
+        # 腿分解(纯多头命门):可交易向多头腿 − 宇宙等权,再扣 τ×成本——spread 靠空头腿
+        # 撑的因子在这里现形(散户做不了空,拿不到那一半)
+        if "QLO_" + fac in res.columns and "mkt_fwd" in res.columns:
+            sign = 1.0 if ic.mean() >= 0 else -1.0
+            leg = res["QHI_" + fac] if sign > 0 else res["QLO_" + fac]
+            leg_ex = (leg - res["mkt_fwd"]).dropna().mean()
+            leg_net = (leg - res["mkt_fwd"] - res["TO_" + fac] * res["cost_rt"]).dropna().mean()
+            print(f"  多头腿 vs 宇宙: 超额 {leg_ex * 100:+.2f}%/期,成本后 {leg_net * 100:+.2f}%/期"
+                  f"(spread 的多头腿贡献占比 {leg_ex / abs(res['SPR_' + fac].dropna().mean()) * 100:.0f}%)")
         print("  LOYO: " + " ".join(f"{y}:{t:+.1f}" for y, t in loyo.items()))
         print(f"  准入: {'✅ 过四门(可提入分讨论)' if ok else '❌ ' + ';'.join(reasons)}")
     print("\n(准入仅适用入分因子;风控/治理标签不适用此线。终判永远人工。)")

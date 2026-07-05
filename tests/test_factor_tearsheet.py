@@ -64,3 +64,38 @@ def test_admission_verdict_all_gates():
     bad, reasons = admission_verdict(full_t=3.5, real_net=0.002,
                                      loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=-0.01)
     assert not bad and any("状态" in r for r in reasons)
+
+
+def test_tradable_real_net_flips_reversal_direction():
+    # 方向盲区(P1 实跑发现):IVOL 类反转因子 SPR<0(=低IVOL腿赢),按原始方向算
+    # 真实净恒为负、被"真实净>0"门机械否决;可交易方向 = sign(IC均值)×SPR − τ×成本
+    from scripts.factor_tearsheet import tradable_real_net
+    res = pd.DataFrame({
+        "IC_Y": [-0.05, -0.06, -0.04],          # 稳定负 IC(反转向)
+        "SPR_Y": [-0.015, -0.014, -0.016],      # 高因子腿输 1.5%/期
+        "TO_Y": [0.5, 0.5, 0.5],
+        "cost_rt": [0.004, 0.004, 0.004],
+    })
+    net = tradable_real_net(res, "Y")
+    assert abs(net - (0.015 - 0.5 * 0.004)) < 1e-9   # 翻向后 +1.3%/期
+    # 正向因子不受影响
+    res2 = res.copy()
+    res2[["IC_Y", "SPR_Y"]] = -res2[["IC_Y", "SPR_Y"]]
+    assert abs(tradable_real_net(res2, "Y") - (0.015 - 0.002)) < 1e-9
+
+
+def test_quantile_leg_means_monotone():
+    # 腿分解:纯多头产品的命门——spread 若全靠空头腿(垃圾崩),多头腿跑不赢宇宙=纸面alpha
+    from scripts.factor_backtest import quantile_leg_means
+    f = pd.Series({f"c{i}": float(i) for i in range(50)})
+    r = pd.Series({f"c{i}": float(i) / 100 for i in range(50)})
+    lo, hi = quantile_leg_means(f, r, 5)
+    assert abs(lo - 0.045) < 1e-9 and abs(hi - 0.445) < 1e-9   # 底组均值 (0..9)/100,顶组 (40..49)/100
+
+
+def test_quantile_leg_means_small_sample_nan():
+    import math
+    from scripts.factor_backtest import quantile_leg_means
+    f = pd.Series({f"c{i}": float(i) for i in range(10)})
+    lo, hi = quantile_leg_means(f, f / 100, 5)
+    assert math.isnan(lo) and math.isnan(hi)

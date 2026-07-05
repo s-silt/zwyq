@@ -275,6 +275,20 @@ def defer_note(n_deferred: int, defer_days: int, n_unresolved: int) -> str:
     return f" 退出顺延{n_deferred}只({avg}未解{n_unresolved})"
 
 
+def quantile_leg_means(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> "tuple[float, float]":
+    """(低分位腿均收益, 高分位腿均收益)——与 quantile_spread 同分组约定(rank first+qcut)。
+
+    腿分解(纯多头产品的命门):spread 显著 ≠ 多头可用——若贡献全在空头腿(高投机票
+    崩盘),做不了空的散户拿不到;tearsheet 用它报"可交易向多头腿 vs 宇宙"的超额。
+    样本 < q*5 → (NaN, NaN)。
+    """
+    df = pd.concat({"f": factor, "r": fwd_return}, axis=1, join="inner").dropna()
+    if len(df) < q * 5:
+        return math.nan, math.nan
+    bucket = pd.qcut(df["f"].rank(method="first"), q, labels=False)
+    return float(df.loc[bucket == 0, "r"].mean()), float(df.loc[bucket == q - 1, "r"].mean())
+
+
 def exclude_shell(mv: pd.Series) -> list[str]:
     """LSY(Liu-Stambaugh-Yuan 2019 JFE, CH-3)剔壳:剔除当期市值最小 30% 的股票。
 
@@ -479,6 +493,7 @@ def main(argv: list[str] | None = None) -> None:
         for fac in FACTORS:
             row["IC_" + fac] = information_coefficient(neu_df[fac], fwd)
             row["SPR_" + fac] = quantile_spread(neu_df[fac], fwd, 5)
+            row["QLO_" + fac], row["QHI_" + fac] = quantile_leg_means(neu_df[fac], fwd, 5)
             # 真实换手折扣(P0②):τ=两腿平均换手,真实成本≈τ×round_trip(全换手上界的替代)
             low, high = quantile_legs(neu_df[fac], 5)
             pl = prev_legs.get(fac)

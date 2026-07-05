@@ -45,11 +45,12 @@ def test_fetch_market_day_heals_degraded_cached_schema(tmp_path):
     pd.DataFrame({"ts_code": ["600519.SH"], "trade_date": ["20160630"],
                   "pe": [30.0]}).to_parquet(path, index=False)
     full = pd.DataFrame({"ts_code": ["600519.SH"], "trade_date": ["20160630"],
-                         "total_mv": [2e7], "pe_ttm": [28.0], "pb": [9.0]})
+                         "total_mv": [2e7], "pe_ttm": [28.0], "pb": [9.0],
+                         "turnover_rate": [1.2]})
     pro = _MarketPro({"daily_basic": full})
     out = fetch_market_day(pro, "daily_basic", "20160630", tmp_path)
-    assert {"total_mv", "pe_ttm", "pb"} <= set(out.columns)
-    assert {"total_mv", "pe_ttm", "pb"} <= set(pd.read_parquet(path).columns)  # 缓存被修复覆盖
+    assert {"total_mv", "pe_ttm", "pb", "turnover_rate"} <= set(out.columns)
+    assert {"total_mv", "pe_ttm", "pb", "turnover_rate"} <= set(pd.read_parquet(path).columns)
 
 
 def test_fetch_market_day_degraded_cache_and_source_fails_loud(tmp_path):
@@ -68,7 +69,8 @@ def test_fetch_market_day_healthy_cache_untouched(tmp_path):
     path = tmp_path / "daily_basic" / "20240102.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     full = pd.DataFrame({"ts_code": ["600519.SH"], "trade_date": ["20240102"],
-                         "total_mv": [2e7], "pe_ttm": [28.0], "pb": [9.0]})
+                         "total_mv": [2e7], "pe_ttm": [28.0], "pb": [9.0],
+                         "turnover_rate": [1.2]})
     full.to_parquet(path, index=False)
     pro = _MarketPro({"daily_basic": full})
     fetch_market_day(pro, "daily_basic", "20240102", tmp_path)
@@ -147,3 +149,23 @@ def test_rates_nan_inf_fail_loud(bad):
         round_trip_cost_rate("20240101", bad, 0.001)
     with pytest.raises(ValueError):
         round_trip_cost_rate("20240101", 0.001, bad)
+
+
+def test_required_daily_basic_covers_panel_consumers(tmp_path):
+    # P1 实跑踩雷:镜像对个别日(实测 20140108)默认返回仅 ts_code/pe_ttm/pb/total_mv 的
+    # 退化 schema——恰好满足旧 required 三列,不触发显式重试;缺 trade_date/turnover_rate
+    # 让 TURN 换手面板整跑崩。required 必须覆盖全部下游消费列,退化日才会自愈。
+    from ashare_gauntlet.data.fetch import REQUIRED_MARKET_COLUMNS
+    assert {"trade_date", "turnover_rate", "total_mv", "pe_ttm", "pb"} <= set(
+        REQUIRED_MARKET_COLUMNS["daily_basic"])
+    # 行为:退化缓存(缺 turnover_rate)命中 → 重拉自愈
+    path = tmp_path / "daily_basic" / "20140108.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"ts_code": ["600519.SH"], "total_mv": [2e7], "pe_ttm": [28.0],
+                  "pb": [9.0]}).to_parquet(path, index=False)
+    full = pd.DataFrame({"ts_code": ["600519.SH"], "trade_date": ["20140108"],
+                         "total_mv": [2e7], "pe_ttm": [28.0], "pb": [9.0],
+                         "turnover_rate": [1.2]})
+    pro = _MarketPro({"daily_basic": full})
+    out = fetch_market_day(pro, "daily_basic", "20140108", tmp_path)
+    assert "turnover_rate" in out.columns

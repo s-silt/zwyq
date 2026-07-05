@@ -92,7 +92,10 @@ CORE_SYMBOL_TABLES: frozenset[str] = frozenset(
 # 全市场逐日表的必需列 + 显式 fields 重试清单(镜像个别日期不带 fields 返回退化 schema,
 # 实测 20160630 daily_basic 只有 pe/pb/dv_ttm;显式请求可拿全)。
 REQUIRED_MARKET_COLUMNS: dict[str, tuple[str, ...]] = {
-    "daily_basic": ("total_mv", "pe_ttm", "pb"),
+    # 必须覆盖**全部下游消费列**:P1 实跑踩雷(20140108)——镜像默认返回仅
+    # ts_code/pe_ttm/pb/total_mv 的退化 schema,恰好满足旧三列检查、不触发显式重试,
+    # 缺 trade_date/turnover_rate 让换手面板整跑崩。required 窄于消费面 = 自愈盲区。
+    "daily_basic": ("trade_date", "total_mv", "pe_ttm", "pb", "turnover_rate"),
 }
 EXPLICIT_MARKET_FIELDS: dict[str, str] = {
     "daily_basic": ("ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,"

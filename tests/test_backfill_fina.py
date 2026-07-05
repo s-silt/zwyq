@@ -137,3 +137,19 @@ def test_output_sorted_and_unique():
         ("600001.SH", "20260630", "20260712"),   # 改期后同票多行:去重
     ])
     assert disclosed_stale_codes(disc, {}, "20260630") == ["600001.SH", "600002.SH"]
+
+
+# ---------- P0③ 修复:退市股财务回填(--universe delisted) ----------
+
+def test_universe_status_listed_and_delisted():
+    from scripts.backfill_fina import universe_status
+    assert universe_status("listed", refresh=False) == "L"
+    assert universe_status("delisted", refresh=False) == "D"
+
+
+def test_universe_status_delisted_rejects_refresh():
+    # 退市股财报永久冻结,--refresh(法定披露期新鲜度刷新)对其无意义 → fail-loud 防误用
+    import pytest
+    from scripts.backfill_fina import universe_status
+    with pytest.raises(ValueError, match="delisted"):
+        universe_status("delisted", refresh=True)

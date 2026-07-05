@@ -162,11 +162,24 @@ def _is_fresh(code: str, target: str) -> bool:
     return _local_max_end(code) >= target
 
 
+def universe_status(universe: str, refresh: bool) -> str:
+    """--universe → stock_basic list_status。P0③ 审计修复:财务缓存此前只按 L 名单回填,
+    退市股 0 覆盖=财务侧幸存者偏差(2013 横截面 8.8% 缺席)。delisted=按 D 名单补拉,
+    退市股财报永久冻结,一次回填终身有效;--refresh 对其无意义,组合 fail-loud 防误用。"""
+    if universe == "delisted":
+        if refresh:
+            raise ValueError("--universe delisted 不可与 --refresh 组合:退市股财报永久冻结,无新鲜度可刷")
+        return "D"
+    return "L"
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="lean", choices=("lean", "core", "full"))
     ap.add_argument("--board", default="main", choices=("main", "all"))
     ap.add_argument("--limit", type=int, default=0, help="只拉前 N 只(0=全部),用于试跑")
+    ap.add_argument("--universe", default="listed", choices=("listed", "delisted"),
+                    help="delisted=退市股名单回填(P0③:修复财务侧幸存者偏差)")
     ap.add_argument("--refresh", action="store_true",
                     help="财报季刷新:法定披露期判过期 + 披露表(disclosure_date)抓提前披露最新期的票,"
                          "两者并集整只 force 重拉(否则缓存优先=永不更新)")
@@ -176,7 +189,10 @@ def main(argv: list[str] | None = None) -> None:
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
     tables = tables_for_mode(a.mode)
 
-    sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name"))
+    status = universe_status(a.universe, a.refresh)
+    sb = call_with_retry(lambda: pro.stock_basic(list_status=status, fields="ts_code,name"))
+    if sb.empty:
+        raise SystemExit(f"stock_basic list_status={status} 拉取为空——源侧异常,拒绝当作'无退市股'")
     codes = [str(c) for c in sb["ts_code"]]
     if a.board == "main":
         codes = [c for c in codes if board_of(c) in MAIN_BOARDS]

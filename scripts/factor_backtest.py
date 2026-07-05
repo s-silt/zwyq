@@ -127,6 +127,55 @@ def one_word_limit_up(daily_1d: pd.DataFrame, stk_limit_1d: pd.DataFrame,
     return set(m.loc[(flat & at_limit) | miss, "ts_code"])
 
 
+def one_word_limit_down(daily_1d: pd.DataFrame, stk_limit_1d: pd.DataFrame,
+                        codes: list[str] | None = None) -> set[str]:
+    """退出日"一字跌停"票集合(卖不出):open==high==low==close 且 low ≤ down_limit + 1e-6。
+
+    退出侧可成交性(吸纳终榜 P0①,对称于入场侧 one_word_limit_up):一字跌停全天封死、
+    无买单承接,"按 ffill 价卖出"等于假设崩盘途中能出货——系统性**高估**多头收益,方向
+    与入场侧过滤相反,两侧都修才对称。只认一字封死;盘中打开(low<high)有成交机会不算。
+    与买侧的一处**方向性不对称**:个券缺跌停价 → 视为**可卖**(daily 行里有真实成交价,
+    无法证明封死;买侧伪造"可买"会虚增收益故保守剔除,卖侧伪造"卖不掉"是无据地推迟
+    真实成交价)。空输入 fail-loud 同买侧。
+    """
+    if daily_1d.empty or stk_limit_1d.empty:
+        raise ValueError("one_word_limit_down: daily/stk_limit 输入为空——上游缓存缺日,"
+                         "拒绝静默当作全部可卖")
+    need_daily = {"ts_code", "open", "high", "low", "close"}
+    need_limit = {"ts_code", "down_limit"}
+    missing = (need_daily - set(daily_1d.columns)) | (need_limit - set(stk_limit_1d.columns))
+    if missing:
+        raise ValueError(f"one_word_limit_down: 输入缺列 {sorted(missing)}——拒绝静默判定")
+    d = daily_1d[["ts_code", "open", "high", "low", "close"]].copy()
+    d["ts_code"] = d["ts_code"].astype(str)
+    if codes is not None:
+        d = d[d["ts_code"].isin(set(codes))]
+    if d.empty:
+        return set()
+    lim = stk_limit_1d[["ts_code", "down_limit"]].copy()
+    lim["ts_code"] = lim["ts_code"].astype(str)
+    m = d.merge(lim, on="ts_code", how="left")
+    o, h, low, c = (m[k].astype(float) for k in ("open", "high", "low", "close"))
+    flat = (o == h) & (h == low) & (low == c)
+    at_limit = low <= m["down_limit"].astype(float) + 1e-6   # 缺跌停价 → NaN 比较=False=可卖
+    return set(m.loc[flat & at_limit, "ts_code"])
+
+
+def first_sellable_open(opens: pd.Series, start: int, locked) -> "tuple[float, int] | None":
+    """从位置 ``start`` 起找第一个可卖日:open 非 NaN(未停牌)且 ``locked(pos)`` 为假
+    (非一字跌停封死)。返回 (该日开盘价, 顺延交易日数);数据尽头仍不可卖(退市终局)
+    → None,调用方保持 ffill 最后成交价并 surface 计数(不伪造未来价格)。
+
+    ``locked`` 注入依赖便于测试与懒取数:只对 open 非 NaN 的日子调用(停牌日无需查涨跌停)。
+    """
+    valid = np.flatnonzero(opens.iloc[start:].notna().to_numpy())
+    for off in valid:
+        pos = start + int(off)
+        if not locked(pos):
+            return float(opens.iloc[pos]), pos - start
+    return None
+
+
 def exclude_shell(mv: pd.Series) -> list[str]:
     """LSY(Liu-Stambaugh-Yuan 2019 JFE, CH-3)剔壳:剔除当期市值最小 30% 的股票。
 
@@ -205,15 +254,45 @@ def main(argv: list[str] | None = None) -> None:
         locked = one_word_limit_up(fetch_market_day(pro, "daily", entry_date, CACHE),
                                    fetch_market_day(pro, "stk_limit", entry_date, CACHE), codes)
         codes = [c for c in codes if c not in locked]
-        print(f"  {k + 1}/{len(rebal)} {t} 入场{entry_date} 一字涨停剔除{len(locked)}只", flush=True)
         if len(codes) < 50:
             continue
         idx = pd.Index(codes)
         # 未来收益:T+1 开盘买入 → 持有窗口内最后成交价(ffill,退市/停牌不丢崩盘收益)
         win = open_p.iloc[it + 1: it + 2 + a.fwd][codes]
         entry = win.iloc[0]
-        exit_ = win.ffill().iloc[-1]
+        exit_ = win.ffill().iloc[-1].copy()
+        # 退出侧卖出约束(吸纳终榜 P0①):计划退出日一字跌停封死/停牌 → 顺延到第一个
+        # 可卖日开盘价(数据尽头仍不可卖=退市终局 → 保持 ffill 并 surface);
+        # 入场"买不进"已剔而退出"卖不出"不修=方向性高估多头,两侧对称才诚实
+        exit_pos = it + 1 + a.fwd
+        exit_date = dates[exit_pos]
+        _ld_cache: dict[int, set[str]] = {}
+
+        def _locked(pos: int, c: str, _pool: list[str] = codes) -> bool:
+            if pos not in _ld_cache:
+                d_ = dates[pos]
+                _ld_cache[pos] = one_word_limit_down(
+                    fetch_market_day(pro, "daily", d_, CACHE),
+                    fetch_market_day(pro, "stk_limit", d_, CACHE), _pool)
+            return c in _ld_cache[pos]
+
+        locked_exit = one_word_limit_down(fetch_market_day(pro, "daily", exit_date, CACHE),
+                                          fetch_market_day(pro, "stk_limit", exit_date, CACHE), codes)
+        suspended_exit = {c for c in codes if pd.isna(open_p.iloc[exit_pos].get(c))
+                          and pd.notna(entry.get(c))}   # 入场成功但退出日无行=停牌中
+        n_deferred = n_unresolved = defer_days = 0
+        for c in locked_exit | suspended_exit:
+            r = first_sellable_open(open_p[c], exit_pos + 1, lambda j, _c=c: _locked(j, _c))
+            if r is None:
+                n_unresolved += 1            # 退市终局:保持窗口内最后成交价(已含崩盘)
+            else:
+                exit_[c] = r[0]
+                n_deferred += 1
+                defer_days += r[1] + 1       # +1:从退出日顺延到可卖日至少隔 1 个交易日
         fwd = exit_ / entry - 1.0
+        extra = (f" 退出顺延{n_deferred}只(均{defer_days / n_deferred:.1f}日,未解{n_unresolved})"
+                 if n_deferred or n_unresolved else "")
+        print(f"  {k + 1}/{len(rebal)} {t} 入场{entry_date} 一字涨停剔除{len(locked)}只{extra}", flush=True)
         # 市值(size 中性)+ 估值(EP/BP 与生产 factor_rank 同口径:1/pe_ttm、1/pb,
         # 仅盈利/正净资产下有定义;旧版 eps/bps÷前复权价的复权乘数每只不同→横截面扭曲)
         # 缓存版:历史 daily_basic 不可变,落盘后重跑回测零 API 调用、结果可复现
@@ -240,6 +319,7 @@ def main(argv: list[str] | None = None) -> None:
         raw["MOM"] = (close_p.iloc[it - MOM_SKIP][list(idx)] / close_p.iloc[it - MOM_LB][list(idx)] - 1.0)
         ind = ind_all.reindex(idx).fillna("其他")
         row: dict = {"date": t, "n": len(idx), "excl_limit_up": len(locked),
+                     "exit_deferred": n_deferred, "exit_unresolved": n_unresolved,
                      # round_trip 成本率(2×佣金+2×滑点+印花税,PIT 分段)——上界口径:
                      # 假设月度全换手。印花税按**持有窗口末=卖出日**取段(税是卖出时缴的,
                      # 窗口跨税改日时用信号日会错扣——外部 review 点名)

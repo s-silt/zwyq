@@ -204,6 +204,65 @@ def quantile_legs(factor: pd.Series, q: int = 5) -> "tuple[set[str], set[str]]":
             set(f.index[bucket == q - 1].astype(str)))
 
 
+# ---------- P1 交易行为族候选因子(先过门禁再谈入分;窗口 月=21/年=252 与 MOM 同惯例) ----------
+
+def max_daily_ret(ret: pd.DataFrame, window: int) -> pd.Series:
+    """MAX(Bali-Cakici-Whitelaw 2011 彩票需求):近 window 日最大单日收益。
+
+    行=交易日升序(末行=信号日)、列=股票。面板历史不足 window → 全 NaN 不伪造;
+    窗内个别停牌日(NaN)按可得日取最大(经济含义:出现过的最大单日暴涨),全缺自然 NaN。
+    """
+    if len(ret) < window:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    return ret.tail(window).max()
+
+
+def ivol_capm(ret: pd.DataFrame, mkt: pd.Series, window: int) -> pd.Series:
+    """IVOL(Ang-Hodrick-Xing-Zhang 2006):市场模型残差的日波动,近 window 日。
+
+    **口径显式标注:CAPM(单因子市场模型)残差,非 FF3/CH-3 残差**(对抗轮 B3:
+    不许拿总波动冒充;CAPM 残差是文献承认的最简因子模型口径)。mkt=宇宙等权日收益。
+    β 用窗内 OLS;面板历史不足 → 全 NaN。
+    """
+    if len(ret) < window or len(mkt) < window:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    w = ret.tail(window).reset_index(drop=True)
+    m = mkt.tail(window).reset_index(drop=True).astype(float)
+    mc = m - m.mean()
+    denom = float((mc ** 2).sum())
+    if denom <= 0:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    beta = w.sub(w.mean()).mul(mc, axis=0).sum() / denom
+    resid = w.sub(w.mean()) - pd.DataFrame(np.outer(mc, beta), columns=w.columns)
+    return resid.std()
+
+
+def amihud_illiq(ret: pd.DataFrame, amount: pd.DataFrame, window: int) -> pd.Series:
+    """ILLIQ(Amihud 2002):mean(|日收益| / 成交额) 近 window 日。
+
+    月窗是 GKX/LWZ 特征工程惯例(Amihud 原式年窗,月窗响应更快、与本族其它因子同窗)。
+    amount≤0/NaN(停牌/无成交)不作分母(inf 污染),skipna 均值;历史不足 → 全 NaN。
+    """
+    if len(ret) < window:
+        return pd.Series(math.nan, index=ret.columns, dtype=float)
+    r = ret.tail(window).abs()
+    a = amount.tail(window).where(amount.tail(window) > 0)
+    return (r / a).mean()
+
+
+def turn_abnormal(turnover: pd.DataFrame, month: int, year: int) -> pd.Series:
+    """TURN 异常换手(LWZ 2022 中国最强特征族):ln(近月均换手 / 之前一年均换手)。
+
+    比率剥掉个股常态换手水平(小盘天生高换手),只留"最近异常活跃"的情绪信号;
+    ln 使倍增/减半对称。历史不足 year+month → 全 NaN。
+    """
+    if len(turnover) < year + month:
+        return pd.Series(math.nan, index=turnover.columns, dtype=float)
+    recent = turnover.tail(month).mean()
+    base = turnover.tail(year + month).head(year).mean()
+    return np.log(recent / base.where(base > 0))
+
+
 def defer_note(n_deferred: int, defer_days: int, n_unresolved: int) -> str:
     """退出顺延的每期 surface 文案。均值只在有顺延时才有定义(n_deferred=0 而
     n_unresolved>0 的期——如全是退市终局——曾除零崩掉 fwd=10 整跑)。"""
@@ -241,6 +300,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--every", type=int, default=1,
                     help="每第 N 个月末取一个换仓日(默认1=月度)。fwd=63 配 --every 3 得"
                          "非重叠季度采样——月度采样 63 日收益强重叠,均值 t 会虚高(对抗轮点名)")
+    ap.add_argument("--candidates", action="store_true",
+                    help="加评 P1 交易行为族候选:MAX/IVOL/ILLIQ/TURN/NLIMIT(需 daily_basic/"
+                         "stk_limit 全史缓存;加载多三张面板,启动慢数分钟)。只评不入分:"
+                         "入 composite 须过准入纪律(NW t>3+成本后>0+方向稳定+年度切片)")
     a = ap.parse_args(argv)
     load_env_local()
     MOM_LB, MOM_SKIP = 250, 21   # 12-1 动量:近250日、跳最近21日
@@ -258,7 +321,9 @@ def main(argv: list[str] | None = None) -> None:
     # glob 会把重复 (trade_date, ts_code) 行读进面板,pivot_table 静默聚合改写价格);
     # assert_adj_complete:adj_factor 缺日 fail-loud,不让 NaN 复权价被 dropna 静默吞
     # (与 factor_rank/pick_track 同口径,外部 review 点名回测侧遗漏)
-    da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "open", "close"])
+    da_cols = ["ts_code", "trade_date", "open", "close"] + (
+        ["high", "amount"] if a.candidates else [])
+    da = pd.concat([pd.read_parquet(f, columns=da_cols)
                     for f in date_partition_files(CACHE, "daily")], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
                     for f in date_partition_files(CACHE, "adj_factor")], ignore_index=True)
@@ -270,6 +335,29 @@ def main(argv: list[str] | None = None) -> None:
     close_p = px.pivot_table(index="trade_date", columns="ts_code", values="aclose")
     open_p = px.pivot_table(index="trade_date", columns="ts_code", values="aopen")
 
+    # P1 候选因子的面板(仅 --candidates;窗口 月=21/年=252 与 MOM 同惯例)
+    ret_p = amt_p = to_p = touched_p = mkt = None
+    if a.candidates:
+        ret_p = close_p.pct_change()                       # 前复权日收益(aclose 面板)
+        amt_p = px.pivot_table(index="trade_date", columns="ts_code", values="amount")
+        mkt = ret_p.mean(axis=1)                           # 宇宙等权市场收益(CAPM 口径锚)
+        print("加载 turnover 面板(daily_basic 全史)…", flush=True)
+        to_files = date_partition_files(CACHE, "daily_basic")
+        to_p = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "turnover_rate"])
+                          for f in to_files], ignore_index=True).pivot_table(
+            index="trade_date", columns="ts_code", values="turnover_rate")
+        print("构建触涨停面板(stk_limit 全史)…", flush=True)
+        high_p = px.pivot_table(index="trade_date", columns="ts_code", values="high")
+        touched_rows = {}
+        for f in date_partition_files(CACHE, "stk_limit"):
+            d_ = os.path.basename(f)[:8]
+            if d_ not in high_p.index:
+                continue
+            ul = pd.read_parquet(f, columns=["ts_code", "up_limit"]).set_index("ts_code")["up_limit"]
+            hi = high_p.loc[d_]
+            touched_rows[d_] = (hi >= ul.reindex(hi.index).astype(float) - 1e-6)
+        touched_p = pd.DataFrame(touched_rows).T.sort_index()  # 行=日(bool;缺涨停价=False 由 NaN 比较)
+
     di = {d: i for i, d in enumerate(dates)}
     month_last: dict[str, str] = {}
     for d in dates:
@@ -280,6 +368,8 @@ def main(argv: list[str] | None = None) -> None:
     rebal = rebal[::max(a.every, 1)]
 
     FACTORS = ["EP", "BP", "ROE", "GP", "ACC", "MOM"]
+    if a.candidates:
+        FACTORS += ["MAX", "IVOL", "ILLIQ", "TURN", "NLIMIT"]
     print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)"
           f"{'·剔壳30%' if a.ex_shell30 else ''}…", flush=True)
     ic_rows: list[dict] = []
@@ -358,9 +448,23 @@ def main(argv: list[str] | None = None) -> None:
         raw["GP"] = (rev - cogs) / ta
         raw["ACC"] = -((ni - ocf) / ta)
         raw["MOM"] = (close_p.iloc[it - MOM_SKIP][list(idx)] / close_p.iloc[it - MOM_LB][list(idx)] - 1.0)
+        if a.candidates:
+            hist = slice(None, it + 1)
+            raw["MAX"] = max_daily_ret(ret_p.iloc[hist], 21).reindex(idx)
+            raw["IVOL"] = ivol_capm(ret_p.iloc[hist], mkt.iloc[hist], 21).reindex(idx)
+            raw["ILLIQ"] = amihud_illiq(ret_p.iloc[hist], amt_p.iloc[hist], 21).reindex(idx)
+            raw["TURN"] = turn_abnormal(to_p.reindex(dates[:it + 1]), 21, 252).reindex(idx)
+            # NLIMIT=近月(21日)触涨停次数;窗内任一日缺 stk_limit 面板行 → 该期整列 NaN
+            # (静默少数会低估计数、把彩票票伪装成安静票)
+            win_days = dates[it - 20: it + 1]
+            if all(d_ in touched_p.index for d_ in win_days):
+                raw["NLIMIT"] = touched_p.loc[win_days].sum().astype(float).reindex(idx)
+            else:
+                raw["NLIMIT"] = pd.Series(float("nan"), index=idx)
         ind = ind_all.reindex(idx).fillna("其他")
         row: dict = {"date": t, "n": len(idx), "excl_limit_up": len(locked),
                      "exit_deferred": n_deferred, "exit_unresolved": n_unresolved,
+                     "mkt_fwd": float(fwd.mean()),   # 宇宙等权前向收益(tearsheet 市场状态切片用)
                      # round_trip 成本率(2×佣金+2×滑点+印花税,PIT 分段)——上界口径:
                      # 假设月度全换手。印花税按**持有窗口末=卖出日**取段(税是卖出时缴的,
                      # 窗口跨税改日时用信号日会错扣——外部 review 点名)

@@ -258,8 +258,11 @@ def turn_abnormal(turnover: pd.DataFrame, month: int, year: int) -> pd.Series:
     """
     if len(turnover) < year + month:
         return pd.Series(math.nan, index=turnover.columns, dtype=float)
-    recent = turnover.tail(month).mean()
-    base = turnover.tail(year + month).head(year).mean()
+    # 边界强制数值化:部分缓存文件的 turnover_rate 为 object dtype(实跑踩雷),
+    # object Series 会让 np.log 崩整跑;errors="coerce" 把真垃圾变 NaN 不伪造
+    tr = turnover.apply(pd.to_numeric, errors="coerce")
+    recent = tr.tail(month).mean()
+    base = tr.tail(year + month).head(year).mean()
     return np.log(recent / base.where(base > 0))
 
 

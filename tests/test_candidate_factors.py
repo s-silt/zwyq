@@ -82,3 +82,11 @@ def test_turn_abnormal_log_ratio():
 def test_turn_abnormal_insufficient_history_nan():
     tr = pd.DataFrame({"a": [1.0] * 100})                   # 不足 252+21
     assert math.isnan(turn_abnormal(tr, month=21, year=252)["a"])
+
+
+def test_turn_abnormal_object_dtype_input():
+    # 实跑踩雷:部分缓存文件 turnover_rate 为 object dtype(混入 float 的 object 列),
+    # np.log(object Series) 直接崩整跑 → 函数边界强制数值化
+    tr = pd.DataFrame({"a": pd.array([1.0] * 252 + [2.0] * 21, dtype=object)})
+    out = turn_abnormal(tr, month=21, year=252)
+    assert abs(out["a"] - math.log(2.0)) < 1e-9

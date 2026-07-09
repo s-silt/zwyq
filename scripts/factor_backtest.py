@@ -243,6 +243,50 @@ def turn_abnormal(turnover: pd.DataFrame, month: int, year: int) -> pd.Series:
     return np.log(recent / base.where(base > 0))
 
 
+def trend_ma_distance(prices: pd.DataFrame, windows: tuple = (5, 10, 20, 50, 100, 200)) -> pd.Series:
+    """TREND(Han-Zhou-Zhu 2016 趋势因子的可检验简化):多窗口 P/MA−1 的等权平均。
+
+    用户质疑"先测再否定"后的让步测试:图形信号(金叉/KDJ)无先验维持不测,但 HZZ
+    趋势因子有文献(含中国复现)——够格过五门。窗口集 {5,10,20,50,100,200} 为 HZZ
+    文献常数;等权=无信息先验(原文横截面回归估权,估权=拟合,违反零拟合公约)。
+    历史不足最长窗 → 全 NaN。
+    """
+    if len(prices) < max(windows):
+        return pd.Series(math.nan, index=prices.columns, dtype=float)
+    last = prices.iloc[-1]
+    dist = [last / prices.tail(w).mean() - 1.0 for w in windows]
+    return pd.concat(dist, axis=1).mean(axis=1)
+
+
+def cgo_grinblatt_han(prices: pd.DataFrame, turnover_pct: pd.DataFrame, window: int = 252) -> pd.Series:
+    """CGO(Grinblatt-Han 2005 未实现盈亏):CGO=(P−RP)/P,RP=换手率衰减加权参考价。
+
+    东财 CYQ 黑箱的学术正身:RP_t = Σ_n w_n·P_{t-n} / Σ_n w_n,
+    w_n = V_{t-n}·Π_{τ=t-n+1..t-1}(1−V_τ)(V=日换手率;"n 天前买入且此后未换手"的
+    概率权重)——衰减由真实换手率决定,零拍参数。turnover_pct 为百分数口径(/100)。
+    年窗 252(GH 原文 5 年周频,日频年窗是 A 股复现惯例);全程零换手/历史不足 → NaN。
+    """
+    if len(prices) < window + 1:
+        return pd.Series(math.nan, index=prices.columns, dtype=float)
+    px = prices.tail(window + 1)
+    # 边界对齐(实跑踩雷):价格面板(daily)与换手面板(daily_basic)列集不同,
+    # broadcast 会崩;按价格列 reindex,缺换手数据的票权重全零 → 如实 NaN
+    v = (turnover_pct.reindex(index=px.index, columns=px.columns)
+         .apply(pd.to_numeric, errors="coerce") / 100.0).clip(0.0, 1.0)
+    hist_p = px.iloc[:-1].to_numpy(dtype=float)          # P_{t-window..t-1}
+    hist_v = v.iloc[:-1].fillna(0.0).to_numpy(dtype=float)
+    # 后缀存活概率:S_j = Π_{i>j}(1−V_i)(行=历史日 j,末日不含当日)
+    surv = np.flipud(np.cumprod(np.flipud(1.0 - hist_v), axis=0))
+    surv = np.vstack([surv[1:], np.ones((1, surv.shape[1]))])   # S_j 只含 j 之后各日
+    w = hist_v * surv
+    wsum = w.sum(axis=0)
+    rp = np.where(wsum > 0, (w * np.nan_to_num(hist_p)).sum(axis=0) / np.where(wsum > 0, wsum, 1.0),
+                  np.nan)
+    last = px.iloc[-1].to_numpy(dtype=float)
+    out = (last - rp) / last
+    return pd.Series(out, index=prices.columns).where(pd.Series(wsum, index=prices.columns) > 0)
+
+
 def defer_note(n_deferred: int, defer_days: int, n_unresolved: int) -> str:
     """退出顺延的每期 surface 文案。均值只在有顺延时才有定义(n_deferred=0 而
     n_unresolved>0 的期——如全是退市终局——曾除零崩掉 fwd=10 整跑)。"""
@@ -376,7 +420,7 @@ def main(argv: list[str] | None = None) -> None:
 
     FACTORS = ["EP", "BP", "ROE", "GP", "ACC", "MOM"]
     if a.candidates:
-        FACTORS += ["MAX", "IVOL", "ILLIQ", "TURN", "NLIMIT"]
+        FACTORS += ["MAX", "IVOL", "ILLIQ", "TURN", "NLIMIT", "TREND", "CGO"]
     print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)"
           f"{'·剔壳30%' if a.ex_shell30 else ''}…", flush=True)
     ic_rows: list[dict] = []
@@ -461,6 +505,10 @@ def main(argv: list[str] | None = None) -> None:
             raw["IVOL"] = ivol_capm(ret_p.iloc[hist], mkt.iloc[hist], 21).reindex(idx)
             raw["ILLIQ"] = amihud_illiq(ret_p.iloc[hist], amt_p.iloc[hist], 21).reindex(idx)
             raw["TURN"] = turn_abnormal(to_p.reindex(dates[:it + 1]), 21, 252).reindex(idx)
+            # TREND/CGO(文献口径,用户质疑"先测再否定"后的让步测试)
+            raw["TREND"] = trend_ma_distance(close_p.iloc[hist]).reindex(idx)
+            raw["CGO"] = cgo_grinblatt_han(close_p.iloc[hist], to_p.reindex(dates[:it + 1]),
+                                           252).reindex(idx)
             # NLIMIT=近月(21日)触涨停次数;窗内任一日缺 stk_limit 面板行 → 该期整列 NaN;
             # 个股级"无法判定日"(touched_row 的 NaN)→ 该股该期 NaN(不静默当 0)
             win_days = dates[it - 20: it + 1]

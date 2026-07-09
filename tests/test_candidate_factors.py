@@ -90,3 +90,59 @@ def test_turn_abnormal_object_dtype_input():
     tr = pd.DataFrame({"a": pd.array([1.0] * 252 + [2.0] * 21, dtype=object)})
     out = turn_abnormal(tr, month=21, year=252)
     assert abs(out["a"] - math.log(2.0)) < 1e-9
+
+
+# ---------- 用户质疑"先测再否定"后的让步测试:文献口径的趋势/筹码因子 ----------
+
+def test_trend_ma_distance_positive_for_uptrend():
+    # TREND(Han-Zhou-Zhu 2016 趋势因子的可检验简化):多窗口 P/MA−1 等权
+    # (窗口集 {5,10,20,50,100,200}=HZZ 文献常数;等权=无信息先验,拒绝拟合权重)
+    from scripts.factor_backtest import trend_ma_distance
+    px = pd.DataFrame({"up": [float(100 + i) for i in range(250)],
+                       "down": [float(350 - i) for i in range(250)]})
+    out = trend_ma_distance(px, windows=(5, 10, 20, 50, 100, 200))
+    assert out["up"] > 0 > out["down"]
+
+
+def test_trend_ma_distance_insufficient_history_nan():
+    from scripts.factor_backtest import trend_ma_distance
+    px = pd.DataFrame({"a": [100.0] * 150})          # 不足最长窗 200
+    assert math.isnan(trend_ma_distance(px, windows=(5, 200))["a"])
+
+
+def test_cgo_positive_when_price_above_turnover_weighted_ref():
+    # CGO(Grinblatt-Han 2005 未实现盈亏):参考价=换手率衰减加权历史价,
+    # CGO=(P−RP)/P;东财 CYQ 黑箱的学术正身,衰减权重由真实换手率决定,零拍参数
+    from scripts.factor_backtest import cgo_grinblatt_han
+    n = 260
+    px = pd.DataFrame({"win": [10.0] * (n - 60) + [float(10 + 0.1 * i) for i in range(60)]})
+    to = pd.DataFrame({"win": [1.0] * n})            # 换手 1%/日(百分数口径)
+    out = cgo_grinblatt_han(px, to, window=252)
+    assert out["win"] > 0                             # 现价高于加权成本 → 浮盈为正
+
+
+def test_cgo_zero_turnover_nan():
+    # 全程零换手 → 参考价无定义(没人换过手),NaN 不伪造
+    from scripts.factor_backtest import cgo_grinblatt_han
+    px = pd.DataFrame({"a": [10.0] * 260})
+    to = pd.DataFrame({"a": [0.0] * 260})
+    assert math.isnan(cgo_grinblatt_han(px, to, window=252)["a"])
+
+
+def test_cgo_insufficient_history_nan():
+    from scripts.factor_backtest import cgo_grinblatt_han
+    px = pd.DataFrame({"a": [10.0] * 100})
+    to = pd.DataFrame({"a": [1.0] * 100})
+    assert math.isnan(cgo_grinblatt_han(px, to, window=252)["a"])
+
+
+def test_cgo_column_mismatch_aligned_at_boundary():
+    # 实跑踩雷:价格面板(daily)与换手面板(daily_basic)列集不同(5866 vs 5788)
+    # → broadcast 崩;函数边界按价格列对齐,缺换手数据的票如实 NaN
+    from scripts.factor_backtest import cgo_grinblatt_han
+    n = 260
+    px = pd.DataFrame({"a": [10.0] * n, "b": [20.0] * n})
+    to = pd.DataFrame({"a": [1.0] * n})                  # b 无换手数据
+    out = cgo_grinblatt_han(px, to, window=252)
+    assert math.isfinite(out["a"]) or out["a"] == 0.0    # a 正常出数(平价→CGO=0)
+    assert math.isnan(out["b"])

@@ -143,6 +143,21 @@ def ivol_capm(ret: pd.DataFrame, mkt: pd.Series, window: int) -> pd.Series:
     return out.where(w.notna().sum() >= window)
 
 
+def trend_ma_distance(prices: pd.DataFrame, windows: tuple = (5, 10, 20, 50, 100, 200)) -> pd.Series:
+    """TREND(Han-Zhou-Zhu 2016 趋势因子的可检验简化):多窗口 P/MA−1 的等权平均。
+
+    用户质疑"先测再否定"后的让步测试:图形信号(金叉/KDJ)无先验维持不测,但 HZZ
+    趋势因子有文献(含中国复现)——够格过五门。窗口集 {5,10,20,50,100,200} 为 HZZ
+    文献常数;等权=无信息先验(原文横截面回归估权,估权=拟合,违反零拟合公约)。
+    历史不足最长窗 → 全 NaN。
+    """
+    if len(prices) < max(windows):
+        return pd.Series(math.nan, index=prices.columns, dtype=float)
+    last = prices.iloc[-1]
+    dist = [last / prices.tail(w).mean() - 1.0 for w in windows]
+    return pd.concat(dist, axis=1).mean(axis=1)
+
+
 def to_decile(s: pd.Series) -> pd.Series:
     """合成分 → 十分位 D1..D10(D10=最好)。只输出分桶,避免 1 分粒度伪精度。NaN 保持 NaN。
 

@@ -46,6 +46,7 @@ from ashare_gauntlet.factor_model import (
     momentum_return,
     to_decile,
     touched_limit_up,
+    trend_ma_distance,
 )
 from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
@@ -188,12 +189,14 @@ def main(argv: list[str] | None = None) -> None:
             fetch_market_day(pro, "stk_limit", d, CACHE)[["ts_code", "trade_date", "up_limit"]])
     spike_codes = set().union(*(touched_by_day[d] for d in last21[-5:]))
     nlimit_cnt = Counter(c for s in touched_by_day.values() for c in s)
-    # IVOL/MAX(IVOL 入分负向 + 两者喂 🎰):近21日前复权日收益面板,市场=宇宙等权
-    sub = px[px["trade_date"].astype(str).isin(all_days[-(IVOL_WINDOW + 1):])]
+    # IVOL/MAX/TREND 共用一张近 200 日前复权面板(200=TREND 最长窗,HZZ 文献常数):
+    # IVOL/MAX 切尾 21 日收益;TREND 用全窗价格。停牌 NaN 保持 NaN(review 第三批)
+    sub = px[px["trade_date"].astype(str).isin(all_days[-200:])]
     ac_p = sub.pivot_table(index="trade_date", columns="ts_code", values="adj_close")
-    ret_p = daily_returns(ac_p).iloc[1:]   # 停牌 NaN 保持 NaN(默认 ffill 会伪装低波,review 第三批)
+    ret_p = daily_returns(ac_p).iloc[-IVOL_WINDOW:]
     ivol_s = ivol_capm(ret_p, ret_p.mean(axis=1), IVOL_WINDOW)
     max_s = max_daily_ret(ret_p, IVOL_WINDOW)
+    trend_s = trend_ma_distance(ac_p)      # 展示列(N=149 t-5.22 反转向,不入分)
     db = fetch_market_day(pro, "daily_basic", as_of, CACHE).set_index("ts_code")  # 缓存版:全字段落盘,一份缓存服务所有下游
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry")).set_index("ts_code")
 
@@ -228,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
     df["ACC"] = (ni - ocf) / ta
     df["IVOL"] = ivol_s.reindex(idx)                 # CAPM残差月波动(入分,负向)
     df["MAX"] = max_s.reindex(idx)                   # 近月最大单日收益(🎰标签用)
+    df["TREND"] = trend_s.reindex(idx)               # 多窗口P/MA距离(展示:高=涨过头,反转向证据)
     df["NLIMIT"] = pd.Series(nlimit_cnt, dtype=float).reindex(idx).fillna(0.0)  # 无触及=0(定义性计数)
     df["spec_crowd"] = spec_crowd_flags(df["IVOL"], df["MAX"], df["NLIMIT"])
 
@@ -253,6 +257,10 @@ def main(argv: list[str] | None = None) -> None:
     df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好(展示)
     df["f_IVOL"] = factor_percentile(df["IVOL"], ind, higher_is_better=False, logmv=logmv)  # 低波=高分(入分)
     df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
+    # TREND 展示方向=原值(分位高=显著高于均线族=涨过头,判断层警惕加仓/追入);
+    # 回测证据方向为负(N=149 t-5.22 反转,多头腿+0.16%薄、与IVOL/彩票族0.38-0.45相关
+    # →不入分;CGO 与其0.81冗余淘汰,证据见 memory factor-backtest-a-share)
+    df["f_TREND"] = factor_percentile(df["TREND"], ind, higher_is_better=True, logmv=logmv)
     # 三因子等权合成 EP+BP+IVOL负向(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
     # ACC/ROE/GP/MOM 不入分(降级证据见 COMPOSITE_FACTORS 注),保留 f_ 列作展示/判断层参考。
     df["score"] = composite_score(df)
@@ -264,8 +272,8 @@ def main(argv: list[str] | None = None) -> None:
 
     os.makedirs(OUT_DIR, exist_ok=True)
     keep = ["name", "industry", "tier", "pe", "pb", "roe", "mv", "decile", "score",
-            "f_EP", "f_BP", "f_IVOL", "f_ROE", "f_GPOA", "f_ACC", "f_MOM",
-            "IVOL", "MAX", "NLIMIT", "spec_crowd", "MOM", "ret5", "last", "dma20",
+            "f_EP", "f_BP", "f_IVOL", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "f_TREND",
+            "IVOL", "MAX", "NLIMIT", "TREND", "spec_crowd", "MOM", "ret5", "last", "dma20",
             "spike_limit"]
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)

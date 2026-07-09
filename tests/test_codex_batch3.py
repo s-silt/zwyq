@@ -104,3 +104,11 @@ def test_parse_tencent_quote_junk_numeric_field_skips_line():
     junk = ('v_sz000589="1~贵州轮胎~000589~--~4.30~4.28' + "~x" * 26 + '~--~~~";')
     q = parse_tencent_quote(good + "\n" + junk)
     assert "600875.SH" in q and "000589.SZ" not in q
+
+
+def test_trend_shared_between_production_and_backtest():
+    # TREND 升展示列(用户批准):生产/回测共用同一实现(ivol_capm 先例),
+    # 从 factor_model 导入;factor_backtest 保持 re-export 兼容
+    from ashare_gauntlet.factor_model import trend_ma_distance as fm_trend
+    from scripts.factor_backtest import trend_ma_distance as bt_trend
+    assert fm_trend is bt_trend

@@ -70,3 +70,28 @@ def test_alert_band_hit():
 
 def test_alert_no_stop_no_band_is_ok():
     assert alert_level(last=5.0, stop=None, warn_dist=0.03) == "OK"
+
+
+# ---------- stock-sdk 对比审查吸纳(2026-07-09):协议健壮性加固 ----------
+
+def test_parse_semicolon_separated_single_line():
+    # 腾讯响应可能单行多记录(分号分隔,无换行)——splitlines 解析会串字段;
+    # 改正则提取后两种物理格式都要通(stock-sdk parser.ts 同款语义)
+    one_line = SAMPLE.rstrip() + 'v_sz000589="1~贵州轮胎~000589~4.27~4.30~4.28' + "~x" * 26 + '~-0.70~~~";'
+    q = parse_tencent_quote(one_line)
+    assert set(q) == {"600875.SH", "000589.SZ"}
+
+
+def test_parse_ignores_pv_none_match():
+    # v_pv_none_match 空壳行(请求了不存在的符号时腾讯返回)不得混入结果
+    q = parse_tencent_quote(SAMPLE + '\nv_pv_none_match="1";')
+    assert set(q) == {"600875.SH"}
+
+
+def test_fetch_chunking_merges_batches():
+    # 批量上限切片(stock-sdk MAX_BATCH_SIZE=500;URL 超长会脆断)——注入 fetcher 验证合并
+    from ashare_gauntlet.intraday import chunked
+    codes = [f"c{i}" for i in range(1201)]
+    batches = list(chunked(codes, 500))
+    assert [len(b) for b in batches] == [500, 500, 201]
+    assert sum(batches, []) == codes

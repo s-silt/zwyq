@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> None:
                           + ("  ← 按纪律执行" if lvl == "BREACH" else "")))
     for w in watch:
         r = q.get(w["ts_code"])
-        if r is None:
+        if r is None:   # 缺行情同样 surface(退市/符号错/字段异常'--'),不静默跳过
+            rows.append((1, f"⚠ {w['name']} [观察] 无行情返回(符号/停牌/退市?)"))
             continue
         band = (w["band_low"], w["band_high"]) if w.get("band_low") is not None else None
         lvl = alert_level(r["last"], None, a.warn_dist, band=band)

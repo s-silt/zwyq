@@ -11,9 +11,23 @@ v_sh600875="1~东方电气~600875~现价~昨收~今开~...~涨跌幅[32]~...";
 """
 from __future__ import annotations
 
+import re
+import urllib.parse
 import urllib.request
+from itertools import islice
+from typing import Iterator
 
 _FIELD_NAME, _FIELD_CODE, _FIELD_LAST, _FIELD_PREV, _FIELD_PCT = 1, 2, 3, 4, 32
+_RECORD = re.compile(r'v_(\w+)="([^"]*)"')   # 记录级正则:换行/分号两种物理分隔都覆盖
+# 单批符号上限(stock-sdk MAX_BATCH_SIZE 同款;URL 超长脆断的操作参数,非评分常数)
+BATCH = 500
+
+
+def chunked(items: list, size: int) -> "Iterator[list]":
+    """列表按 size 切片(批量请求用)。"""
+    it = iter(items)
+    while batch := list(islice(it, size)):
+        yield batch
 
 
 def tencent_symbol(ts_code: str) -> str:
@@ -33,12 +47,9 @@ def parse_tencent_quote(text: str) -> dict[str, dict]:
     垃圾行(v_pv_none 等空值行)跳过。
     """
     out: dict[str, dict] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("v_") or '="' not in line:
-            continue
-        sym = line[2:line.index('="')]
-        body = line[line.index('="') + 2:].rstrip('";')
+    for sym, body in _RECORD.findall(text):
+        # 正则按记录提取(stock-sdk parser 同语义):单行多记录(分号分隔)不再串字段;
+        # v_pv_none_match 空壳(请求了不存在的符号)与非沪深前缀在此过滤
         parts = body.split("~")
         if len(parts) <= _FIELD_PCT or not parts[_FIELD_LAST]:
             continue
@@ -59,12 +70,19 @@ def parse_tencent_quote(text: str) -> dict[str, dict]:
 
 
 def fetch_quotes(ts_codes: list[str], timeout: float = 10.0) -> dict[str, dict]:
-    """批量拉实时价(一次 GET)。网络失败向上抛(操作工具,fail-loud 由调用方重试)。"""
-    syms = ",".join(tencent_symbol(c) for c in ts_codes)
-    req = urllib.request.Request(f"http://qt.gtimg.cn/q={syms}",
-                                 headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return parse_tencent_quote(resp.read().decode("gbk", errors="replace"))
+    """批量拉实时价(HTTPS+URL encode+超上限自动切片)。网络失败向上抛(调用方重试)。
+
+    缺失票(请求了但响应无该记录:退市/符号错/字段异常'--')**不在返回 dict 里**,
+    由调用方逐票 surface(intraday_watch 对持仓打 ⚠)——静默遗漏是哨兵最危险的失败模式。
+    """
+    out: dict[str, dict] = {}
+    for batch in chunked(ts_codes, BATCH):
+        syms = urllib.parse.quote(",".join(tencent_symbol(c) for c in batch), safe=",")
+        req = urllib.request.Request(f"https://qt.gtimg.cn/q={syms}",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            out.update(parse_tencent_quote(resp.read().decode("gbk", errors="replace")))
+    return out
 
 
 def alert_level(last: float, stop: "float | None", warn_dist: float,

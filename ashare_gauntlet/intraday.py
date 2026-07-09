@@ -44,13 +44,15 @@ def parse_tencent_quote(text: str) -> dict[str, dict]:
             continue
         if sym[:2] not in ("sh", "sz"):
             continue
-        ts_code = f"{parts[_FIELD_CODE]}.{sym[:2].upper()}"
-        out[ts_code] = {
-            "name": parts[_FIELD_NAME],
-            "last": float(parts[_FIELD_LAST]),
-            "prev_close": float(parts[_FIELD_PREV]),
-            "pct": float(parts[_FIELD_PCT]),
-        }
+        try:   # 单行字段异常('--'/空串)跳过该行,不崩整批(哨兵要报出其余持仓)
+            out[f"{parts[_FIELD_CODE]}.{sym[:2].upper()}"] = {
+                "name": parts[_FIELD_NAME],
+                "last": float(parts[_FIELD_LAST]),
+                "prev_close": float(parts[_FIELD_PREV]),
+                "pct": float(parts[_FIELD_PCT]),
+            }
+        except ValueError:
+            continue
     if not out:
         raise ValueError("腾讯行情响应无有效行——接口异常或符号全错,拒绝静默当作无行情")
     return out

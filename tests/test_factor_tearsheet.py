@@ -49,20 +49,25 @@ def test_state_split_up_down():
 
 def test_admission_verdict_all_gates():
     ok, reasons = admission_verdict(full_t=3.5, real_net=0.002,
-                                    loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=0.02)
+                                    loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=0.02,
+                                    leg_net=0.001)
     assert ok and reasons == []
-    # 任一门不过 → 拒绝并给出理由
+    # 任一门不过 → 拒绝并给出理由(第五门=多头腿净,见 test_codex_batch3)
     bad, reasons = admission_verdict(full_t=2.5, real_net=0.002,
-                                     loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=0.02)
+                                     loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=0.02,
+                                     leg_net=0.001)
     assert not bad and any("t>3" in r for r in reasons)
     bad, reasons = admission_verdict(full_t=3.5, real_net=-0.001,
-                                     loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=0.02)
+                                     loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=0.02,
+                                     leg_net=0.001)
     assert not bad and any("真实净" in r for r in reasons)
     bad, reasons = admission_verdict(full_t=3.5, real_net=0.002,
-                                     loyo={"2020": 3.1, "2021": -0.4}, up_ic=0.03, down_ic=0.02)
+                                     loyo={"2020": 3.1, "2021": -0.4}, up_ic=0.03, down_ic=0.02,
+                                     leg_net=0.001)
     assert not bad and any("LOYO" in r for r in reasons)
     bad, reasons = admission_verdict(full_t=3.5, real_net=0.002,
-                                     loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=-0.01)
+                                     loyo={"2020": 3.1, "2021": 3.4}, up_ic=0.03, down_ic=-0.01,
+                                     leg_net=0.001)
     assert not bad and any("状态" in r for r in reasons)
 
 

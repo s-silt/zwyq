@@ -61,10 +61,27 @@ def tradable_real_net(res: pd.DataFrame, fac: str) -> float:
     return float(net.dropna().mean())
 
 
-def admission_verdict(full_t: float, real_net: float, loyo: dict[str, float],
-                      up_ic: float, down_ic: float) -> tuple[bool, list[str]]:
-    """入 composite 准入判定:四门全过 → (True, []);否则 (False, 未过理由)。
+def long_leg_net(res: pd.DataFrame, fac: str) -> float:
+    """可交易向**多头腿**成本后超额:sign(IC)选腿(QHI/QLO)与对应腿换手(TOHI/TOLO)。
 
+    两处口径修正(review 第三批 P1):①多头腿成本必须用**对应腿**的 τ——低腿换手 10%/
+    高腿 90% 时用两腿平均 50% 扣会错估纯多头可拿收益;②该值升格为准入第五门
+    (MOM 教训:过四门但多头腿 -0.28%,'腿分解为准入必查'写了要执行)。
+    旧明细无逐腿 τ 列时回退 TO_(均值,标注保守偏差方向不定)。
+    """
+    ic_mean = res["IC_" + fac].dropna().mean()
+    sign = 1.0 if ic_mean >= 0 else -1.0
+    leg = res[("QHI_" if sign > 0 else "QLO_") + fac]
+    to_col = ("TOHI_" if sign > 0 else "TOLO_") + fac
+    tau = res[to_col] if to_col in res.columns else res["TO_" + fac]
+    return float((leg - res["mkt_fwd"] - tau * res["cost_rt"]).dropna().mean())
+
+
+def admission_verdict(full_t: float, real_net: float, loyo: dict[str, float],
+                      up_ic: float, down_ic: float, leg_net: float) -> tuple[bool, list[str]]:
+    """入 composite 准入判定:**五门**全过 → (True, []);否则 (False, 未过理由)。
+
+    第五门=可交易向多头腿成本后>0(纯多头产品的命门,MOM 教训后升格为门)。
     仅适用**入分因子**;治理雷/流动性警示/人工复核标签不适用此线(对抗轮划定:
     风控信号的价值不在预测收益,用收益 t 值门槛会误杀)。
     """
@@ -79,6 +96,8 @@ def admission_verdict(full_t: float, real_net: float, loyo: dict[str, float],
         reasons.append("LOYO 未过(存在变号折或 |t|≤2 折=单一年份引擎/时间不稳)")
     if not (up_ic * down_ic > 0):
         reasons.append(f"市场状态未过(涨市 {up_ic:+.3f} vs 跌市 {down_ic:+.3f} 变号)")
+    if not leg_net > 0:
+        reasons.append(f"多头腿成本后>0 未过({leg_net * 100:+.2f}%/期,纯多头拿不到)")
     return not reasons, reasons
 
 
@@ -88,7 +107,7 @@ def main() -> None:
         raise SystemExit("明细缺 mkt_fwd 列——先用新版 factor_backtest 重跑产出")
     facs = sorted(c[3:] for c in res.columns if c.startswith("IC_"))
     print(f"=== 因子 tear-sheet(N={len(res)},{res['date'].min()}→{res['date'].max()};"
-          f"准入线=NW t>3+真实净>0+LOYO 同号过2+涨跌市同号)===")
+          f"准入五门=NW t>3+真实净>0+LOYO 同号过2+涨跌市同号+多头腿净>0)===")
     for fac in facs:
         ic = res["IC_" + fac].dropna()
         if ic.empty:
@@ -98,22 +117,22 @@ def main() -> None:
         real_net = tradable_real_net(res, fac) if "TO_" + fac in res.columns else float("nan")
         loyo = loyo_tstats(res, "IC_" + fac)
         up_ic, down_ic = state_split(res, "IC_" + fac)
-        ok, reasons = admission_verdict(full_t, real_net, loyo, up_ic, down_ic)
+        has_leg = "QLO_" + fac in res.columns
+        leg_net = long_leg_net(res, fac) if has_leg else float("nan")
+        ok, reasons = admission_verdict(full_t, real_net, loyo, up_ic, down_ic, leg_net)
         worst_year = min(loyo, key=lambda k: abs(loyo[k]))
         print(f"\n◆ {fac}: IC {ic.mean():+.3f} | NW t {full_t:+.2f} | 可交易向真实净 {real_net * 100:+.2f}%/期"
               f" | 涨市 {up_ic:+.3f}/跌市 {down_ic:+.3f}"
               f" | LOYO 最弱折 {worst_year}(t {loyo[worst_year]:+.2f})")
-        # 腿分解(纯多头命门):可交易向多头腿 − 宇宙等权,再扣 τ×成本——spread 靠空头腿
-        # 撑的因子在这里现形(散户做不了空,拿不到那一半)
-        if "QLO_" + fac in res.columns and "mkt_fwd" in res.columns:
+        # 腿分解(纯多头命门):多头腿 − 宇宙等权 − **对应腿** τ×成本(第五门输入)
+        if has_leg:
             sign = 1.0 if ic.mean() >= 0 else -1.0
             leg = res["QHI_" + fac] if sign > 0 else res["QLO_" + fac]
             leg_ex = (leg - res["mkt_fwd"]).dropna().mean()
-            leg_net = (leg - res["mkt_fwd"] - res["TO_" + fac] * res["cost_rt"]).dropna().mean()
             print(f"  多头腿 vs 宇宙: 超额 {leg_ex * 100:+.2f}%/期,成本后 {leg_net * 100:+.2f}%/期"
                   f"(spread 的多头腿贡献占比 {leg_ex / abs(res['SPR_' + fac].dropna().mean()) * 100:.0f}%)")
         print("  LOYO: " + " ".join(f"{y}:{t:+.1f}" for y, t in loyo.items()))
-        print(f"  准入: {'✅ 过四门(可提入分讨论)' if ok else '❌ ' + ';'.join(reasons)}")
+        print(f"  准入: {'✅ 过五门(可提入分讨论)' if ok else '❌ ' + ';'.join(reasons)}")
     print("\n(准入仅适用入分因子;风控/治理标签不适用此线。终判永远人工。)")
 
 

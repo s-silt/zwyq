@@ -39,6 +39,7 @@ from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_f
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import (
     composite,
+    daily_returns,
     factor_percentile,
     ivol_capm,
     max_daily_ret,
@@ -190,7 +191,7 @@ def main(argv: list[str] | None = None) -> None:
     # IVOL/MAX(IVOL 入分负向 + 两者喂 🎰):近21日前复权日收益面板,市场=宇宙等权
     sub = px[px["trade_date"].astype(str).isin(all_days[-(IVOL_WINDOW + 1):])]
     ac_p = sub.pivot_table(index="trade_date", columns="ts_code", values="adj_close")
-    ret_p = ac_p.pct_change().iloc[1:]
+    ret_p = daily_returns(ac_p).iloc[1:]   # 停牌 NaN 保持 NaN(默认 ffill 会伪装低波,review 第三批)
     ivol_s = ivol_capm(ret_p, ret_p.mean(axis=1), IVOL_WINDOW)
     max_s = max_daily_ret(ret_p, IVOL_WINDOW)
     db = fetch_market_day(pro, "daily_basic", as_of, CACHE).set_index("ts_code")  # 缓存版:全字段落盘,一份缓存服务所有下游
@@ -252,7 +253,7 @@ def main(argv: list[str] | None = None) -> None:
     df["f_ACC"] = factor_percentile(df["ACC"], ind, higher_is_better=False, logmv=logmv)  # 应计越低越好(展示)
     df["f_IVOL"] = factor_percentile(df["IVOL"], ind, higher_is_better=False, logmv=logmv)  # 低波=高分(入分)
     df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
-    # 双因子等权合成 EP+BP(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
+    # 三因子等权合成 EP+BP+IVOL负向(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
     # ACC/ROE/GP/MOM 不入分(降级证据见 COMPOSITE_FACTORS 注),保留 f_ 列作展示/判断层参考。
     df["score"] = composite_score(df)
     df["decile"] = to_decile(df["score"])

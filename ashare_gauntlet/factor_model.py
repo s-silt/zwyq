@@ -94,6 +94,17 @@ def momentum_return(adj_close: pd.Series, lookback: int = 120) -> float | None:
     return float(s.iloc[-1] / s.iloc[-1 - lookback] - 1.0)
 
 
+def daily_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """价格面板 → 日收益面板,**停牌 NaN 保持 NaN**(fill_method=None)。
+
+    pct_change 默认前值填充会把停牌日变成 0% 收益——停牌/流动性差的股票被伪装成
+    低波动票,在 IVOL(负向入分)里拿高分混进 composite(外部 review 第三批点名)。
+    复牌日收益(跨停牌区间)同样 NaN 不伪造:那不是一天的收益。
+    生产(factor_rank)与回测(factor_backtest)共用,同一数学对象。
+    """
+    return prices.pct_change(fill_method=None)
+
+
 def max_daily_ret(ret: pd.DataFrame, window: int) -> pd.Series:
     """MAX(Bali-Cakici-Whitelaw 2011 彩票需求):近 window 日最大单日收益。
 
@@ -124,7 +135,12 @@ def ivol_capm(ret: pd.DataFrame, mkt: pd.Series, window: int) -> pd.Series:
         return pd.Series(math.nan, index=ret.columns, dtype=float)
     beta = w.sub(w.mean()).mul(mc, axis=0).sum() / denom
     resid = w.sub(w.mean()) - pd.DataFrame(np.outer(mc, beta), columns=w.columns)
-    return resid.std()
+    out = resid.std()
+    # 单股有效样本门槛(外部 review 第三批):面板总长够但个股只有零星有效收益
+    # (新股/长停牌)时,少量点的"低波"会绕过入池门槛——有效收益数 < window 的列
+    # 一律 NaN(全窗口要求=与"每只入榜票的 score 是同一数学对象"的门槛原则一致;
+    # 2020 后监管已限制随意停牌,窗内缺日在当代样本中罕见,历史样本宁缺毋伪)。
+    return out.where(w.notna().sum() >= window)
 
 
 def to_decile(s: pd.Series) -> pd.Series:

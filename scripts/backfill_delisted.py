@@ -36,6 +36,15 @@ VIP = {"income": "income_vip", "balancesheet": "balancesheet_vip",
 FIRST_PERIOD = "20121231"   # 回测首个换仓日(2014-01)的 PIT 尾部所需最早报告期
 
 
+def require_nonempty(df: pd.DataFrame, endpoint: str, period: str) -> pd.DataFrame:
+    """VIP 按期核心表空结果 fail-loud(review 第三批 P1):瞬时空拉一旦经 read_or_fetch
+    落盘,空 parquet 会永久命中缓存挡住重拉——四张财务表按期必非空(全市场一个报告期
+    不可能零行),空=源侧异常,拒绝缓存。"""
+    if df.empty:
+        raise RuntimeError(f"{endpoint} period={period} 返回空——源侧异常,拒绝缓存空页(重跑重试)")
+    return df
+
+
 def fetch_all_pages(page: Callable[[int, int], pd.DataFrame], limit: int = PAGE) -> pd.DataFrame:
     """limit/offset 分页拉全:末页行数 < limit 即停;首页即空返回空表。"""
     out: list[pd.DataFrame] = []
@@ -95,15 +104,15 @@ def main() -> None:
         for p in periods:
             raw = read_or_fetch(
                 Path(CACHE) / ep / f"{p}.parquet",
-                lambda e=ep, pp=p: fetch_all_pages(
+                lambda e=ep, pp=p: require_nonempty(fetch_all_pages(
                     lambda limit, offset: call_with_retry(
-                        lambda: getattr(pro, e)(period=pp, limit=limit, offset=offset))))
-            if not raw.empty:
-                chunks.append(raw[raw["ts_code"].astype(str).isin(gone)])
+                        lambda: getattr(pro, e)(period=pp, limit=limit, offset=offset))), e, pp))
+            if raw.empty:   # 历史遗留空缓存(加固前落盘)同样拒绝服务
+                raise SystemExit(f"{ep}/{p}.parquet 是空缓存——删除该文件后重跑")
+            chunks.append(raw[raw["ts_code"].astype(str).isin(gone)])
         rows = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         if rows.empty:
-            print(f"  {table}: vip 全期无退市股行(异常,人工核查)", flush=True)
-            continue
+            raise SystemExit(f"{table}: vip 全期无退市股行——与 279 只退市名单矛盾,源侧异常")
         written = write_missing_symbol_tables(rows, CACHE, table)
         total_written[table] = len(written)
         print(f"  {table}: 退市股行 {len(rows)},新写 {len(written)} 只(既有跳过 "

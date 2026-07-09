@@ -51,7 +51,12 @@ from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
 from ashare_gauntlet.data.tushare_source import make_pro_api
-from ashare_gauntlet.factor_model import ivol_capm, max_daily_ret, neutralize_industry_size
+from ashare_gauntlet.factor_model import (
+    daily_returns,
+    ivol_capm,
+    max_daily_ret,
+    neutralize_industry_size,
+)
 from ashare_gauntlet.screen import board_of
 
 CACHE = "data/cache"
@@ -247,6 +252,18 @@ def defer_note(n_deferred: int, defer_days: int, n_unresolved: int) -> str:
     return f" 退出顺延{n_deferred}只({avg}未解{n_unresolved})"
 
 
+def touched_row(hi: pd.Series, ul: pd.Series) -> pd.Series:
+    """单日触涨停行(NLIMIT 面板用):1.0=触及 / 0.0=未触 / **NaN=无法判定**。
+
+    无法判定 = 停牌无价(hi NaN)或个券缺规则价(ul 缺行)。此前缺 up_limit 被
+    NaN 比较静默判 False——回测把"缺数据"当"没涨停",而生产 touched_limit_up 对同
+    情形 fail-loud,门禁验证的与生产使用的不是同一对象(外部 review 第三批点名)。
+    NaN 在窗口聚合处传染:窗内任一天无法判定 → 该股该期 NLIMIT 如实 NaN。
+    """
+    ul2 = ul.reindex(hi.index).astype(float)
+    return (hi >= ul2 - 1e-6).astype(float).where(hi.notna() & ul2.notna())
+
+
 def quantile_leg_means(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> "tuple[float, float]":
     """(低分位腿均收益, 高分位腿均收益)——与 quantile_spread 同分组约定(rank first+qcut)。
 
@@ -327,7 +344,9 @@ def main(argv: list[str] | None = None) -> None:
     # P1 候选因子的面板(仅 --candidates;窗口 月=21/年=252 与 MOM 同惯例)
     ret_p = amt_p = to_p = touched_p = mkt = None
     if a.candidates:
-        ret_p = close_p.pct_change()                       # 前复权日收益(aclose 面板)
+        # 停牌 NaN 保持 NaN(daily_returns,fill_method=None):默认 ffill 会把停牌日
+        # 变 0% 收益,停牌股伪装成低波票在 IVOL 拿高分(review 第三批 P1)
+        ret_p = daily_returns(close_p)
         amt_p = px.pivot_table(index="trade_date", columns="ts_code", values="amount")
         mkt = ret_p.mean(axis=1)                           # 宇宙等权市场收益(CAPM 口径锚)
         print("加载 turnover 面板(daily_basic 全史)…", flush=True)
@@ -343,9 +362,8 @@ def main(argv: list[str] | None = None) -> None:
             if d_ not in high_p.index:
                 continue
             ul = pd.read_parquet(f, columns=["ts_code", "up_limit"]).set_index("ts_code")["up_limit"]
-            hi = high_p.loc[d_]
-            touched_rows[d_] = (hi >= ul.reindex(hi.index).astype(float) - 1e-6)
-        touched_p = pd.DataFrame(touched_rows).T.sort_index()  # 行=日(bool;缺涨停价=False 由 NaN 比较)
+            touched_rows[d_] = touched_row(high_p.loc[d_], ul)
+        touched_p = pd.DataFrame(touched_rows).T.sort_index()  # 行=日(1/0/NaN=无法判定)
 
     di = {d: i for i, d in enumerate(dates)}
     month_last: dict[str, str] = {}
@@ -443,11 +461,14 @@ def main(argv: list[str] | None = None) -> None:
             raw["IVOL"] = ivol_capm(ret_p.iloc[hist], mkt.iloc[hist], 21).reindex(idx)
             raw["ILLIQ"] = amihud_illiq(ret_p.iloc[hist], amt_p.iloc[hist], 21).reindex(idx)
             raw["TURN"] = turn_abnormal(to_p.reindex(dates[:it + 1]), 21, 252).reindex(idx)
-            # NLIMIT=近月(21日)触涨停次数;窗内任一日缺 stk_limit 面板行 → 该期整列 NaN
-            # (静默少数会低估计数、把彩票票伪装成安静票)
+            # NLIMIT=近月(21日)触涨停次数;窗内任一日缺 stk_limit 面板行 → 该期整列 NaN;
+            # 个股级"无法判定日"(touched_row 的 NaN)→ 该股该期 NaN(不静默当 0)
             win_days = dates[it - 20: it + 1]
             if all(d_ in touched_p.index for d_ in win_days):
-                raw["NLIMIT"] = touched_p.loc[win_days].sum().astype(float).reindex(idx)
+                sub = touched_p.loc[win_days]
+                nl = sub.sum().astype(float)
+                nl[sub.isna().any()] = float("nan")
+                raw["NLIMIT"] = nl.reindex(idx)
             else:
                 raw["NLIMIT"] = pd.Series(float("nan"), index=idx)
         ind = ind_all.reindex(idx).fillna("其他")
@@ -466,11 +487,16 @@ def main(argv: list[str] | None = None) -> None:
             row["IC_" + fac] = information_coefficient(neu_df[fac], fwd)
             row["SPR_" + fac] = quantile_spread(neu_df[fac], fwd, 5)
             row["QLO_" + fac], row["QHI_" + fac] = quantile_leg_means(neu_df[fac], fwd, 5)
-            # 真实换手折扣(P0②):τ=两腿平均换手,真实成本≈τ×round_trip(全换手上界的替代)
-            low, high = quantile_legs(neu_df[fac], 5)
+            # 真实换手折扣(P0②):腿成员只含**可执行**股(入场日有价;entry NaN=买不到,
+            # 进腿集合会让换手口径与实际组合脱节——review 第三批 P2);逐腿 τ 分存
+            # (TOLO/TOHI:多头腿成本要用对应腿的 τ,两腿平均会错估——第三批 P1)
+            low, high = quantile_legs(neu_df[fac][fwd.notna()], 5)
             pl = prev_legs.get(fac)
-            row["TO_" + fac] = float(pd.Series([leg_turnover(pl[0] if pl else None, low),
-                                                leg_turnover(pl[1] if pl else None, high)]).mean())
+            tol = leg_turnover(pl[0] if pl else None, low)
+            toh = leg_turnover(pl[1] if pl else None, high)
+            row["TOLO_" + fac] = tol
+            row["TOHI_" + fac] = toh
+            row["TO_" + fac] = float(pd.Series([tol, toh]).mean())
             prev_legs[fac] = (low, high)
         c = neu_df.corr(method="spearman")
         # 逐单元格 skipna 累计:某期某因子全缺 → 该期该行/列 NaN,直接相加会把 NaN

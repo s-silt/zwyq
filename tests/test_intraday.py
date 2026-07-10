@@ -95,3 +95,87 @@ def test_fetch_chunking_merges_batches():
     batches = list(chunked(codes, 500))
     assert [len(b) for b in batches] == [500, 500, 201]
     assert sum(batches, []) == codes
+
+
+# ---------- 止盈提醒 + 定时任务去重(2026-07-10 用户批准) ----------
+
+def test_alert_profit_when_above_tp():
+    # 长线 +25% 减半锁利(既有约定):现价≥tp → PROFIT;止损类警报优先级更高
+    assert alert_level(last=12.6, stop=10.0, warn_dist=0.03, tp=12.5) == "PROFIT"
+    assert alert_level(last=12.4, stop=10.0, warn_dist=0.03, tp=12.5) == "OK"
+    assert alert_level(last=10.2, stop=10.0, warn_dist=0.03, tp=12.5) == "NEAR"  # 止损优先
+
+
+def test_sentinel_state_namespaced_keys_no_collision():
+    # 设计审查[高]:众兴同时在持仓与观察名单,ts_code 裸键互相覆盖 → pos:/watch: 命名空间
+    from ashare_gauntlet.intraday import sentinel_delta
+    cur = {"pos:002772.SZ": "NEAR", "watch:002772.SZ": "BAND"}
+    report, cleared, state = sentinel_delta({}, cur, "20260710")
+    assert set(report) == {"pos:002772.SZ", "watch:002772.SZ"}   # 两条独立警报都报
+
+
+def test_sentinel_breach_latch_no_oscillation_spam():
+    # 设计审查[高]:BREACH→NEAR→BREACH 震荡不得反复轰炸——当日已报最高级封存(latch)
+    from ashare_gauntlet.intraday import sentinel_delta
+    _, _, st = sentinel_delta({}, {"pos:a": "BREACH"}, "20260710")            # 首报 BREACH
+    r2, _, st = sentinel_delta(st, {"pos:a": "NEAR"}, "20260710")             # 回到 NEAR:静默
+    assert r2 == []
+    r3, _, st = sentinel_delta(st, {"pos:a": "BREACH"}, "20260710")           # 再破线:仍静默(已 latch)
+    assert r3 == []
+
+
+def test_sentinel_breach_clear_reported_once():
+    # 设计审查[中]:BREACH 解除要报一次(信息缺口),但只报一次
+    from ashare_gauntlet.intraday import sentinel_delta
+    _, _, st = sentinel_delta({}, {"pos:a": "BREACH"}, "20260710")
+    r, cleared, st = sentinel_delta(st, {"pos:a": "OK"}, "20260710")
+    assert cleared == ["pos:a"]
+    _, cleared2, st = sentinel_delta(st, {"pos:a": "OK"}, "20260710")
+    assert cleared2 == []                                                     # 不重复报解除
+
+
+def test_sentinel_new_day_resets_state():
+    # 跨交易日状态重置:昨日 latch 不带入今天(PROFIT/BREACH 每日至多一报)
+    from ashare_gauntlet.intraday import sentinel_delta
+    _, _, st = sentinel_delta({}, {"pos:a": "PROFIT"}, "20260710")
+    r, _, st = sentinel_delta(st, {"pos:a": "PROFIT"}, "20260713")            # 新交易日
+    assert r == ["pos:a"]
+
+
+def test_sentinel_fingerprint_change_resets_key():
+    # 设计审查[中]:持仓指纹(股数@成本@止损)变化 → 该键状态重置(卖出再买不继承旧 latch)
+    from ashare_gauntlet.intraday import sentinel_delta
+    _, _, st = sentinel_delta({}, {"pos:a": "BREACH"}, "20260710", fps={"pos:a": "800@10.5@10"})
+    r, _, st = sentinel_delta(st, {"pos:a": "BREACH"}, "20260710", fps={"pos:a": "500@9.8@9.2"})
+    assert r == ["pos:a"]                                                     # 新仓,重新报
+
+
+# ---------- 实现审查修复(Codex 哨兵批):解除语义/重破线/合成键 ----------
+
+def test_sentinel_breach_to_profit_also_clears():
+    # P1:BREACH→PROFIT(如止损线下方反弹直接冲过止盈线)也算解除,不只 OK
+    from ashare_gauntlet.intraday import sentinel_delta
+    _, _, st = sentinel_delta({}, {"pos:a": "BREACH"}, "20260710")
+    _, cleared, st = sentinel_delta(st, {"pos:a": "PROFIT"}, "20260710")
+    assert cleared == ["pos:a"]
+
+
+def test_sentinel_rebreach_after_clear_reports_again():
+    # P1:解除后同日再破线必须重报——用户最后看到的是"安全",再破线静默=危险漏报
+    from ashare_gauntlet.intraday import sentinel_delta
+    _, _, st = sentinel_delta({}, {"pos:a": "BREACH"}, "20260710")
+    _, _, st = sentinel_delta(st, {"pos:a": "OK"}, "20260710")        # 解除
+    r, _, st = sentinel_delta(st, {"pos:a": "BREACH"}, "20260710")    # 再破线
+    assert r == ["pos:a"]
+    r2, _, st = sentinel_delta(st, {"pos:a": "BREACH"}, "20260710")   # 再 latch,不轰炸
+    assert r2 == []
+
+
+def test_sentinel_synthetic_meta_keys_report_once_daily():
+    # P1:持仓陈旧/缺行情作为合成键走状态机——每日一报,不随价格警报静默而丢失
+    from ashare_gauntlet.intraday import sentinel_delta
+    cur = {"meta:holdings_stale": "NEAR", "miss:600999.SH": "NEAR"}
+    r, _, st = sentinel_delta({}, cur, "20260710")
+    assert set(r) == set(cur)
+    r2, _, st = sentinel_delta(st, cur, "20260710")
+    assert r2 == []                                                    # 同日不重复

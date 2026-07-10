@@ -86,17 +86,69 @@ def fetch_quotes(ts_codes: list[str], timeout: float = 10.0) -> dict[str, dict]:
 
 
 def alert_level(last: float, stop: "float | None", warn_dist: float,
-                band: "tuple[float, float] | None" = None) -> str:
-    """警报分级:BREACH(≤止损)> NEAR(距止损<warn_dist)> BAND(触发带命中)> OK。
+                band: "tuple[float, float] | None" = None,
+                tp: "float | None" = None) -> str:
+    """警报分级:BREACH(≤止损)> NEAR(距止损<warn_dist)> PROFIT(≥止盈提示线)
+    > BAND(触发带命中)> OK。
 
-    warn_dist 是操作性提醒参数(CLI 可调,默认见调用方),非评分常数;
-    band=观察名单的买入触发带 [low, high],命中报 BAND。
+    warn_dist 是操作性提醒参数(CLI 可调),非评分常数;band=观察名单买入触发带;
+    tp=止盈提示线(长线=成本×1.25,出处:双仓制"+25% 减半锁利"既有约定)——
+    提示减半锁利而非清仓,与"财报季持有"不冲突;止损类警报优先(风险先于收益)。
     """
     if stop is not None:
         if last <= stop:
             return "BREACH"
         if last / stop - 1.0 < warn_dist:
             return "NEAR"
+    if tp is not None and last >= tp:
+        return "PROFIT"
     if band is not None and band[0] <= last <= band[1]:
         return "BAND"
     return "OK"
+
+
+_SEVERITY = {"OK": 0, "BAND": 1, "PROFIT": 2, "NEAR": 2, "BREACH": 3}
+
+
+def sentinel_delta(prev_state: dict, cur: dict[str, str], trade_date: str,
+                   fps: "dict[str, str] | None" = None) -> tuple[list, list, dict]:
+    """定时哨兵状态机(设计审查后 v2)。返回 (要报的键, 解除要报的键, 新状态)。
+
+    语义(每条对应一个设计审查发现):
+    - 键带命名空间(pos:/watch:)——同一 ts_code 在持仓与观察名单并存时不互相覆盖;
+    - **当日已报最高级封存(latch)**:BREACH↔NEAR 贴线震荡不反复轰炸,同级/降级静默;
+    - BREACH 解除(回到 OK/PROFIT/BAND)报一次并打 cleared 标,不重复;
+    - 跨交易日重置:latch 只在当日有效(PROFIT/BREACH 每日至多一报,收盘后翻篇);
+    - 持仓指纹(fps:如 股数@成本@止损)变化 → 该键重置(卖出再买不继承旧 latch)。
+    状态结构:{"date": 交易日, "keys": {key: {"max": 已报最高级, "cleared": bool, "fp": 指纹}}}。
+    """
+    fps = fps or {}
+    if prev_state.get("date") != trade_date:
+        prev_keys: dict = {}
+    else:
+        prev_keys = dict(prev_state.get("keys", {}))
+    report, cleared = [], []
+    new_keys: dict = {}
+    for key, lvl in cur.items():
+        rec = prev_keys.get(key)
+        if rec is not None and fps.get(key) is not None and rec.get("fp") not in (None, fps.get(key)):
+            rec = None                       # 指纹变化=新仓,重置
+        prev_max = rec.get("max", "OK") if rec else "OK"
+        was_cleared = rec.get("cleared", False) if rec else False
+        sev, prev_sev = _SEVERITY.get(lvl, 0), _SEVERITY.get(prev_max, 0)
+        if prev_max == "BREACH" and was_cleared and lvl == "BREACH":
+            # 解除后同日**再破线必须重报**(用户最后看到的是"安全",静默=危险漏报),
+            # 重报后重新 latch(cleared=False),贴线震荡仍只报这一次
+            report.append(key)
+            new_keys[key] = {"max": "BREACH", "cleared": False, "fp": fps.get(key)}
+        elif sev > prev_sev and sev > 0:
+            report.append(key)
+            new_keys[key] = {"max": lvl, "cleared": False, "fp": fps.get(key)}
+        elif prev_max == "BREACH" and lvl in ("OK", "PROFIT", "BAND") and not was_cleared:
+            # 解除=离开风险区(OK/PROFIT/BAND 都算,不只 OK——破线后直接反弹过止盈线同样是解除)
+            cleared.append(key)
+            new_keys[key] = {"max": prev_max, "cleared": True, "fp": fps.get(key)}
+        else:
+            new_keys[key] = {"max": prev_max if prev_sev >= sev else lvl,
+                             "cleared": was_cleared, "fp": fps.get(key)}
+    return report, cleared, {"date": trade_date, "keys": new_keys}

@@ -11,10 +11,12 @@ EP/BP/IVOL 原值 → factor_percentile(行业+市值双中性→百分位,IVOL 
 - PROD_G   :PROD 的 D10 ∩ 🟢
 - PROD_GX  :PROD_G 再剔 data/profile.json 行业(反事实:当前 profile 应用于全史)
 
-生产复刻经对抗审查对齐(2026-07-13):先滤后排(tier→剔ST→有披露财务→三因子
-全齐,再在滤后池算百分位)——先排后滤实测每期 D10 与生产对称差 ~9%。残余差异
-(诚实边界,报告尾同步打印):ST/行业=当前快照近似;打分池=入场剔涨停后的可执行
-宇宙(与单因子引擎一致);dedt TTM 构件用更正后终值(仅影响 R4)。
+生产复刻经两轮审查对齐(2026-07-13):①先滤后排(tier→剔ST→有披露财务→三因子
+全齐,再在滤后池算百分位)——先排后滤实测每期 D10 与生产对称差 ~9%;②打分在
+t 日全宇宙完成,T+1 一字涨停只从**已选成员**剔除、不重排名(评审三轮 P0-1:先剔
+后排=用 T+1 信息改写分位边界);③宇宙名录=stock_basic L+D+P 全状态(评审三轮
+P0-2:仅 L 会把后来退市的股票整段剔除,幸存者偏差回门)。残余差异(报告尾打印):
+ST=最终名称近似(namechange PIT 待补);dedt TTM 构件用更正后终值(仅影响 R4)。
 成本:round_trip(佣金+滑点+卖出日印花税 PIT 分段)× 组合真实换手 τ(首期建仓 τ=1)。
 
 Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.composite_backtest
@@ -136,10 +138,14 @@ def main(argv: list[str] | None = None) -> None:
     fdedt = fdedt.groupby("ts_code", group_keys=False)[
         ["ts_code", "end_date", "ann_date", "profit_dedt"]].apply(dedt_ttm_rows)
     pro = tushare_pro()
-    sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,industry,name")).set_index("ts_code")
+    # 宇宙名录 = L+D+P 全状态(评审三轮 P0-2:仅 list_status="L" 会把后来退市的
+    # 股票从宇宙 B 整段历史剔除——退市财务回填白做,幸存者偏差从后门回来)
+    frames = [call_with_retry(lambda s=s: pro.stock_basic(
+        list_status=s, fields="ts_code,industry,name")) for s in ("L", "D", "P")]
+    sb = pd.concat(frames, ignore_index=True).drop_duplicates("ts_code").set_index("ts_code")
     ind_all = sb["industry"].fillna("其他")
-    # ST 剔除=当前名单近似(历史逐日 ST 状态无缓存;生产 factor_rank 同用当天名称,
-    # 回测口径的残余偏差已在报告尾注明)
+    # ST 剔除=最终名称近似(历史逐日 ST 状态需 namechange PIT 面板,记为残余偏差:
+    # 后来戴帽的被错误早剔、当时戴帽后摘帽的被错误纳入;规模已在报告尾量化)
     non_st = ~sb["name"].astype(str).str.contains("ST", na=False)
 
     da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "open", "close"])
@@ -172,13 +178,16 @@ def main(argv: list[str] | None = None) -> None:
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()] if board_of(str(c)) in MAIN]
-        entry_date = dates[it + 1]
-        locked = one_word_limit_up(fetch_market_day(pro, "daily", entry_date, CACHE),
-                                   fetch_market_day(pro, "stk_limit", entry_date, CACHE), codes)
-        codes = [c for c in codes if c not in locked]
         if len(codes) < 50:
             continue
         idx = pd.Index(codes)
+        entry_date = dates[it + 1]
+        # T+1 一字涨停 = 可执行性约束,只作用于**已选组合成员**,不得进入打分宇宙
+        # (评审三轮 P0-1:生产在 t 日不知明天涨停名单;先剔后排=用 T+1 信息改写
+        # 行业中位/市值桶/分位边界,属前视)。锁定票同样剔出基准(买不进的收益不可得)
+        locked = one_word_limit_up(fetch_market_day(pro, "daily", entry_date, CACHE),
+                                   fetch_market_day(pro, "stk_limit", entry_date, CACHE), codes)
+        locked_idx = pd.Index([c for c in locked])
         # 前向收益(与引擎同):T+1 开盘 → 窗口末,退出一字跌停/停牌顺延到首个可卖开盘
         win = open_p.iloc[it + 1: it + 2 + a.fwd][codes]
         entry = win.iloc[0]
@@ -250,22 +259,28 @@ def main(argv: list[str] | None = None) -> None:
         dec_a = score_deciles(idx)              # 宇宙A:无 tier 预过滤(单调性/与单因子可比)
         if dec_a is None:
             continue
-        members["D10"] = dec_a.index[dec_a == 10]
-        row: dict = {"date": t, "mkt_fwd": float(fwd.mean()),
+        # 打分完成后才应用 T+1 可执行性:锁定票从**已选成员**与基准中剔除,排名不重算
+        # (P0-1 修复;组合语义=想买但买不进,只能少持这一只)
+        members["D10"] = dec_a.index[dec_a == 10].difference(locked_idx)
+        exec_idx = idx.difference(locked_idx)
+        row: dict = {"date": t, "mkt_fwd": float(fwd[exec_idx].mean()),
                      "cost_rt": round_trip_cost_rate(entry_date, a.commission, a.slippage,
                                                      sell_date=dates[exit_pos]),
-                     "exit_deferred": n_def, "exit_unresolved": n_unres}
+                     "exit_deferred": n_def, "exit_unresolved": n_unres,
+                     "n_locked": len(locked)}
         for q in range(1, 11):
-            m = dec_a.index[dec_a == q]
+            m = dec_a.index[dec_a == q].difference(locked_idx)
             row[f"ret_Q{q}"] = float(fwd[m].mean()) if len(m) else float("nan")
 
-        # 宇宙B:生产复刻(与 factor_rank 同序:tier 🟢🟡 + 有已披露财务 + 剔当前名单 ST)。
+        # 宇宙B:生产复刻(与 factor_rank 同序:tier 🟢🟡 + 有已披露财务 + 剔 ST[最终名称近似])。
         # 对抗审查 P1-1 实测:漏掉 has_fina/ST 时每期 D10 与生产对称差 ~9%(含 ST 票混入)
         has_fina = idx.isin(pf.index)
         sub_b = idx[tier.isin(["🟢", "🟡"]) & has_fina & non_st.reindex(idx).fillna(False)]
         dec_b = score_deciles(sub_b)
         if dec_b is not None:
             d10b = dec_b.index[dec_b == 10]
+            row["locked_in_prod"] = int(len(d10b.intersection(locked_idx)))   # 想买没买进的
+            d10b = d10b.difference(locked_idx)
             members["PROD"] = d10b
             members["PROD_G"] = pd.Index([c for c in d10b if tier[c] == "🟢"])
             members["PROD_GX"] = pd.Index([c for c in members["PROD_G"] if ind[c] not in excluded])
@@ -273,13 +288,13 @@ def main(argv: list[str] | None = None) -> None:
         # R4:同宇宙、EP→扣非 TTM 口径的对照组合 + 因子级 IC 对照(宇宙A 百分位)
         dec_d = score_deciles(sub_b, ep_col="EPD")
         if dec_d is not None:
-            members["PROD_DEDT"] = dec_d.index[dec_d == 10]
+            members["PROD_DEDT"] = dec_d.index[dec_d == 10].difference(locked_idx)
             if dec_b is not None and len(members["PROD"]):
                 row["ovl_dedt"] = len(set(members["PROD"]) & set(members["PROD_DEDT"])) / len(members["PROD"])
         row["IC_EP"] = information_coefficient(
-            factor_percentile(raw["EP"], ind, True, logmv=logmv), fwd)
+            factor_percentile(raw["EP"], ind, True, logmv=logmv)[exec_idx], fwd[exec_idx])
         row["IC_EPD"] = information_coefficient(
-            factor_percentile(raw["EPD"], ind, True, logmv=logmv), fwd)
+            factor_percentile(raw["EPD"], ind, True, logmv=logmv)[exec_idx], fwd[exec_idx])
         for p in PORTS:
             m = members.get(p)
             if m is None or not len(m):
@@ -345,11 +360,14 @@ def main(argv: list[str] | None = None) -> None:
     yr_tbl = (res["ret_PROD"] - res["mkt_fwd"] - res["TO_PROD"] * res["cost_rt"]).groupby(y)
     print("PROD 逐年净超额%(期均):" + " ".join(
         f"{yy}:{v.mean() * 100:+.2f}" for yy, v in yr_tbl))
-    print(f"退出顺延合计 {res['exit_deferred'].sum()} 次,未解(退市终局){res['exit_unresolved'].sum()} 次")
-    print("已知与生产的残余差异(对抗审查后口径):①ST/行业=当前快照近似(历史逐日名单无缓存);"
-          "②打分池=入场剔涨停后的可执行宇宙(与单因子引擎一致,生产为全池);"
-          "③退出顺延跨税改日时印花税取计划退出日段(量级趋零);"
-          "④dedt TTM 构件用更正后终值(行级近似,仅影响 R4 口径);⑤⚡🎰/dma20 展示列不入分。")
+    print(f"退出顺延合计 {res['exit_deferred'].sum()} 次,未解(退市终局){res['exit_unresolved'].sum()} 次;"
+          f"T+1 一字涨停均锁 {res['n_locked'].mean():.1f} 只/期,其中锁在 PROD 内(想买没买进)"
+          f"均 {res['locked_in_prod'].mean():.2f} 只/期")
+    print(f"已知与生产的残余差异(评审三轮后口径):①宇宙名录=L+D+P 全状态(退市股在池),"
+          f"但 ST=最终名称近似(历史逐日戴帽状态需 namechange PIT——当前按名称剔除 "
+          f"{int((~non_st).sum())} 只,双向偏差:后来戴帽的被错误早剔/摘帽的被错误纳入);"
+          f"②退出顺延跨税改日时印花税取计划退出日段(量级趋零);"
+          f"③dedt TTM 构件用更正后终值(行级近似,仅影响 R4 口径);④⚡🎰/dma20 展示列不入分。")
     print("→ 明细 data/holdscore/composite_backtest.json(已在报告前落盘)")
 
 

@@ -23,11 +23,10 @@ import os
 
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry
 from ashare_gauntlet.data.partition import date_partition_files
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.screen import board_of
+from ashare_gauntlet.config import tushare_pro
 from scripts.factor_backtest import CACHE, MAIN, _load, _pit
 
 
@@ -51,8 +50,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--every", type=int, default=6,
                     help="每第 N 个月末取一个审计点(默认6=半年;覆盖率变化缓慢,无需月度)")
     a = ap.parse_args(argv)
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     listed_now = set(call_with_retry(
         lambda: pro.stock_basic(list_status="L", fields="ts_code"))["ts_code"].astype(str))
 

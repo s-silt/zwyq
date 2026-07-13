@@ -15,22 +15,19 @@ Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.barrier_experi
 from __future__ import annotations
 
 import argparse
-import os
 
 import numpy as np
 import pandas as pd
 
 from ashare_gauntlet.backtest import newey_west_tstat
 from ashare_gauntlet.costs import round_trip_cost_rate
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import fetch_market_day
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import trend_ma_distance
 from ashare_gauntlet.screen import board_of
+from ashare_gauntlet.config import CACHE_DIR as CACHE, tushare_pro
 from scripts.factor_backtest import one_word_limit_up
 
-CACHE = "data/cache"
 MAIN = ("沪主板", "深主板")
 GRID = ((0.08, 0.05), (0.10, 0.07), (0.20, 0.10))   # (止盈,止损):双仓制参数及常见档,全报不挑
 H = 63                                               # 持有上限(季度;更长即非"短线"语境)
@@ -80,8 +77,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default=None)
     a = ap.parse_args(argv)
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
 
     cols = ["ts_code", "trade_date", "open", "high", "low", "close"]
     da = pd.concat([pd.read_parquet(f, columns=cols)

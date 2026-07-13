@@ -28,12 +28,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR as OUT_DIR
 from ashare_gauntlet.costs import round_trip_cost_rate
 from ashare_gauntlet.data.fetch import call_with_retry
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
-
-CACHE = "data/cache"
-OUT_DIR = "data/holdscore"
 
 INDEX_CODE = "000300.SH"   # 沪深300 —— 配置基准(大盘宽基,主板宇宙的自然对照)
 # regime 窗口 = 20 交易日 ≈ 一个自然月,复用代码库既有约定(pct20/ret20/reversal n=20)
@@ -208,10 +206,8 @@ def main() -> None:
     # 沪深300 日线(单文件缓存,一次拉够全区间:最早快照日 ∪ regime 窗口起点)
     regime_start = trade_days[-(REGIME_WINDOW + 1)] if len(trade_days) > REGIME_WINDOW else trade_days[0]
     idx_start = min(first_snap, regime_start)
-    from ashare_gauntlet.data.env import load_env_local
-    from ashare_gauntlet.data.tushare_source import make_pro_api
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    from ashare_gauntlet.config import tushare_pro
+    pro = tushare_pro()
     idx = load_index_daily(pro, INDEX_CODE, start_date=idx_start, end_date=latest,
                            expected_days=[d for d in trade_days if idx_start <= d <= latest])
 

@@ -25,17 +25,15 @@ from collections.abc import Mapping
 
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import (
     EmptyCoreTableError,
     TokenExpiredError,
     call_with_retry,
     fetch_symbol_table,
 )
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.screen import board_of
+from ashare_gauntlet.config import CACHE_DIR as CACHE, tushare_pro
 
-CACHE = "data/cache"
 LEAN_TABLES: tuple[str, ...] = ("fina_indicator",)
 CORE_TABLES: tuple[str, ...] = ("income", "fina_indicator", "balancesheet", "cashflow")
 FULL_TABLES: tuple[str, ...] = (
@@ -185,8 +183,7 @@ def main(argv: list[str] | None = None) -> None:
                          "两者并集整只 force 重拉(否则缓存优先=永不更新)")
     a = ap.parse_args(argv)
 
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     tables = tables_for_mode(a.mode)
 
     status = universe_status(a.universe, a.refresh)

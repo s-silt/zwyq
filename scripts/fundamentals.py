@@ -14,6 +14,7 @@ import sys
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_history, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.fundamentals import (
@@ -54,7 +55,7 @@ def _macro(pro: object, as_of: str, cache_dir: str) -> None:
     print()
 
 
-def main(codes: list[str], cache_dir: str = "data/cache") -> None:
+def main(codes: list[str], cache_dir: str = CACHE_DIR) -> None:
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
     as_of = _as_of(cache_dir)
     _macro(pro, as_of, cache_dir)

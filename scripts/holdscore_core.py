@@ -20,15 +20,13 @@ from typing import cast
 
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import market_returns
 from ashare_gauntlet.record import build_record, compute_holdscore
 from ashare_gauntlet.screen import board_of
 
-CACHE = "data/cache"
-OUT_DIR = "data/holdscore"
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR as OUT_DIR, tushare_pro
+
 MAIN = ("沪主板", "深主板")
 CORE = ("income", "fina_indicator", "balancesheet", "cashflow")
 WARN = ("forecast", "express", "share_float", "pledge_stat", "stk_holdertrade", "namechange")
@@ -75,7 +73,6 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--top", type=int, default=40)
     a = ap.parse_args(argv)
 
-    load_env_local()
     universe = core_universe(a.board)
     daily = pd.concat([pd.read_parquet(f)  # 全列:build_record 技术指标要 amount/vol/high/low
                        for f in sorted(glob.glob(f"{CACHE}/daily/*.parquet"))], ignore_index=True)
@@ -88,7 +85,7 @@ def main(argv: list[str] | None = None) -> None:
     adj_g = {str(c): g for c, g in adj.groupby("ts_code")}
     _empty = daily.iloc[:0]
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     db = fetch_market_day(pro, "daily_basic", as_of, CACHE)  # 缓存版
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry"))
     db_d = {str(r["ts_code"]): r for _, r in db.iterrows()}

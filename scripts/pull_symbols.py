@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
+from ashare_gauntlet.config import BYSTOCK_DIR
 from ashare_gauntlet.data.fetch import fetch_symbol_history
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.universe import build_universe
@@ -35,7 +36,7 @@ def _pull_one(pro: object, code: str, start: str, end: str, cache_dir: str) -> l
     return errs
 
 
-def main(start: str, end: str, cache_dir: str = "data/bystock") -> None:
+def main(start: str, end: str, cache_dir: str = BYSTOCK_DIR) -> None:
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
     fields = "ts_code,name,list_date,delist_date,list_status,market"
     parts = [pro.stock_basic(exchange="", list_status=st, fields=fields) for st in ("L", "D")]

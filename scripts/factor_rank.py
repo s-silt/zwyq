@@ -33,10 +33,9 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR as OUT_DIR, tushare_pro
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import (
     composite,
     daily_returns,
@@ -52,8 +51,6 @@ from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
 from scripts.backfill_fina import expected_min_end_date
 
-CACHE = "data/cache"
-OUT_DIR = "data/holdscore"
 MAIN = ("沪主板", "深主板")
 
 # 入分因子(证据链见 memory factor-backtest-a-share,N=149 / 2014-2026):
@@ -136,9 +133,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--industry", default=None)
     ap.add_argument("--top", type=int, default=40)
     a = ap.parse_args(argv)
-    load_env_local()
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     # 全历史日线+复权 → 前复权价(算动量 MOM / 近5日收益 / 距MA20)。
     # 走 date_partition_files:只认 ^\d{8}\.parquet$(daily/ 实际混入过整段拉取文件,
     # 直接 glob 会污染交易日历与面板,见 data.partition 模块 docstring)

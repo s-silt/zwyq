@@ -20,14 +20,12 @@ import os
 
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.record import compute_holdscore, lean_tier
 from ashare_gauntlet.screen import board_of
 
-CACHE = "data/cache"
-OUT_DIR = "data/holdscore"
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR as OUT_DIR, tushare_pro
+
 MAIN = ("沪主板", "深主板")
 FCOLS = ["ts_code", "end_date", "netprofit_yoy", "dt_netprofit_yoy", "tr_yoy", "ocfps", "roe"]
 
@@ -65,7 +63,6 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--top", type=int, default=40)
     a = ap.parse_args(argv)
 
-    load_env_local()
     fina = latest_fina()
     if a.board == "main":
         fina = fina[fina["ts_code"].apply(lambda c: board_of(str(c)) in MAIN)].reset_index(drop=True)
@@ -73,7 +70,7 @@ def main(argv: list[str] | None = None) -> None:
     daily = pd.read_parquet(sorted(glob.glob(f"{CACHE}/daily/*.parquet"))[-1])
     as_of = str(daily["trade_date"].max())
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv"))
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry"))
     pe_d = dict(zip(db["ts_code"], db["pe_ttm"]))

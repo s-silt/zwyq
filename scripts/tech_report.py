@@ -18,6 +18,7 @@ import sys
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR
 from ashare_gauntlet.factsheet import (
     NORTH_FLOW_SEMANTICS_CUTOFF,
     daily_tech_facts,
@@ -53,7 +54,7 @@ def _load(cache_dir: str, endpoint: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def main(cache_dir: str = "data/cache", watch: dict[str, str] | None = None) -> None:
+def main(cache_dir: str = CACHE_DIR, watch: dict[str, str] | None = None) -> None:
     watch = watch or DEFAULT_WATCH
     daily = _load(cache_dir, "daily")
     adj = _load(cache_dir, "adj_factor")

@@ -16,7 +16,8 @@ from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.fundamentals import balance_facts, cashflow_facts, latest_quarter, peg, receivables_ratio
 import os
 
-CACHE = "data/cache"
+from ashare_gauntlet.config import CACHE_DIR as CACHE
+
 TABLES = ("income", "fina_indicator", "balancesheet", "cashflow")
 
 

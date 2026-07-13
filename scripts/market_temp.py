@@ -44,10 +44,8 @@ def main() -> None:
                   for f in day_files[-(BASELINE_WINDOW + 1):]]
     amt = amount_ratio(amounts_yi)
 
-    from ashare_gauntlet.data.env import load_env_local
-    from ashare_gauntlet.data.tushare_source import make_pro_api
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    from ashare_gauntlet.config import tushare_pro
+    pro = tushare_pro()
 
     # ① 涨停/炸板/跌停:limit_list_d 不在 MARKET_ENDPOINTS,直接单日调用不落缓存
     #    (fetch_market_day 会把未发布日的空拉永久缓存;这里空表由 limit_counts fail-loud,

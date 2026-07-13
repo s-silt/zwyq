@@ -46,11 +46,10 @@ import numpy as np
 import pandas as pd
 
 from ashare_gauntlet.backtest import information_coefficient, newey_west_tstat, quantile_spread
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR, tushare_pro
 from ashare_gauntlet.costs import round_trip_cost_rate
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
 from ashare_gauntlet.data.partition import assert_adj_complete, date_partition_files
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factor_model import (
     daily_returns,
     ivol_capm,
@@ -60,7 +59,6 @@ from ashare_gauntlet.factor_model import (
 )
 from ashare_gauntlet.screen import board_of
 
-CACHE = "data/cache"
 MAIN = ("沪主板", "深主板")
 
 
@@ -341,7 +339,6 @@ def main(argv: list[str] | None = None) -> None:
                          "stk_limit 全史缓存;加载多三张面板,启动慢数分钟)。只评不入分:"
                          "入 composite 须过准入纪律(NW t>3+成本后>0+方向稳定+年度切片)")
     a = ap.parse_args(argv)
-    load_env_local()
     MOM_LB, MOM_SKIP = 250, 21   # 12-1 动量:近250日、跳最近21日
 
     fina = _load("fina_indicator", ["roe"])
@@ -349,7 +346,7 @@ def main(argv: list[str] | None = None) -> None:
     cf = _load("cashflow", ["n_cashflow_act"])
     bs = _load("balancesheet", ["total_assets"])
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,industry")).set_index("ts_code")
     ind_all = sb["industry"].fillna("其他")
 
@@ -568,12 +565,12 @@ def main(argv: list[str] | None = None) -> None:
         sign = "(反转)" if m < -0.02 else ""
         print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{nwlag:>5d}{spr:>+8.2f}%{net:>+7.2f}%"
               f"{to.mean():>6.0%}{real_net:>+7.2f}%{hit:>5.0f}%  {v}{sign}")
-    os.makedirs("data/holdscore", exist_ok=True)
+    os.makedirs(HOLDSCORE_DIR, exist_ok=True)
     if corr_sum is not None and corr_n:
         avg_corr = corr_sum / corr_cnt.replace(0, pd.NA)
         print(f"\n=== 因子横截面 Spearman 相关(逐期平均,N={corr_n};冗余审查:>0.65 触发合并/剔除评估)===")
         print(avg_corr.astype(float).round(2).to_string())
-    res.to_json("data/holdscore/factor_ic_backtest.json", orient="records", force_ascii=False, indent=2)
+    res.to_json(f"{HOLDSCORE_DIR}/factor_ic_backtest.json", orient="records", force_ascii=False, indent=2)
     print("→ 明细 data/holdscore/factor_ic_backtest.json")
 
 

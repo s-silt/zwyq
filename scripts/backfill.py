@@ -7,7 +7,6 @@ Idempotent: already-cached (endpoint, trade_date) pulls are skipped, so it is
 safe to re-run / resume after an interruption.
 """
 
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -15,14 +14,13 @@ from pathlib import Path
 import pandas as pd
 
 from ashare_gauntlet.data.cache import read_or_fetch
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import (
     TokenExpiredError,
     call_with_retry,
     fetch_market_day,
     trading_days_from_cal,
 )
-from ashare_gauntlet.data.tushare_source import make_pro_api
+from ashare_gauntlet.config import CACHE_DIR, tushare_pro
 
 # Co-pull all three per date together so price and 北向 are time-aligned even if
 # the pull is aborted mid-way (1-hour token / credit cap): newest-first means the
@@ -97,9 +95,8 @@ def _pull_day(pro: object, day: str, cache_dir: str) -> list[str]:
     return errs
 
 
-def main(start: str, end: str, cache_dir: str = "data/cache") -> None:
-    load_env_local()  # .env.local 权威覆盖 —— 调度任务可能没继承到新源的环境变量
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+def main(start: str, end: str, cache_dir: str = CACHE_DIR) -> None:
+    pro = tushare_pro()  # .env.local 权威覆盖 —— 调度任务可能没继承到新源的环境变量
     cal = fetch_trade_cal(pro, start, end, cache_dir)
     days = days_to_pull(cal, start, end)
     label = "trading days (per trade_cal)" if cal is not None else "calendar days (trade_cal 不可用,逐日试错)"

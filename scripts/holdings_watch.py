@@ -16,6 +16,7 @@ import sys
 
 import pandas as pd
 
+from ashare_gauntlet.config import HOLDINGS_PATH as HOLDINGS
 from ashare_gauntlet.holdings import (
     build_position_record,
     is_date_partition,
@@ -24,7 +25,6 @@ from ashare_gauntlet.holdings import (
 )
 from scripts.pick_track import CACHE
 
-HOLDINGS = "data/holdings.json"
 WINDOW = 20
 HISTORY_DAYS = WINDOW + 1  # 前复权 MA20 需 20 日;多取 1 日与代码库 n+1 约定一致
 

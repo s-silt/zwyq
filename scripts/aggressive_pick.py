@@ -40,14 +40,15 @@ import os
 
 import pandas as pd
 
+from ashare_gauntlet.config import (
+    CACHE_DIR as CACHE,
+    HOLDINGS_PATH as HOLDINGS,
+    HOLDSCORE_DIR as FACTOR_DIR,
+)
 from ashare_gauntlet.execution import MIN_BARS, entry_readiness
 from ashare_gauntlet.factor_model import percentile_rank
 from scripts.entry_check import load_code_history
 from scripts.factor_rank import latest_rows
-
-CACHE = "data/cache"
-FACTOR_DIR = "data/holdscore"
-HOLDINGS = "data/holdings.json"
 
 # 风险分摊硬排除集合(定义性;出处=用户场外基金前十大重仓所属 tushare 行业,见模块
 # docstring 第 3 条)。⚠ 基金持仓变了要同步改这里(与 tests/test_aggressive_pick.py

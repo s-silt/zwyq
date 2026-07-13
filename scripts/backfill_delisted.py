@@ -15,7 +15,6 @@ Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.backfill_delis
 """
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Callable
@@ -23,13 +22,11 @@ from typing import Callable
 import pandas as pd
 
 from ashare_gauntlet.data.cache import read_or_fetch
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.screen import board_of
+from ashare_gauntlet.config import CACHE_DIR as CACHE, tushare_pro
 from scripts.backfill_fina import MAIN_BOARDS, latest_period_end
 
-CACHE = "data/cache"
 PAGE = 5000
 VIP = {"income": "income_vip", "balancesheet": "balancesheet_vip",
        "cashflow": "cashflow_vip", "fina_indicator": "fina_indicator_vip"}
@@ -89,8 +86,7 @@ def quarterly_periods(first: str, last: str) -> list[str]:
 
 
 def main() -> None:
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     sb = call_with_retry(lambda: pro.stock_basic(list_status="D", fields="ts_code,name,delist_date"))
     if sb.empty:
         raise SystemExit("stock_basic list_status=D 为空——源侧异常,拒绝当作'无退市股'")

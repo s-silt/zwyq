@@ -23,15 +23,13 @@ from typing import Any, cast
 
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import market_returns
 from ashare_gauntlet.record import build_record, compute_holdscore
 from ashare_gauntlet.screen import board_of
 
-CACHE = "data/cache"
-OUT_DIR = "data/holdscore"
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR as OUT_DIR, tushare_pro
+
 SYM = ("income", "fina_indicator", "balancesheet", "cashflow", "share_float",
        "pledge_stat", "stk_holdertrade", "namechange", "forecast", "express")
 BOARDS: dict[str, list[str] | None] = {
@@ -64,14 +62,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--top", type=int, default=30)
     a = ap.parse_args(argv)
 
-    load_env_local()
     daily, adj = _load("daily"), _load("adj_factor")
     if daily.empty:
         raise SystemExit("data/cache/daily 为空 —— 先 backfill")
     as_of = str(daily["trade_date"].max())
     mr = market_returns(daily, adj, (5, 20))
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv,dv_ttm"))
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry"))
     name_d = dict(zip(sb["ts_code"], sb["name"]))

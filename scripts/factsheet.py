@@ -12,6 +12,7 @@ import sys
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR
 from ashare_gauntlet.factsheet import build_factsheet
 
 
@@ -21,7 +22,7 @@ def load(cache_dir: str, endpoint: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def main(ts_code: str, cache_dir: str = "data/cache") -> None:
+def main(ts_code: str, cache_dir: str = CACHE_DIR) -> None:
     daily = load(cache_dir, "daily")
     adj = load(cache_dir, "adj_factor")
     hk = load(cache_dir, "hk_hold")

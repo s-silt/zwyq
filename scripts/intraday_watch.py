@@ -17,11 +17,13 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from ashare_gauntlet.config import (
+    HOLDINGS_PATH as HOLDINGS,
+    INTRADAY_STATE_PATH as STATE,  # 定时模式的上次警报态(去重用,非研究数据)
+    TRIGGER_BANDS_PATH as WATCHLIST,
+)
 from ashare_gauntlet.intraday import alert_level, fetch_quotes, sentinel_delta
 
-HOLDINGS = "data/holdings.json"
-WATCHLIST = "data/trigger_bands.json"
-STATE = "data/intraday_alert_state.json"     # 定时模式的上次警报态(去重用,非研究数据)
 TP_MULT = 1.25   # 长线止盈提示线=成本×1.25(双仓制"+25%减半锁利"既有约定,非新常数)
 _ICON = {"BREACH": "🔴", "NEAR": "🟠", "PROFIT": "🟢", "BAND": "🟡", "OK": "  "}
 

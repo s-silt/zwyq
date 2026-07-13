@@ -29,7 +29,7 @@ import math
 import re
 from pathlib import Path
 
-JOURNAL_PATH = Path("data/trade_journal.json")
+from ashare_gauntlet.config import TRADE_JOURNAL_PATH as JOURNAL_PATH
 
 # 双仓制三档:短线(≤1万,右侧入场,硬止损-7%)/ 长线(四关+财报季持有)/
 # 制度前(双仓制 2026-07-03 生效之前的历史仓,只作复盘基线,不套新规)

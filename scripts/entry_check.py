@@ -25,14 +25,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from ashare_gauntlet.data.env import load_env_local
+from ashare_gauntlet.config import CACHE_DIR as CACHE, tushare_pro
 from ashare_gauntlet.data.fetch import fetch_market_day
 from ashare_gauntlet.data.partition import date_partition_files
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.execution import MIN_BARS, entry_readiness, position_size
 from ashare_gauntlet.factor_model import touched_limit_up
-
-CACHE = "data/cache"
 
 # 涨停检查窗口 = 近5日:复用库内既有"近5日触及涨停"窗口约定(touched_limit_up 的
 # 使用场景,见 memory momentum-screen-limitup"新强名先问是不是涨停顶上来的")
@@ -55,8 +52,7 @@ DEFAULT_ACCOUNT = 75000.0
 
 
 def _make_pro() -> object:
-    load_env_local()
-    return make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    return tushare_pro()
 
 
 def _trade_dates(cache_dir: str) -> list[str]:

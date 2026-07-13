@@ -12,6 +12,7 @@ import os
 import sys
 from pathlib import Path
 
+from ashare_gauntlet.config import CACHE_DIR
 from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day, trading_days_from_cal
 from ashare_gauntlet.data.tushare_source import make_pro_api
 
@@ -21,7 +22,7 @@ from ashare_gauntlet.data.tushare_source import make_pro_api
 ENDPOINTS = ("daily", "adj_factor", "hk_hold", "moneyflow_hsgt")
 
 
-def main(lookback_days: int = 10, cache_dir: str = "data/cache") -> None:
+def main(lookback_days: int = 10, cache_dir: str = CACHE_DIR) -> None:
     today = dt.date.today()
     start = today - dt.timedelta(days=lookback_days)
     pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])

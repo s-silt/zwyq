@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR as CACHE, SURVIVORS_DIR as OUT_DIR
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
@@ -29,8 +30,6 @@ from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_retur
 from ashare_gauntlet.record import build_record
 from ashare_gauntlet.screen import board_of, screen_candidates
 
-CACHE = "data/cache"
-OUT_DIR = "data/survivors"
 SYM = ("income", "fina_indicator", "balancesheet", "cashflow", "share_float",
        "pledge_stat", "stk_holdertrade", "namechange", "forecast", "express")
 _TIER_ORDER = {"🟢": 0, "🟡": 1, "🔴": 2, "⛔": 3}

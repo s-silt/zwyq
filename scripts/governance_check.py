@@ -13,15 +13,10 @@ Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.governance_che
 
 import argparse
 import json
-import os
 
-from ashare_gauntlet.data.env import load_env_local
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH as HOLDINGS, tushare_pro
 from ashare_gauntlet.data.fetch import fetch_symbol_table
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.governance import audit_opinion, controller_pledge
-
-CACHE = "data/cache"
-HOLDINGS = "data/holdings.json"
 
 
 def holdings_codes(path: str) -> list[tuple[str, str]]:
@@ -73,8 +68,7 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="跳过缓存整只重拉(有新公告时用)")
     args = parser.parse_args()
 
-    load_env_local()
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
 
     if args.codes:
         targets = [(c.strip(), "") for c in args.codes.split(",") if c.strip()]

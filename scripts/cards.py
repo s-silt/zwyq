@@ -15,34 +15,17 @@ from typing import Any, cast
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR as CACHE, CARDS_DIR, PANELS_DIR, WATCHLIST_PATH as WATCHLIST, tushare_pro
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import market_returns
 from ashare_gauntlet.record import build_record, diff_records, merge_factcheck
 from ashare_gauntlet.render_html import render_dashboard
 from ashare_gauntlet.render_md import render_md
 
-CACHE = "data/cache"
-CARDS_DIR = "data/cards"
-PANELS_DIR = "data/panels"
-WATCHLIST = "data/watchlist.json"
 SYMBOL_TABLES = (
     "income", "fina_indicator", "balancesheet", "cashflow", "share_float",
     "pledge_stat", "stk_holdertrade", "namechange", "forecast", "express",
 )
-
-
-def _load_env_local(path: str = ".env.local") -> None:
-    """把 .env.local 的 KEY=VALUE 灌入 os.environ(已存在不覆盖);绝不打印任何值。"""
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def _load(ep: str) -> pd.DataFrame:
@@ -86,7 +69,6 @@ def render_outputs(records: list[dict[str, Any]], as_of: str, panels_dir: str = 
 
 
 def main(limit: int | None = None, render: bool = True) -> None:
-    _load_env_local()
     daily, adj = _load("daily"), _load("adj_factor")
     if daily.empty:
         raise SystemExit("data/cache/daily 为空 —— 先 backfill")
@@ -98,7 +80,10 @@ def main(limit: int | None = None, render: bool = True) -> None:
     if limit:
         watch = watch[:limit]
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    # 语义统一(2026-07 Codex 审查确认的有意行为修正):本文件旧私有 _load_env_local
+    # 用 setdefault(进程环境优先),与 env.py 权威 override 语义相反,属历史不一致;
+    # 收敛后统一为 .env.local 权威覆盖(与其余全部脚本一致)。
+    pro = tushare_pro()
     records: list[dict[str, Any]] = []
     for i, item in enumerate(watch):
         code = item["ts_code"]

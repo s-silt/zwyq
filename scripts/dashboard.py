@@ -19,11 +19,9 @@ import os
 import sys
 from typing import Any
 
+from ashare_gauntlet.config import CARDS_DIR, PANELS_DIR
 from ashare_gauntlet.render_html import render_dashboard
 from ashare_gauntlet.render_svg import render_svg_card
-
-CARDS_DIR = "data/cards"
-PANELS_DIR = "data/panels"
 
 
 def _latest_as_of() -> str:

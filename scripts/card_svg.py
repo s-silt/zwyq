@@ -16,10 +16,9 @@ import os
 import sys
 from typing import Any
 
+from ashare_gauntlet.config import CARDS_DIR, CARDS_SVG_DIR as OUT_DIR
 from ashare_gauntlet.render_svg import render_svg_card
 
-CARDS_DIR = "data/cards"
-OUT_DIR = "data/cards_svg"
 TIER_ORDER = ("🟢", "🟡", "🔴", "⛔")
 
 

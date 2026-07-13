@@ -12,6 +12,7 @@ import sys
 
 import pandas as pd
 
+from ashare_gauntlet.config import CACHE_DIR as CACHE
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_history, fetch_symbol_table
 from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
@@ -38,7 +39,6 @@ from ashare_gauntlet.fundamentals import (
     upcoming_unlocks,
 )
 
-CACHE = "data/cache"
 INDEXES = (("000001.SH", "上证"), ("399001.SZ", "深成"), ("399006.SZ", "创业板"), ("000688.SH", "科创50"))
 SYMBOL_TABLES = ("income", "fina_indicator", "balancesheet", "cashflow", "share_float",
                  "pledge_stat", "stk_holdertrade", "namechange", "forecast", "express")

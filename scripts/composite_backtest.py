@@ -5,18 +5,22 @@ EP/BP/IVOL 原值 → factor_percentile(行业+市值双中性→百分位,IVOL 
 等权 → to_decile;组合 T+1 开盘等权买入、持有 --fwd 日、入场一字涨停剔除、退出侧
 一字跌停/停牌顺延(与 scripts.factor_backtest 同引擎组件)。
 
-一次跑出四个口径:
-- D1..D10  :无 tier 预过滤宇宙(与单因子五门证据同宇宙,验单调性)
-- PROD     :生产宇宙(lean_tier ∈ 🟢🟡 预过滤,同 factor_rank)→ D10
-- PROD_G   :PROD 的 D10 ∩ 🟢
-- PROD_GX  :PROD_G 再剔 data/profile.json 行业(反事实:当前 profile 应用于全史)
+一次跑出八个口径:
+- D1..D10   :无 tier 预过滤宇宙(与单因子五门证据同宇宙,验单调性)
+- PROD      :生产宇宙(lean_tier ∈ 🟢🟡 + 有披露财务 + 剔ST,同 factor_rank)→ D10
+- PROD_G    :PROD 的 D10 ∩ 🟢
+- PROD_GX   :PROD_G 再剔 data/profile.json 行业(反事实:当前 profile 应用于全史)
+- PROD_DEDT :EP → 扣非 TTM 口径(全覆盖版,R4)
+- CS_EP/CS_EPD:common-support 同池对照(每期限定四因子全可得的同一批票,R6——
+  两行之差=纯 EP 定义效应,剥离覆盖池与构件差异)
+- PROD_XP   :PROD 剔除污染标记(pe>0 且扣非TTM≤0=主业亏损靠非经常盈利)后的边际
 
-生产复刻经两轮审查对齐(2026-07-13):①先滤后排(tier→剔ST→有披露财务→三因子
-全齐,再在滤后池算百分位)——先排后滤实测每期 D10 与生产对称差 ~9%;②打分在
-t 日全宇宙完成,T+1 一字涨停只从**已选成员**剔除、不重排名(评审三轮 P0-1:先剔
-后排=用 T+1 信息改写分位边界);③宇宙名录=stock_basic L+D+P 全状态(评审三轮
-P0-2:仅 L 会把后来退市的股票整段剔除,幸存者偏差回门)。残余差异(报告尾打印):
-ST=最终名称近似(namechange PIT 待补);dedt TTM 构件用更正后终值(仅影响 R4)。
+生产复刻经三轮审查对齐(2026-07-13):①先滤后排(先排后滤实测每期 D10 与生产
+对称差 ~9%);②打分在 t 日全宇宙完成,T+1 一字涨停只从**已选成员**剔除、不重排名
+(P0-1:先剔后排=用 T+1 信息改写分位边界);③宇宙名录=stock_basic L+D+P 全状态
+(P0-2:仅 L 会把后来退市的股票整段剔除,幸存者偏差回门);④扣非 TTM 构件按期
+严格 PIT 现算(dedt_ttm_pit,R6,废弃"更正后终值"行级近似)。残余差异(报告尾
+打印):ST=最终名称近似(namechange PIT 待补)。
 成本:round_trip(佣金+滑点+卖出日印花税 PIT 分段)× 组合真实换手 τ(首期建仓 τ=1)。
 
 Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.composite_backtest
@@ -85,36 +89,40 @@ def top_contrib_share(contrib: pd.Series) -> float:
     return float(c.abs().max() / gross)
 
 
-def dedt_ttm_rows(sym: pd.DataFrame) -> pd.DataFrame:
-    """单只股票 fina 行(end_date/ann_date/profit_dedt,YTD 累计)→ 逐行加 dedt_ttm。
+def dedt_ttm_pit(fd: pd.DataFrame, asof: str) -> pd.Series:
+    """严格 PIT 扣非 TTM(评审三轮 R6):每个构件只用 ann_date<=asof 时已知的最新版本。
 
-    TTM(E) = YTD(E) + 上年年报 − 上年同期 YTD;E 为年报(1231)时 TTM=自身。
-    任一构件缺失 → NaN(fail-honest,不得退化成 YTD 冒充 TTM)。同 end_date 多行
-    (更正公告)构件查表取 ann_date 最新终值;行本身保留(PIT 查询仍按 ann_date)。
-    构件用"更正后终值"是行级近似:更正公告晚于当期 ann_date 的极端序列会带入微量
-    后验值,占比可忽略,已在 R4 报告口径注明。
+    输入=全市场 fina 行(ts_code/end_date/ann_date/profit_dedt,YTD 累计,已按
+    ts_code/end_date/ann_date 排序)。TTM = 最新已披露期 YTD + 上年年报 − 上年同期
+    YTD;最新期为年报(1231)时 TTM=自身;任一构件在视界内缺失 → NaN(fail-honest);
+    一切未披露的股票缺席结果。取代旧行级近似(构件用最终更正值=微量后验,评审实测
+    复现后废弃)。
     """
-    # mergesort=稳定排序:同 end_date+同 ann_date 的双行(缓存重复)last() 取值才确定
-    s = sym.sort_values("ann_date", kind="mergesort")
-    latest = s.groupby("end_date")["profit_dedt"].last()
-
-    def _ttm(e: str, v: object) -> float:
+    vis = fd[fd["ann_date"] <= asof]
+    if vis.empty:
+        return pd.Series(dtype=float)
+    # 视界内每 (股, 期) 的最新已知版本(输入行序已按 ann_date 升序,last=最新公告)
+    latest = vis.groupby(["ts_code", "end_date"])["profit_dedt"].last()
+    cur = vis.groupby("ts_code", sort=False).tail(1)   # 每股最新已披露期(行序契约)
+    out: dict[str, float] = {}
+    for c, e, v in zip(cur["ts_code"], cur["end_date"], cur["profit_dedt"]):
+        e = str(e)
         if pd.isna(v):
-            return float("nan")
+            out[str(c)] = float("nan")
+            continue
         if e.endswith("1231"):
-            return float(v)  # type: ignore[arg-type]
-        pa = latest.get(str(int(e[:4]) - 1) + "1231")
-        ps = latest.get(str(int(e[:4]) - 1) + e[4:])
+            out[str(c)] = float(v)  # type: ignore[arg-type]
+            continue
+        pa = latest.get((c, str(int(e[:4]) - 1) + "1231"))
+        ps = latest.get((c, str(int(e[:4]) - 1) + e[4:]))
         if pa is None or ps is None or pd.isna(pa) or pd.isna(ps):
-            return float("nan")
-        return float(v) + float(pa) - float(ps)  # type: ignore[arg-type]
-
-    out = sym.copy()
-    out["dedt_ttm"] = [_ttm(str(e), v) for e, v in zip(sym["end_date"], sym["profit_dedt"])]
-    return out
+            out[str(c)] = float("nan")
+        else:
+            out[str(c)] = float(v) + float(pa) - float(ps)  # type: ignore[arg-type]
+    return pd.Series(out)
 
 
-PORTS = ("D10", "PROD", "PROD_G", "PROD_GX", "PROD_DEDT")
+PORTS = ("D10", "PROD", "PROD_G", "PROD_GX", "PROD_DEDT", "CS_EP", "CS_EPD", "PROD_XP")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -130,13 +138,11 @@ def main(argv: list[str] | None = None) -> None:
     excluded = load_excluded_industries()
     fina = _load("fina_indicator", ["roe", "netprofit_yoy", "dt_netprofit_yoy", "tr_yoy", "ocfps"])
     # R4 扣非对照:profit_dedt(YTD 累计)→ 逐行 TTM(EP 污染实验,methodology §7-⑤)
-    print("构造扣非 TTM(profit_dedt,YTD→滚动四季,逐股)…", flush=True)
+    print("加载 profit_dedt 全市场行(扣非 TTM 构件按期严格 PIT 现算)…", flush=True)
     fdedt = _load("fina_indicator", ["profit_dedt"])
     # 脏 ann_date(NaN→astype(str)→"nan" 会恒排最后赢得构件查表)从严剔除,
     # 与生产 latest_rows 的三键排序防线同精神(审查 P2-7)
     fdedt = fdedt[fdedt["ann_date"].str.fullmatch(r"\d{8}", na=False)]
-    fdedt = fdedt.groupby("ts_code", group_keys=False)[
-        ["ts_code", "end_date", "ann_date", "profit_dedt"]].apply(dedt_ttm_rows)
     pro = tushare_pro()
     # 宇宙名录 = L+D+P 全状态(评审三轮 P0-2:仅 list_status="L" 会把后来退市的
     # 股票从宇宙 B 整段历史剔除——退市财务回填白做,幸存者偏差从后门回来)
@@ -226,10 +232,13 @@ def main(argv: list[str] | None = None) -> None:
         raw["EP"] = (1.0 / pe).where(pe > 0)
         raw["BP"] = (1.0 / pb_).where(pb_ > 0)
         raw["IVOL"] = ivol_capm(ret_p.iloc[: it + 1], mkt.iloc[: it + 1], 21).reindex(idx)
-        # 扣非 EP(R4):dedt_ttm(元)/ 总市值(daily_basic total_mv 单位=万元);
+        # 扣非 EP(R4/R6):严格 PIT TTM(元)/ 总市值(daily_basic total_mv 单位=万元);
         # 与 EP 同样仅在 E>0 下有定义(价值因子语义)
-        dedt = _pit(fdedt, t)["dedt_ttm"].reindex(idx)
+        dedt = dedt_ttm_pit(fdedt, t).reindex(idx)
         raw["EPD"] = (dedt / (mv * 1e4)).where((mv > 0) & (dedt > 0))
+        # 污染探针(R6,定义性零阈值):主业不赚钱(扣非 TTM≤0)而市场按含非经常
+        # 口径给出正 PE——好想你式"一次性收益抬 EP"的机器可判形态;dedt 未知不标
+        poll_mark = (pe > 0) & dedt.notna() & (dedt <= 0)
         ind = ind_all.reindex(idx).fillna("其他")
         logmv = np.log(mv.where(mv > 0))
         pf = _pit(fina, t)
@@ -285,12 +294,28 @@ def main(argv: list[str] | None = None) -> None:
             members["PROD_G"] = pd.Index([c for c in d10b if tier[c] == "🟢"])
             members["PROD_GX"] = pd.Index([c for c in members["PROD_G"] if ind[c] not in excluded])
             row["hhi_PROD"] = industry_hhi(ind[d10b])
-        # R4:同宇宙、EP→扣非 TTM 口径的对照组合 + 因子级 IC 对照(宇宙A 百分位)
+            # R6 污染探针落库:标记股入 D10 频率 + 标记组当期收益 + 剔除后的边际组合
+            poll_in = pd.Index([c for c in d10b if bool(poll_mark.get(c, False))])
+            row["n_poll_prod"] = int(len(poll_in))
+            row["ret_poll_prod"] = float(fwd[poll_in].mean()) if len(poll_in) else float("nan")
+            members["PROD_XP"] = d10b.difference(poll_in)
+        row["n_poll_universe"] = int(poll_mark[sub_b].sum())
+        # R4:同宇宙、EP→扣非 TTM 口径的对照组合 + 因子级 IC 对照(可执行宇宙百分位)
         dec_d = score_deciles(sub_b, ep_col="EPD")
         if dec_d is not None:
             members["PROD_DEDT"] = dec_d.index[dec_d == 10].difference(locked_idx)
             if dec_b is not None and len(members["PROD"]):
                 row["ovl_dedt"] = len(set(members["PROD"]) & set(members["PROD_DEDT"])) / len(members["PROD"])
+        # R6 common-support(评审三轮):每期限定四因子全可得的**同一批票**,分别用
+        # EP/扣非EP 排名——成员池完全一致,收益/回撤差异才可归因于 EP 定义本身
+        cs = sub_b[raw.loc[sub_b, ["EP", "EPD", "BP", "IVOL"]].notna().all(axis=1)]
+        dec_ce = score_deciles(cs)
+        dec_cd = score_deciles(cs, ep_col="EPD")
+        if dec_ce is not None and dec_cd is not None:
+            members["CS_EP"] = dec_ce.index[dec_ce == 10].difference(locked_idx)
+            members["CS_EPD"] = dec_cd.index[dec_cd == 10].difference(locked_idx)
+            if len(members["CS_EP"]):
+                row["ovl_cs"] = len(set(members["CS_EP"]) & set(members["CS_EPD"])) / len(members["CS_EP"])
         row["IC_EP"] = information_coefficient(
             factor_percentile(raw["EP"], ind, True, logmv=logmv)[exec_idx], fwd[exec_idx])
         row["IC_EPD"] = information_coefficient(
@@ -357,6 +382,15 @@ def main(argv: list[str] | None = None) -> None:
     if "ovl_dedt" in res:
         print(f"D10(EP) 与 D10(扣非EP) 平均重合率:{res['ovl_dedt'].mean():.0%}"
               f"(平均每期换血 {(1 - res['ovl_dedt'].mean()) * res['n_PROD'].mean():.0f} 只)")
+    if "ovl_cs" in res:
+        print(f"common-support 同宇宙对照(R6,成员池完全一致):D10(EP) vs D10(扣非EP) "
+              f"重合率 {res['ovl_cs'].mean():.0%}——CS_EP/CS_EPD 两行之差即纯 EP 定义效应")
+    # R6 污染探针(定义性标记:pe>0 且扣非 TTM≤0 = 主业亏损靠非经常盈利)
+    print(f"污染探针:宇宙B均 {res['n_poll_universe'].mean():.0f} 只/期被标记;"
+          f"落入 PROD D10 均 {res['n_poll_prod'].mean():.2f} 只/期"
+          f"(占 D10 成员 {res['n_poll_prod'].sum() / max(res['n_PROD'].sum(), 1):.2%});"
+          f"标记组期均收益 {res['ret_poll_prod'].mean() * 100:+.2f}% vs PROD 整体 "
+          f"{res['ret_PROD'].mean() * 100:+.2f}%;剔除标记的边际影响=上表 PROD_XP 行")
     yr_tbl = (res["ret_PROD"] - res["mkt_fwd"] - res["TO_PROD"] * res["cost_rt"]).groupby(y)
     print("PROD 逐年净超额%(期均):" + " ".join(
         f"{yy}:{v.mean() * 100:+.2f}" for yy, v in yr_tbl))
@@ -366,8 +400,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"已知与生产的残余差异(评审三轮后口径):①宇宙名录=L+D+P 全状态(退市股在池),"
           f"但 ST=最终名称近似(历史逐日戴帽状态需 namechange PIT——当前按名称剔除 "
           f"{int((~non_st).sum())} 只,双向偏差:后来戴帽的被错误早剔/摘帽的被错误纳入);"
-          f"②退出顺延跨税改日时印花税取计划退出日段(量级趋零);"
-          f"③dedt TTM 构件用更正后终值(行级近似,仅影响 R4 口径);④⚡🎰/dma20 展示列不入分。")
+          f"②退出顺延跨税改日时印花税取计划退出日段(量级趋零);③⚡🎰/dma20 展示列不入分。"
+          f"(dedt TTM 构件已改严格 PIT 现算,旧'更正后终值'近似废弃——R6)")
     print("→ 明细 data/holdscore/composite_backtest.json(已在报告前落盘)")
 
 

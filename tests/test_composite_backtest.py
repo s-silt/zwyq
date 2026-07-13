@@ -56,60 +56,54 @@ def test_top_contrib_share():
     assert pd.isna(top_contrib_share(pd.Series(dtype=float)))
 
 
-# ---------- dedt_ttm_rows:扣非 TTM(YTD 累计口径 → 滚动四季)PIT 逐行构造 ----------
+# ---------- dedt_ttm_pit:扣非 TTM,构件严格 PIT(评审三轮 R6:不得用未来更正值) ----------
 
-def _fina(rows):
-    return pd.DataFrame(rows, columns=["end_date", "ann_date", "profit_dedt"])
+def _fina(rows, code="000001.SZ"):
+    df = pd.DataFrame(rows, columns=["end_date", "ann_date", "profit_dedt"])
+    df.insert(0, "ts_code", code)
+    return df.sort_values(["ts_code", "end_date", "ann_date"], kind="mergesort")
 
 
-def test_dedt_ttm_mid_year_quarter():
-    from scripts.composite_backtest import dedt_ttm_rows
+def test_dedt_ttm_pit_mid_year_quarter():
+    from scripts.composite_backtest import dedt_ttm_pit
 
     df = _fina([
         ("20240630", "20240820", 40.0),   # 上年同期 YTD
         ("20241231", "20250328", 100.0),  # 上年年报
         ("20250630", "20250815", 55.0),   # 当期 YTD
     ])
-    out = dedt_ttm_rows(df)
-    # TTM(20250630) = 55 + 100 − 40 = 115;年报行 TTM=自身
-    assert out.loc[out["end_date"] == "20250630", "dedt_ttm"].iloc[0] == pytest.approx(115.0)
-    assert out.loc[out["end_date"] == "20241231", "dedt_ttm"].iloc[0] == pytest.approx(100.0)
+    # asof=20250901:TTM = 55 + 100 − 40 = 115;asof=20250401:最新期=年报,TTM=自身
+    assert dedt_ttm_pit(df, "20250901")["000001.SZ"] == pytest.approx(115.0)
+    assert dedt_ttm_pit(df, "20250401")["000001.SZ"] == pytest.approx(100.0)
 
 
-def test_dedt_ttm_missing_pieces_is_nan():
-    from scripts.composite_backtest import dedt_ttm_rows
+def test_dedt_ttm_pit_missing_pieces_is_nan():
+    from scripts.composite_backtest import dedt_ttm_pit
 
-    # 缺上年年报 → 无法构造 TTM,必须 NaN(fail-honest,不得退化成 YTD 冒充 TTM)
+    # 缺上年年报 → NaN(fail-honest,不得退化成 YTD 冒充 TTM)
     df = _fina([("20240630", "20240820", 40.0), ("20250630", "20250815", 55.0)])
-    out = dedt_ttm_rows(df)
-    assert pd.isna(out.loc[out["end_date"] == "20250630", "dedt_ttm"].iloc[0])
+    assert pd.isna(dedt_ttm_pit(df, "20250901")["000001.SZ"])
 
 
-def test_dedt_ttm_dedupes_corrections_by_latest_ann():
-    from scripts.composite_backtest import dedt_ttm_rows
+def test_dedt_ttm_pit_future_correction_invisible():
+    from scripts.composite_backtest import dedt_ttm_pit
 
-    # 同 end_date 多行(更正公告):取 ann_date 最新一行的值
+    # 评审三轮 P0 场景:年报更正公告晚于查询日,构件必须用当时已知版本(100),
+    # 不得用未来更正值(80);更正公告日之后查询才切换到 80
     df = _fina([
-        ("20240630", "20240820", 40.0),
+        ("20240930", "20241030", 30.0),
         ("20241231", "20250328", 100.0),
-        ("20241231", "20250428", 90.0),   # 年报更正:100 → 90
-        ("20250630", "20250815", 55.0),
+        ("20241231", "20251201", 80.0),    # 年报更正,公告于 2025-12-01
+        ("20250930", "20251030", 35.0),
     ])
-    out = dedt_ttm_rows(df)
-    assert out.loc[out["end_date"] == "20250630", "dedt_ttm"].iloc[0] == pytest.approx(55 + 90 - 40)
+    assert dedt_ttm_pit(df, "20251115")["000001.SZ"] == pytest.approx(35 + 100 - 30)
+    assert dedt_ttm_pit(df, "20251215")["000001.SZ"] == pytest.approx(35 + 80 - 30)
 
 
-def test_dedt_ttm_preserves_row_order_and_index():
-    from scripts.composite_backtest import dedt_ttm_rows
+def test_dedt_ttm_pit_nothing_announced_yet():
+    from scripts.composite_backtest import dedt_ttm_pit
 
-    # 行序/索引契约:_pit 的 groupby.tail(1) 依赖输入行序(end_date/ann_date 已排序);
-    # 函数内 reset_index/重排会静默错选行(对抗审查 P2-9 的回归防线)
-    df = _fina([
-        ("20240630", "20240820", 40.0),
-        ("20241231", "20250328", 100.0),
-        ("20250630", "20250815", 55.0),
-    ])
-    df.index = [7, 3, 9]                      # 故意非常规索引
-    out = dedt_ttm_rows(df)
-    assert list(out.index) == [7, 3, 9]
-    assert list(out["end_date"]) == ["20240630", "20241231", "20250630"]
+    # 查询日早于一切公告 → 该股缺席结果(reindex 后自然 NaN),不得伪造
+    df = _fina([("20241231", "20250328", 100.0)])
+    out = dedt_ttm_pit(df, "20250101")
+    assert "000001.SZ" not in out.index

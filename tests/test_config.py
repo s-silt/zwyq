@@ -23,6 +23,7 @@ def test_paths_pin_historical_strings():
     assert config.WATCHLIST_PATH == "data/watchlist.json"
     assert config.TRADE_JOURNAL_PATH == "data/trade_journal.json"
     assert config.INTRADAY_STATE_PATH == "data/intraday_alert_state.json"
+    assert config.PROFILE_PATH == "data/profile.json"
 
 
 def test_tushare_pro_fails_loud_without_token(tmp_path, monkeypatch):

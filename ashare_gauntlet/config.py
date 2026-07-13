@@ -29,6 +29,7 @@ TRIGGER_BANDS_PATH = "data/trigger_bands.json"    # 观察名单触发带(哨兵
 WATCHLIST_PATH = "data/watchlist.json"            # 6/19 种子名单(cards/tech_report 消费)
 TRADE_JOURNAL_PATH = "data/trade_journal.json"    # 交易流水
 INTRADAY_STATE_PATH = "data/intraday_alert_state.json"  # 哨兵去重状态(可删)
+PROFILE_PATH = "data/profile.json"                # 个人投资约束 profile(非研究结论)
 
 
 def tushare_pro():

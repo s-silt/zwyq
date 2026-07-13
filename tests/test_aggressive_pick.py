@@ -96,8 +96,36 @@ def test_empty_pool_returns_empty():
 
 def test_excluded_industries_matches_fund_topten_derivation():
     # 出处:用户场外基金(华泰柏瑞质量精选/质量成长、易方达远见成长)前十大重仓
-    # 所属 tushare 行业推导 —— 基金持仓变了必须同步改常量与本测试
+    # 所属 tushare 行业推导 —— 基金持仓变了必须同步改 data/profile.json 与本测试
     assert EXCLUDED_INDUSTRIES == {"通信设备", "元器件", "半导体", "IT设备"}
+
+
+# ---------- 个人 profile 配置层(外部评审 P2:个人约束出代码入配置) ----------
+
+def test_load_excluded_industries_reads_profile(tmp_path):
+    import json
+
+    from scripts.aggressive_pick import load_excluded_industries
+
+    p = tmp_path / "profile.json"
+    p.write_text(json.dumps({"excluded_industries": ["银行", "白酒"]}), encoding="utf-8")
+    assert load_excluded_industries(str(p)) == {"银行", "白酒"}
+
+
+def test_load_excluded_industries_fails_loud(tmp_path):
+    # 排除约束静默失效 = 风险敞口翻倍,必须 fail-loud:文件缺失/键缺失都要炸
+    import json
+
+    import pytest
+
+    from scripts.aggressive_pick import load_excluded_industries
+
+    with pytest.raises(FileNotFoundError):
+        load_excluded_industries(str(tmp_path / "nope.json"))
+    p = tmp_path / "profile.json"
+    p.write_text(json.dumps({"其他键": []}), encoding="utf-8")
+    with pytest.raises(KeyError):
+        load_excluded_industries(str(p))
 
 
 # ---------- latest_rows PIT(as_of):未来公告不得混入横截面 ----------

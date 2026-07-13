@@ -44,16 +44,28 @@ from ashare_gauntlet.config import (
     CACHE_DIR as CACHE,
     HOLDINGS_PATH as HOLDINGS,
     HOLDSCORE_DIR as FACTOR_DIR,
+    PROFILE_PATH,
 )
 from ashare_gauntlet.execution import MIN_BARS, entry_readiness
 from ashare_gauntlet.factor_model import percentile_rank
 from scripts.entry_check import load_code_history
 from scripts.factor_rank import latest_rows
 
-# 风险分摊硬排除集合(定义性;出处=用户场外基金前十大重仓所属 tushare 行业,见模块
-# docstring 第 3 条)。⚠ 基金持仓变了要同步改这里(与 tests/test_aggressive_pick.py
-# 里钉口径的测试一起改)。
-EXCLUDED_INDUSTRIES: set[str] = {"通信设备", "元器件", "半导体", "IT设备"}
+
+def load_excluded_industries(path: str = PROFILE_PATH) -> set[str]:
+    """个人 profile(data/profile.json)的行业硬排除集合(见模块 docstring 第 3 条)。
+
+    个人约束出代码入版本化配置(外部评审 P2):换人/换基金只改 json 不改代码。
+    文件缺失/键缺失 fail-loud——排除约束静默失效 = 基金敞口行业被重复买入。
+    """
+    with open(path, encoding="utf-8") as fh:
+        return set(json.load(fh)["excluded_industries"])
+
+
+# 出处=用户场外基金前十大重仓所属 tushare 行业(data/profile.json,基金变了改 json
+# 与 tests/test_aggressive_pick.py 钉口径的测试)。模块级加载:消费方与测试的既有
+# 导入口径(from scripts.aggressive_pick import EXCLUDED_INDUSTRIES)保持不变。
+EXCLUDED_INDUSTRIES: set[str] = load_excluded_industries()
 
 
 def quality_floor(rows: list[dict]) -> list[dict]:

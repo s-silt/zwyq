@@ -1,6 +1,10 @@
 """Load the cached per-symbol data, assemble the panel, run the gauntlet, print
 the GO/NO_GO verdict.
 
+⚠️ LEGACY(2026-07 标注):项目最早期的一次性验证脚本,消费未标定阈值的旧
+gauntlet(见 ashare_gauntlet/gauntlet.py 头注)。不在现役链路;现役回测/门禁 =
+scripts.factor_backtest + scripts.factor_tearsheet。留档备查,勿作研究结论依据。
+
 v1 universe-wide reversal: past-5-day back-adjusted return signal, weekly
 (non-overlapping 5-day) holds, deciles, entry at next open. Liquidity floor on
 daily turnover (amount, 千元); 次新 excluded; 一字板/turnover refinements pending.

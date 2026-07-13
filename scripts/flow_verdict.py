@@ -1,5 +1,10 @@
 """Northbound-flow (北向资金) signal verdict.
 
+⚠️ LEGACY(2026-07 标注):早期一次性验证脚本,消费未标定阈值的旧 gauntlet
+(见 ashare_gauntlet/gauntlet.py 头注)。不在现役链路;且 2024-08-19 后
+moneyflow_hsgt 语义变更(净流→成交额,见 ashare_gauntlet/factsheet.py 的
+NORTH_FLOW_SEMANTICS_CUTOFF),北向净流信号已不可延续。留档备查。
+
 Pulls hk_hold (北向持股明细) for the dates already cached as daily prices, builds
 the flow panel (signal = -Δ北向占比 over k days; fwd_ret from cached prices), and
 runs the same gauntlet. Needs a live token for the hk_hold pull (~25 credits per

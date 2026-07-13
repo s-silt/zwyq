@@ -1,5 +1,12 @@
 """Falsification gauntlet: metrics and (later) the orchestrated GO/NO_GO run.
 
+⚠️ LEGACY(2026-07 标注):本模块是项目早期的通用证伪器,阈值(min_excess_sharpe
+等)为未标定 placeholder,仅剩 scripts/first_verdict.py 与 scripts/flow_verdict.py
+两个早期一次性脚本引用,**不在现役选股链路中**。现役准入门禁 = scripts/
+factor_tearsheet.py 的五门纪律(NW t>3 出处 Harvey-Liu-Zhu 2016 + 真实净>0 +
+LOYO 逐年同号 + 涨跌市同号 + 多头腿成本后>0),标定依据见 docs/methodology.md。
+保留本模块因其测试仍钉住底层指标函数(annualized_sharpe/oos_split 等)的语义。
+
 The gauntlet consumes a daily strategy-return series (and, for some steps, the
 tidy panel) and asks the soilbot questions: does an edge survive out-of-sample
 splits, cross-regime sign checks, per-symbol concentration, demeaning, and

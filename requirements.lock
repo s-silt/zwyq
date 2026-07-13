@@ -3,6 +3,7 @@ bs4==0.0.2
 certifi==2026.5.20
 charset-normalizer==3.4.7
 colorama==0.4.6
+coverage==7.15.1
 cssselect2==0.9.0
 idna==3.18
 iniconfig==2.3.0
@@ -16,6 +17,7 @@ pyarrow==24.0.0
 Pygments==2.20.0
 PyMuPDF==1.27.2.3
 pytest==9.1.0
+pytest-cov==7.1.0
 python-dateutil==2.9.0.post0
 reportlab==5.0.0
 requests==2.34.2

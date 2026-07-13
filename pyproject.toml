@@ -10,8 +10,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+# 覆盖率按需跑(不进默认 addopts,避免拖慢日常 pytest):
+#   python -m pytest --cov=ashare_gauntlet --cov=scripts --cov-report=term
+# 2026-07-11 基线:核心包 ashare_gauntlet 96%(2108 语句漏 81),scripts 编排层
+# 拉低 TOTAL 至 55%(多为 CLI/IO 壳,核心逻辑在包内被测)。
+[tool.coverage.run]
+source = ["ashare_gauntlet", "scripts"]

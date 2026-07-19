@@ -92,6 +92,27 @@ def quantile_spread(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> flo
     return float(df.loc[bucket == q - 1, "r"].mean() - df.loc[bucket == 0, "r"].mean())
 
 
+def restated_visibility(df: pd.DataFrame) -> pd.DataFrame:
+    """重述行可见日修正:ann_date ← f_ann_date(实际发布日)优先。
+
+    tushare income/cashflow/balancesheet 的更正重述行(update_flag='1')保留**原
+    公告日** ann_date,真实发布日在 f_ann_date(2026-07 四镜头验证实测:同 ann_date
+    不同取值的组 income 444/24万、balancesheet 631/23.7万,重述滞后中位 ~360 天)。
+    不修正则 PIT 过滤(ann_date<=asof)会让更正值在原公告日即"可见"=前视。
+    f_ann_date 缺失或非 YYYYMMDD 的行保留原 ann_date;无该列的表(fina_indicator
+    缓存)原样返回——其重述泄漏(profit_dedt 1,793 组)为已知残余,记 methodology。
+    """
+    if "f_ann_date" not in df.columns:
+        return df
+    # 数值规范先行(Codex P2):parquet 可能把日期存 float(20230429.0),直接
+    # astype(str) 会被八位正则静默拒绝、修复失效;经 Int64 归一再转字符串
+    fa = pd.to_numeric(df["f_ann_date"], errors="coerce").astype("Int64").astype(str)
+    ok = fa.str.fullmatch(r"\d{8}", na=False)
+    out = df.copy()
+    out.loc[ok, "ann_date"] = fa[ok]
+    return out.drop(columns=["f_ann_date"])
+
+
 def point_in_time(hist: pd.DataFrame, asof: str, ann_col: str = "ann_date") -> "pd.Series | None":
     """防未来函数选期:返回截至 ``asof`` **已公告**(ann_date<=asof)的最新一期财务行。
 

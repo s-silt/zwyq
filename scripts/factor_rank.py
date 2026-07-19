@@ -104,7 +104,10 @@ def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
     # ann_date/update_flag 参与排序:同 (end_date) 多行(快照 vs 更正重述)时必须确定性地取
     # 最新更正值——update_flag='1' 是 tushare 更正后记录(官方语义),字符序恰排最后;
     # 否则不稳定排序会随机取到更正前的错值(实测 600115 归母净利更正前后差 1.6 亿,直接进 ACC 分子)。
-    need = ["ts_code", "end_date", "ann_date", "update_flag"] + cols
+    # f_ann_date:重述行实际发布日并入 ann_date(restated_visibility)——价格缓存停在
+    # 旧日而财务已刷新时,晚于 as_of 发布的更正不得以原公告日混入 PIT 闸门(与回测同修)。
+    from ashare_gauntlet.backtest import restated_visibility
+    need = ["ts_code", "end_date", "ann_date", "f_ann_date", "update_flag"] + cols
     out: dict[str, pd.Series] = {}
     for f in glob.glob(f"{CACHE}/{endpoint}/*.parquet"):
         try:
@@ -114,6 +117,7 @@ def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
             df = df[[c for c in need if c in df.columns]]
         if df.empty:
             continue
+        df = restated_visibility(df)
         if "ann_date" in df.columns:
             df = df[df["ann_date"].astype(str) <= str(as_of)]   # PIT:只用 as_of 已公告的行
             if df.empty:

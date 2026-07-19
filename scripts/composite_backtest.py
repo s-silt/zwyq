@@ -181,6 +181,7 @@ def main(argv: list[str] | None = None) -> None:
     rows: list[dict] = []
     prev_sets: dict[str, set | None] = {p: None for p in PORTS}
     contrib: dict[str, dict[str, float]] = {p: {} for p in PORTS}
+    members_log: list[dict] = []            # 逐期 PROD 成员(M2 入场实验消费)
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()] if board_of(str(c)) in MAIN]
@@ -291,6 +292,8 @@ def main(argv: list[str] | None = None) -> None:
             row["locked_in_prod"] = int(len(d10b.intersection(locked_idx)))   # 想买没买进的
             d10b = d10b.difference(locked_idx)
             members["PROD"] = d10b
+            members_log.append({"date": t, "entry_date": entry_date,
+                                "prod": sorted(str(c) for c in d10b)})
             members["PROD_G"] = pd.Index([c for c in d10b if tier[c] == "🟢"])
             members["PROD_GX"] = pd.Index([c for c in members["PROD_G"] if ind[c] not in excluded])
             row["hhi_PROD"] = industry_hhi(ind[d10b])
@@ -349,6 +352,11 @@ def main(argv: list[str] | None = None) -> None:
     # 先落盘再报告:149 期逐日计算约数十分钟,报告层的任何 bug 不允许毁掉计算成果
     os.makedirs(HOLDSCORE_DIR, exist_ok=True)
     res.to_json(f"{HOLDSCORE_DIR}/composite_backtest.json", orient="records", force_ascii=False, indent=2)
+    # PROD 成员逐期落盘(M2 入场实验的 common-support 基础:入场规则只在已审计的
+    # 生产 D10 成员上评测,不得另造候选口径——spec §6.2)
+    import json as _json
+    with open(f"{HOLDSCORE_DIR}/composite_members.json", "w", encoding="utf-8") as fh:
+        _json.dump(members_log, fh, ensure_ascii=False)
     y = res["date"].str[:4]
 
     print(f"\n=== composite 端到端组合回测(N={len(res)},{res['date'].min()}→{res['date'].max()},"

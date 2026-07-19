@@ -230,6 +230,16 @@ def main(argv: list[str] | None = None) -> None:
     df["TREND"] = trend_s.reindex(idx)               # 多窗口P/MA距离(展示:高=涨过头,反转向证据)
     df["NLIMIT"] = pd.Series(nlimit_cnt, dtype=float).reindex(idx).fillna(0.0)  # 无触及=0(定义性计数)
     df["spec_crowd"] = spec_crowd_flags(df["IVOL"], df["MAX"], df["NLIMIT"])
+    # 污染探针(R6 定义性零阈值:pe>0 且扣非TTM≤0=主业亏损靠非经常盈利;
+    # buy_list 消费该列把污染票压到 WAIT——评审曾指此前为死代码)。
+    # 延迟导入防循环(composite_backtest→aggressive_pick→factor_rank);
+    # dedt 构件严格 PIT(dedt_ttm_pit,只用 ann_date<=as_of 版本)
+    from scripts.composite_backtest import dedt_ttm_pit
+    from scripts.factor_backtest import _load as _fb_load
+    _fd = _fb_load("fina_indicator", ["profit_dedt"])
+    _fd = _fd[_fd["ann_date"].str.fullmatch(r"\d{8}", na=False)]
+    _dedt = dedt_ttm_pit(_fd, as_of).reindex(df.index)
+    df["poll_mark"] = ((df["pe"] > 0) & _dedt.notna() & (_dedt <= 0)).astype(bool)
 
     df["tier"] = [lean_tier(df["np_yoy"].iat[k], df["dedt_yoy"].iat[k], df["rev_yoy"].iat[k],
                             ocfps=df["ocfps"].iat[k], roe=df["roe"].iat[k]) for k in range(len(df))]
@@ -270,7 +280,7 @@ def main(argv: list[str] | None = None) -> None:
     keep = ["name", "industry", "tier", "pe", "pb", "roe", "mv", "decile", "score",
             "f_EP", "f_BP", "f_IVOL", "f_ROE", "f_GPOA", "f_ACC", "f_MOM", "f_TREND",
             "IVOL", "MAX", "NLIMIT", "TREND", "spec_crowd", "MOM", "ret5", "last", "dma20",
-            "spike_limit"]
+            "spike_limit", "poll_mark"]
     df[keep].reset_index().rename(columns={"index": "ts_code"}).to_json(
         f"{OUT_DIR}/{as_of}_factor.json", orient="records", force_ascii=False, indent=2)
 

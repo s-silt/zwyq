@@ -1,0 +1,183 @@
+"""每日四态买入决策清单(spec §9/§10/§11)——JSON 为唯一真相源,终端只呈现。
+
+Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.buy_list [--as-of YYYYMMDD]
+
+fail-loud(spec §11,任一命中即整场失败,不产出看似正常的快照):
+factor snapshot 非最新行情日 / schema 缺生产字段 / holdings 重复或非法 / policy 矛盾。
+决策不回写 holdings.json(模型建议≠已成交,spec §10)。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from datetime import datetime, timezone, timedelta
+
+from ashare_gauntlet.candidates import candidate_assessment
+from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH
+from ashare_gauntlet.data.partition import date_partition_files
+from ashare_gauntlet.portfolio_decision import decide_states, validate_policy
+
+FACTOR_DIR = "data/holdscore"
+DECISION_DIR = "data/decisions"
+POLICY_PATH = "data/trading_policy.json"
+OVERRIDES_PATH = "data/factcheck_overrides.json"
+REQUIRED_ROW_FIELDS = ("ts_code", "name", "industry", "decile", "tier",
+                       "spec_crowd", "spike_limit", "score", "last",
+                       "f_EP", "f_BP", "f_IVOL")   # 生产因子字段在场=snapshot 出自现役口径
+ENTRY_MODEL_VERSION = "research-only"   # M2 过门前不得宣称择时(spec §13)
+
+
+def latest_trade_date(cache: "str | None" = None) -> str:
+    files = date_partition_files(cache or CACHE, "daily")   # 调用时读全局(可测性)
+    if not files:
+        raise SystemExit("行情缓存为空——不生成决策")
+    return os.path.basename(files[-1])[:8]
+
+
+def validate_rows(rows: list[dict], held: "set[str] | None" = None) -> None:
+    held = held or set()
+    seen: set[str] = set()
+    for i, r in enumerate(rows):
+        missing = [f for f in REQUIRED_ROW_FIELDS if f not in r]
+        if missing:
+            raise SystemExit(f"factor snapshot 第{i}行缺生产字段 {missing}——不生成决策")
+        ts = str(r["ts_code"])
+        if ts in seen:
+            raise SystemExit(f"factor snapshot 重复代码 {ts}——不生成决策")
+        seen.add(ts)
+        # 被消费的行(D10 候选/持仓)score 与 last 必须有限——NaN 会破坏排序确定性
+        # 并伪装成合法证据(Codex review §③④)
+        if r.get("decile") == 10 or ts in held:
+            for f in ("score", "last"):
+                v = r.get(f)
+                if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
+                    raise SystemExit(f"factor snapshot {ts} 字段 {f}={v!r} 无效——不生成决策")
+
+
+def validate_holdings(h: dict) -> None:
+    seen: set[str] = set()
+    for p in h["positions"]:
+        ts = p["ts_code"]
+        if ts in seen:
+            raise SystemExit(f"holdings 重复代码 {ts}——不生成决策")
+        seen.add(ts)
+        sh, cost = p["shares"], float(p["cost"])
+        if (not isinstance(sh, (int, float)) or isinstance(sh, bool) or sh <= 0
+                or float(sh) != int(sh) or not math.isfinite(cost) or cost <= 0):
+            raise SystemExit(f"holdings 非法行 {ts}(shares={sh!r}/cost={cost!r})——不生成决策")
+        # 行业上限依赖 industry/mv;缺失=约束静默失效(对抗审查:生产 holdings 正是这个形状)
+        for f in ("industry", "mv", "last"):
+            if p.get(f) in (None, ""):
+                raise SystemExit(f"holdings {ts} 缺 {f} 字段——行业/风险约束无法执行,不生成决策")
+
+
+def load_overrides(path: "str | None" = None) -> dict[str, dict]:
+    try:
+        data = json.load(open(path or OVERRIDES_PATH, encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    return {o["ts_code"]: o for o in data["overrides"]}
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--as-of", dest="as_of", default=None)
+    a = ap.parse_args(argv)
+
+    trade_date = latest_trade_date()
+    as_of = a.as_of or trade_date
+    snap_path = f"{FACTOR_DIR}/{as_of}_factor.json"
+    if not os.path.exists(snap_path):
+        raise SystemExit(f"无 factor snapshot {snap_path}——先跑 scripts.factor_rank")
+    if as_of != trade_date:
+        raise SystemExit(f"snapshot 日期 {as_of} ≠ 最新行情日 {trade_date}——陈旧数据不生成决策")
+
+    # 复权/基础数据分区当日在场(深度完整性检查在上游 factor_rank/assert_adj_complete;
+    # 此处防"snapshot 在而底层分区被删/未拉"的错配,spec §11)
+    for ep in ("adj_factor", "daily_basic"):
+        if not os.path.exists(f"{CACHE}/{ep}/{as_of}.parquet"):
+            raise SystemExit(f"{ep}/{as_of} 分区缺失——底层数据不完整,不生成决策")
+
+    rows = json.load(open(snap_path, encoding="utf-8"))
+    hold = json.load(open(HOLDINGS_PATH, encoding="utf-8"))
+    validate_holdings(hold)
+    validate_rows(rows, held={p["ts_code"] for p in hold["positions"]})
+    policy = json.load(open(POLICY_PATH, encoding="utf-8"))
+    validate_policy(policy)
+    overrides = load_overrides()
+
+    held = {p["ts_code"]: p for p in hold["positions"]}
+    snap_last = {str(r["ts_code"]): r.get("last") for r in rows}
+    # 个人风险线(spec §8:触发 EXIT 但归因与因子模型分离)。价格口径=as_of 当日
+    # snapshot 收盘价优先,持仓掉出快照时退回 holdings 手工价(对抗审查 P1:
+    # holdings.last 为截图口径可能陈旧,snapshot 在场时不得使用)
+    risk_breach: set[str] = set()
+    for p in hold["positions"]:
+        if not p.get("stop"):
+            continue
+        px = snap_last.get(p["ts_code"], p.get("last"))
+        if px is None or not math.isfinite(float(px)):
+            raise SystemExit(f"holdings {p['ts_code']} 无可用价格(snapshot 缺行且 last 无效)——不生成决策")
+        if float(px) <= float(p["stop"]):
+            risk_breach.add(p["ts_code"])
+    manual_exit = {p["ts_code"] for p in hold["positions"] if p.get("logic_fail")}
+    cash = hold.get("cash")
+    account_value = (sum(float(p["mv"]) for p in hold["positions"]) + float(cash)
+                     if cash is not None else None)
+
+    # 相关股票 = D10 全档(BUY 候选与其 WAIT 理由)+ 当前持仓(HOLD/EXIT 判定)
+    assessments = [candidate_assessment(r, overrides.get(str(r["ts_code"])), as_of)
+                   for r in rows
+                   if r.get("decile") == 10 or r["ts_code"] in held]
+    # P0 修复(对抗审查):持仓股掉出 snapshot(变ST/🔴/亏损/停牌——恰是最危险情形)
+    # 时仍须消费人工红灯覆盖,否则 verdict=red 被静默吞掉、错误输出 HOLD
+    in_snap = {a["ts_code"] for a in assessments}
+    for ts, p in held.items():
+        if ts in in_snap:
+            continue
+        ov = overrides.get(ts)
+        assessments.append({"ts_code": ts, "name": p.get("name", ts),
+                            "industry": p.get("industry", "其他"), "score": None,
+                            "last": p.get("last"), "decile": None, "spec_crowd": None,
+                            "spike_limit": None, "eligible_buy": False,
+                            "reason_codes": ["SNAPSHOT_MISSING"],
+                            "governance_red": bool(ov) and str(ov["verdict"]) == "red"})
+    decisions = decide_states(assessments, held, policy,
+                              account_value=account_value,
+                              cash=float(cash) if cash is not None else None,
+                              risk_breach=risk_breach, manual_exit=manual_exit)
+
+    out = {"as_of": as_of,
+           "generated_at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
+           "factor_snapshot": snap_path,
+           "policy_version": str(policy["policy_version"]),
+           "entry_model_version": ENTRY_MODEL_VERSION,
+           "data_status": "complete",
+           "decisions": decisions}
+    os.makedirs(DECISION_DIR, exist_ok=True)
+    out_path = f"{DECISION_DIR}/{as_of}_buy_decisions.json"
+    json.dump(out, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    print(f"=== 四态决策(as_of={as_of},entry_model={ENTRY_MODEL_VERSION},"
+          f"policy v{policy['policy_version']})===")
+    for state in ("BUY", "WAIT", "HOLD", "EXIT"):   # spec §9 CLI 分组序
+        group = [d for d in decisions if d["state"] == state]
+        if state == "WAIT" and len(group) > 15:
+            shown, extra = group[:15], len(group) - 15
+        else:
+            shown, extra = group, 0
+        print(f"[{state}] {len(group)} 只")
+        for d in shown:
+            ex = d["execution"]
+            qty = f" {ex['shares']}股" if ex["shares"] else ""
+            # 每行自带数据日期(spec §9:截屏/复制传播时单行不脱离口径)
+            print(f"  {d['name']:　<6}{d['ts_code']}{qty}  {'/'.join(d['reason_codes'])}  [{as_of}]")
+        if extra:
+            print(f"  …另 {extra} 只 WAIT(完整名单见 JSON)")
+    print(f"→ {out_path}(机器唯一真相源;非荐股,执行须人工确认)")
+
+
+if __name__ == "__main__":
+    main()

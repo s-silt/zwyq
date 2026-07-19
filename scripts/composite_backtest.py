@@ -44,8 +44,11 @@ from ashare_gauntlet.factor_model import (
     daily_returns,
     factor_percentile,
     ivol_capm,
+    max_daily_ret,
     to_decile,
+    trend_ma_distance,
 )
+from ashare_gauntlet.namechange import load_namechange, st_codes_asof
 from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
 from scripts.aggressive_pick import load_excluded_industries
@@ -58,7 +61,10 @@ from scripts.factor_backtest import (
     leg_turnover,
     one_word_limit_down,
     one_word_limit_up,
+    touched_row,
 )
+
+INCR_FACTORS = ("ACC", "MAX", "NLIMIT", "TREND")   # X-02/X-03:全部负向(低者好)
 
 MOM_LB = 250   # 与 factor_backtest 同锚:保证换仓日集合一致(N 可比),非本实验用到动量
 
@@ -156,6 +162,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="单边佣金率(万2.5,与 factor_backtest 同出处)")
     ap.add_argument("--slippage", type=float, default=0.0015,
                     help="单边滑点率(LWZ 2022 JFE 中国实测 15bp 下沿)")
+    ap.add_argument("--increments", action="store_true",
+                    help="X-02/X-03:ACC/MAX/NLIMIT/TREND 对 composite 的 common-support "
+                         "增量与冗余(加载财务三表+stk_limit 触板面板,启动慢数分钟)")
     a = ap.parse_args(argv)
 
     excluded = load_excluded_industries()
@@ -166,6 +175,13 @@ def main(argv: list[str] | None = None) -> None:
     # 脏 ann_date(NaN→astype(str)→"nan" 会恒排最后赢得构件查表)从严剔除,
     # 与生产 latest_rows 的三键排序防线同精神(审查 P2-7)
     fdedt = fdedt[fdedt["ann_date"].str.fullmatch(r"\d{8}", na=False)]
+    # X-02/X-03:增量因子的财务构件(ACC=(归母净利−经营现金流)/总资产,PIT 同 _pit)
+    inc_t = cf_t = bs_t = None
+    if a.increments:
+        print("加载增量因子财务三表(income/cashflow/balancesheet)…", flush=True)
+        inc_t = _load("income", ["n_income_attr_p"])
+        cf_t = _load("cashflow", ["n_cashflow_act"])
+        bs_t = _load("balancesheet", ["total_assets"])
     pro = tushare_pro()
     # 宇宙名录 = L+D+P 全状态(评审三轮 P0-2:仅 list_status="L" 会把后来退市的
     # 股票从宇宙 B 整段历史剔除——退市财务回填白做,幸存者偏差从后门回来)
@@ -173,11 +189,14 @@ def main(argv: list[str] | None = None) -> None:
         list_status=s, fields="ts_code,industry,name")) for s in ("L", "D", "P")]
     sb = pd.concat(frames, ignore_index=True).drop_duplicates("ts_code").set_index("ts_code")
     ind_all = sb["industry"].fillna("其他")
-    # ST 剔除=最终名称近似(历史逐日 ST 状态需 namechange PIT 面板,记为残余偏差:
-    # 后来戴帽的被错误早剔、当时戴帽后摘帽的被错误纳入;规模已在报告尾量化)
-    non_st = ~sb["name"].astype(str).str.contains("ST", na=False)
+    # X-05:ST 剔除改 **PIT 名称面板**(namechange 生效日区间,st_codes_asof 按期还原
+    # 当日名称)——废弃"最终名称近似"残余偏差;旧静态掩码仅保留作对照统计
+    changes = load_namechange(CACHE)
+    fallback_names = sb["name"].astype(str)
+    static_st = fallback_names.str.contains("ST", na=False)
 
-    da = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "open", "close"])
+    da_cols = ["ts_code", "trade_date", "open", "close"] + (["high"] if a.increments else [])
+    da = pd.concat([pd.read_parquet(f, columns=da_cols)
                     for f in date_partition_files(CACHE, "daily")], ignore_index=True)
     aj = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "adj_factor"])
                     for f in date_partition_files(CACHE, "adj_factor")], ignore_index=True)
@@ -190,6 +209,19 @@ def main(argv: list[str] | None = None) -> None:
     open_p = px.pivot_table(index="trade_date", columns="ts_code", values="aopen")
     ret_p = daily_returns(close_p)          # 停牌 NaN 保持(伪低波防线,与引擎同)
     mkt = ret_p.mean(axis=1)
+    # X-03:NLIMIT 需近月触涨停计数(与 factor_backtest --candidates 同构造)
+    touched_p = None
+    if a.increments:
+        print("构建触涨停面板(stk_limit 全史)…", flush=True)
+        high_p = px.pivot_table(index="trade_date", columns="ts_code", values="high")
+        touched_rows = {}
+        for f in date_partition_files(CACHE, "stk_limit"):
+            d_ = os.path.basename(f)[:8]
+            if d_ not in high_p.index:
+                continue
+            ul = pd.read_parquet(f, columns=["ts_code", "up_limit"]).set_index("ts_code")["up_limit"]
+            touched_rows[d_] = touched_row(high_p.loc[d_], ul)
+        touched_p = pd.DataFrame(touched_rows).T.sort_index()
 
     di = {d: i for i, d in enumerate(dates)}
     month_last: dict[str, str] = {}
@@ -201,9 +233,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日;宇宙=主板,"
           f"构造与 factor_rank 同函数(factor_percentile/composite/to_decile)", flush=True)
 
+    ports = list(PORTS)
+    if a.increments:
+        for x in INCR_FACTORS:
+            ports += [f"CS3_{x}", f"P4_{x}"]   # 同池 3因子基线 / +x 的4因子(common-support 对)
     rows: list[dict] = []
-    prev_sets: dict[str, set | None] = {p: None for p in PORTS}
-    contrib: dict[str, dict[str, float]] = {p: {} for p in PORTS}
+    prev_sets: dict[str, set | None] = {p: None for p in ports}
+    contrib: dict[str, dict[str, float]] = {p: {} for p in ports}
     members_log: list[dict] = []            # 逐期 PROD 成员(M2 入场实验消费)
     c2_prev: set[str] = set()               # M3:PROD_C2 上期持仓
     c2_out_streak: dict[str, int] = {}      # M3:跌出 D10 连续期数
@@ -259,6 +295,22 @@ def main(argv: list[str] | None = None) -> None:
         raw["EP"] = (1.0 / pe).where(pe > 0)
         raw["BP"] = (1.0 / pb_).where(pb_ > 0)
         raw["IVOL"] = ivol_capm(ret_p.iloc[: it + 1], mkt.iloc[: it + 1], 21).reindex(idx)
+        if a.increments:
+            # 增量因子原值(全部负向,构造与 factor_backtest 被验证的形态一致)
+            ni = _pit(inc_t, t)["n_income_attr_p"].reindex(idx)
+            ocf = _pit(cf_t, t)["n_cashflow_act"].reindex(idx)
+            ta = _pit(bs_t, t)["total_assets"].reindex(idx)
+            raw["ACC"] = (ni - ocf) / ta
+            raw["MAX"] = max_daily_ret(ret_p.iloc[: it + 1], 21).reindex(idx)
+            raw["TREND"] = trend_ma_distance(close_p.iloc[: it + 1]).reindex(idx)
+            win_days = dates[it - 20: it + 1]
+            if touched_p is not None and all(d_ in touched_p.index for d_ in win_days):
+                s_ = touched_p.loc[win_days]
+                nl = s_.sum().astype(float)
+                nl[s_.isna().any()] = float("nan")
+                raw["NLIMIT"] = nl.reindex(idx)
+            else:
+                raw["NLIMIT"] = pd.Series(float("nan"), index=idx)
         # 扣非 EP(R4/R6):严格 PIT TTM(元)/ 总市值(daily_basic total_mv 单位=万元);
         # 与 EP 同样仅在 E>0 下有定义(价值因子语义)
         dedt = dedt_ttm_pit(fdedt, t).reindex(idx)
@@ -274,14 +326,18 @@ def main(argv: list[str] | None = None) -> None:
                        pf["tr_yoy"].get(c), ocfps=pf["ocfps"].get(c), roe=pf["roe"].get(c))
              for c in idx], index=idx)
 
-        def score_deciles(sub: pd.Index, ep_col: str = "EP") -> "pd.Series | None":
+        def score_deciles(sub: pd.Index, ep_col: str = "EP",
+                          extra: "str | None" = None) -> "pd.Series | None":
             """给定宇宙内按生产构造打分定档。**先滤后排**(对抗审查 P1-1:生产是
             tier→剔ST→pe>0→三因子全齐先过滤、再在滤后池算百分位;先排后滤会让
             pe≤0 等出局票污染 BP/IVOL 的百分位池/行业中位/size 桶界)。
 
             ep_col="EPD" 时为 R4 对照:EP 换扣非 TTM 口径,其余构造不变。
+            extra 给定时为 X-02/X-03 增量口径:四因子等权(extra 一律负向——
+            ACC/MAX/NLIMIT/TREND 的方向证据均为反向),入池门槛同步要求 extra 可得。
             """
-            ok = raw.loc[sub, [ep_col, "BP", "IVOL"]].notna().all(axis=1)
+            cols = [ep_col, "BP", "IVOL"] + ([extra] if extra else [])
+            ok = raw.loc[sub, cols].notna().all(axis=1)
             pool = sub[ok]                      # 入池门槛先行(composite_inputs_complete 同序)
             if len(pool) < 50:
                 return None
@@ -289,6 +345,9 @@ def main(argv: list[str] | None = None) -> None:
             f["f_EP"] = factor_percentile(raw.loc[pool, ep_col], ind[pool], True, logmv=logmv[pool])
             f["f_BP"] = factor_percentile(raw.loc[pool, "BP"], ind[pool], True, logmv=logmv[pool])
             f["f_IVOL"] = factor_percentile(raw.loc[pool, "IVOL"], ind[pool], False, logmv=logmv[pool])
+            if extra:
+                f[f"f_{extra}"] = factor_percentile(raw.loc[pool, extra], ind[pool], False,
+                                                    logmv=logmv[pool])
             return to_decile(composite(f))
 
         members: dict[str, pd.Index] = {}
@@ -308,10 +367,15 @@ def main(argv: list[str] | None = None) -> None:
             m = dec_a.index[dec_a == q].difference(locked_idx)
             row[f"ret_Q{q}"] = float(fwd[m].mean()) if len(m) else float("nan")
 
-        # 宇宙B:生产复刻(与 factor_rank 同序:tier 🟢🟡 + 有已披露财务 + 剔 ST[最终名称近似])。
-        # 对抗审查 P1-1 实测:漏掉 has_fina/ST 时每期 D10 与生产对称差 ~9%(含 ST 票混入)
+        # 宇宙B:生产复刻(与 factor_rank 同序:tier 🟢🟡 + 有已披露财务 + 剔 ST)。
+        # X-05:ST 用 **PIT 名称面板**(当期生效名称含 ST 才剔)——后来戴帽的不再被
+        # 错误早剔、当时戴帽后摘帽的不再被错误纳入;与旧静态近似的逐期差异入 row
+        st_now = st_codes_asof(changes, t, fallback_names)
+        st_dyn_mask = pd.Series([c in st_now for c in idx], index=idx)
+        row["n_st_dyn"] = int(st_dyn_mask.sum())
+        row["st_sym_diff"] = int((st_dyn_mask ^ static_st.reindex(idx).fillna(False)).sum())
         has_fina = idx.isin(pf.index)
-        sub_b = idx[tier.isin(["🟢", "🟡"]) & has_fina & non_st.reindex(idx).fillna(False)]
+        sub_b = idx[tier.isin(["🟢", "🟡"]) & has_fina & ~st_dyn_mask]
         dec_b = score_deciles(sub_b)
         if dec_b is not None:
             d10b = dec_b.index[dec_b == 10]
@@ -340,6 +404,24 @@ def main(argv: list[str] | None = None) -> None:
             u3 = set().union(*d10_hist)
             members["PROD_U3"] = pd.Index(sorted(c for c in u3
                                                  if c in fwd.index and pd.notna(entry.get(c))))
+        # X-02/X-03:每个增量因子一对 common-support 组合——同一 pool_x(EP/BP/IVOL/x
+        # 全可得)上分别跑 3因子基线与 +x 四因子;两者之差=纯因子增量,剥离覆盖池
+        # 变化(R6 的 common-support 教训直接搬用)。冗余=pool 内双中性分位的秩相关。
+        if a.increments and dec_b is not None:
+            for x in INCR_FACTORS:
+                pool_x = sub_b[raw.loc[sub_b, ["EP", "BP", "IVOL", x]].notna().all(axis=1)]
+                d3 = score_deciles(pool_x)
+                d4 = score_deciles(pool_x, extra=x)
+                if d3 is None or d4 is None:
+                    continue
+                members[f"CS3_{x}"] = d3.index[d3 == 10].difference(locked_idx)
+                members[f"P4_{x}"] = d4.index[d4 == 10].difference(locked_idx)
+                fx = factor_percentile(raw.loc[pool_x, x], ind[pool_x], False,
+                                       logmv=logmv[pool_x])
+                fiv = factor_percentile(raw.loc[pool_x, "IVOL"], ind[pool_x], False,
+                                        logmv=logmv[pool_x])
+                row[f"corr_{x}_IVOL"] = float(fx.rank().corr(fiv.rank()))
+                row[f"n_pool_{x}"] = int(len(pool_x))
         row["n_poll_universe"] = int(poll_mark[sub_b].sum())
         # R4:同宇宙、EP→扣非 TTM 口径的对照组合 + 因子级 IC 对照(可执行宇宙百分位)
         dec_d = score_deciles(sub_b, ep_col="EPD")
@@ -361,7 +443,7 @@ def main(argv: list[str] | None = None) -> None:
             factor_percentile(raw["EP"], ind, True, logmv=logmv)[exec_idx], fwd[exec_idx])
         row["IC_EPD"] = information_coefficient(
             factor_percentile(raw["EPD"], ind, True, logmv=logmv)[exec_idx], fwd[exec_idx])
-        for p in PORTS:
+        for p in ports:
             m = members.get(p)
             if m is None or not len(m):
                 row[f"ret_{p}"] = float("nan")
@@ -406,7 +488,7 @@ def main(argv: list[str] | None = None) -> None:
           + " ".join(f"{m:+.2f}" for _, m in dec_means) + f" | 单调性ρ={mono:+.2f}")
     print(f"{'组合':>8}{'期数':>5}{'均只数':>7}{'超额毛%':>8}{'NW t':>7}{'换手':>6}{'超额净%':>8}"
           f"{'年胜率':>7}{'涨市%':>7}{'跌市%':>7}{'绝对MaxDD':>10}{'单票贡献':>9}")
-    for p in PORTS:
+    for p in ports:
         ex = res[f"ret_{p}"] - res["mkt_fwd"]
         net = ex - res[f"TO_{p}"] * res["cost_rt"]
         _, tnw, _ = newey_west_tstat(ex.dropna())
@@ -443,11 +525,29 @@ def main(argv: list[str] | None = None) -> None:
     print(f"退出顺延合计 {res['exit_deferred'].sum()} 次,未解(退市终局){res['exit_unresolved'].sum()} 次;"
           f"T+1 一字涨停均锁 {res['n_locked'].mean():.1f} 只/期,其中锁在 PROD 内(想买没买进)"
           f"均 {res['locked_in_prod'].mean():.2f} 只/期")
-    print(f"已知与生产的残余差异(评审三轮后口径):①宇宙名录=L+D+P 全状态(退市股在池),"
-          f"但 ST=最终名称近似(历史逐日戴帽状态需 namechange PIT——当前按名称剔除 "
-          f"{int((~non_st).sum())} 只,双向偏差:后来戴帽的被错误早剔/摘帽的被错误纳入);"
-          f"②退出顺延跨税改日时印花税取计划退出日段(量级趋零);③⚡🎰/dma20 展示列不入分。"
-          f"(dedt TTM 构件已改严格 PIT 现算,旧'更正后终值'近似废弃——R6)")
+    # X-05:PIT ST 面板 vs 旧最终名称近似的量化(对称差=两口径判定不同的票数)
+    print(f"ST 剔除=PIT 名称面板(X-05,namechange 生效日区间):均 "
+          f"{res['n_st_dyn'].mean():.0f} 只/期被判 ST;与旧'最终名称近似'的对称差均 "
+          f"{res['st_sym_diff'].mean():.0f} 只/期(峰值 {res['st_sym_diff'].max():.0f})")
+    if a.increments:
+        print(f"\n=== X-02/X-03 composite 增量(common-support:同池 4因子 − 3因子基线;"
+              f"准入门=|NW t|>3 且经济意义为正)===")
+        for x in INCR_FACTORS:
+            inc = res[f"ret_P4_{x}"] - res[f"ret_CS3_{x}"]
+            _, t_inc, _ = newey_west_tstat(inc.dropna())
+            net_inc = ((res[f"ret_P4_{x}"] - res[f"TO_P4_{x}"] * res["cost_rt"])
+                       - (res[f"ret_CS3_{x}"] - res[f"TO_CS3_{x}"] * res["cost_rt"])).dropna()
+            corr = res[f"corr_{x}_IVOL"].mean() if f"corr_{x}_IVOL" in res else float("nan")
+            # 准入=显著为正且净增量为正(Codex P2:abs() 会把显著负增量误报过门)
+            verdict = ("过t>3门" if (t_inc > 3 and float(net_inc.mean()) > 0)
+                       else "未过t>3门")
+            print(f"{x:>6}: 毛增量{inc.mean() * 100:+.3f}%/期 NW t{t_inc:+.2f}"
+                  f" | 净增量{net_inc.mean() * 100:+.3f}%"
+                  f" | 换手{res[f'TO_CS3_{x}'].mean():.0%}→{res[f'TO_P4_{x}'].mean():.0%}"
+                  f" | 与f_IVOL秩相关{corr:+.2f} | N={int(inc.notna().sum())} | {verdict}")
+    print(f"已知与生产的残余差异(评审三轮后口径):①退出顺延跨税改日时印花税取计划"
+          f"退出日段(量级趋零);②⚡🎰/dma20 展示列不入分。(ST 已改 PIT 名称面板——"
+          f"X-05;dedt TTM 构件严格 PIT 现算——R6)")
     print("→ 明细 data/holdscore/composite_backtest.json(已在报告前落盘)")
 
 

@@ -56,6 +56,28 @@ def test_top_contrib_share():
     assert pd.isna(top_contrib_share(pd.Series(dtype=float)))
 
 
+# ---------- c2_step:C2 退出规则状态机(M3;跌出首期保留/连续第2期剔/回档清零) ----------
+
+def test_c2_step_state_machine():
+    from scripts.composite_backtest import c2_step
+
+    tradable = {"A", "B", "C"}
+    # 首期:B 跌出 D10 但保留(streak=1)
+    m1, s1 = c2_step({"A", "B"}, {}, {"A"}, tradable)
+    assert m1 == {"A", "B"} and s1 == {"B": 1}
+    # 次期仍在档外:B 被剔
+    m2, s2 = c2_step(m1, s1, {"A"}, tradable)
+    assert m2 == {"A"} and s2 == {}
+    # 回档清零:B 回到 D10 后再跌出,重新从 streak=1 开始
+    m3, s3 = c2_step({"A", "B"}, {"B": 1}, {"A", "B"}, tradable)
+    assert m3 == {"A", "B"} and s3 == {}
+    m4, s4 = c2_step(m3, s3, {"A"}, tradable)
+    assert "B" in m4 and s4 == {"B": 1}
+    # 不可交易的跌出票不保留
+    m5, s5 = c2_step({"A", "D"}, {}, {"A"}, tradable)
+    assert m5 == {"A"} and s5 == {}
+
+
 # ---------- dedt_ttm_pit:扣非 TTM,构件严格 PIT(评审三轮 R6:不得用未来更正值) ----------
 
 def _fina(rows, code="000001.SZ"):

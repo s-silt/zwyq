@@ -122,7 +122,30 @@ def dedt_ttm_pit(fd: pd.DataFrame, asof: str) -> pd.Series:
     return pd.Series(out)
 
 
-PORTS = ("D10", "PROD", "PROD_G", "PROD_GX", "PROD_DEDT", "CS_EP", "CS_EPD", "PROD_XP")
+PORTS = ("D10", "PROD", "PROD_G", "PROD_GX", "PROD_DEDT", "CS_EP", "CS_EPD", "PROD_XP",
+         "PROD_C2", "PROD_U3")
+# M3 退出规则变体(spec §7:跌出 D10 何时退出不手拍,组合级实验定):
+# PROD    = 立即退出(每期重建为当期 D10,现行语义)
+# PROD_C2 = 连续确认:跌出 D10 第 1 个**有效审视期**保留,连续第 2 期才剔
+# PROD_U3 = 近 3 个有效观测期 D10 **唯一成员并集等权**(注意:非严格 1/3 梯队——
+#           连续入选者不叠加权重,cohort 加权版留待需要时实现;Codex review 订正)
+
+
+def c2_step(prev_members: "set[str]", out_streak: dict[str, int], d10: "set[str]",
+            tradable: "set[str]") -> "tuple[set[str], dict[str, int]]":
+    """C2 退出规则单步状态机(可单测):跌出首期保留,连续第 2 期剔;回档即清零。
+
+    tradable=当期可交易宇宙(有收盘且 T+1 有开盘);跳期语义=按**有效审视期**计
+    (缺期不推进也不清零,Codex review P1 明确)。
+    """
+    keep_extra: set[str] = set()
+    new_streak: dict[str, int] = {}
+    for c in prev_members - d10:
+        s = out_streak.get(c, 0) + 1
+        if s < 2 and c in tradable:
+            keep_extra.add(c)
+            new_streak[c] = s
+    return d10 | keep_extra, new_streak
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -182,6 +205,9 @@ def main(argv: list[str] | None = None) -> None:
     prev_sets: dict[str, set | None] = {p: None for p in PORTS}
     contrib: dict[str, dict[str, float]] = {p: {} for p in PORTS}
     members_log: list[dict] = []            # 逐期 PROD 成员(M2 入场实验消费)
+    c2_prev: set[str] = set()               # M3:PROD_C2 上期持仓
+    c2_out_streak: dict[str, int] = {}      # M3:跌出 D10 连续期数
+    d10_hist: list[set[str]] = []           # M3:PROD_U3 近 3 期 D10 集合
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()] if board_of(str(c)) in MAIN]
@@ -302,6 +328,18 @@ def main(argv: list[str] | None = None) -> None:
             row["n_poll_prod"] = int(len(poll_in))
             row["ret_poll_prod"] = float(fwd[poll_in].mean()) if len(poll_in) else float("nan")
             members["PROD_XP"] = d10b.difference(poll_in)
+            # M3 退出规则变体(基于同一 d10b,持仓延续项只保留仍可交易的票)
+            d10_set = set(str(c) for c in d10b)
+            tradable = {c for c in fwd.index if pd.notna(entry.get(c))}
+            c2_members, c2_out_streak = c2_step(c2_prev, c2_out_streak, d10_set, tradable)
+            c2_prev = c2_members
+            members["PROD_C2"] = pd.Index(sorted(c2_members))
+            d10_hist.append(d10_set)
+            if len(d10_hist) > 3:
+                d10_hist.pop(0)
+            u3 = set().union(*d10_hist)
+            members["PROD_U3"] = pd.Index(sorted(c for c in u3
+                                                 if c in fwd.index and pd.notna(entry.get(c))))
         row["n_poll_universe"] = int(poll_mark[sub_b].sum())
         # R4:同宇宙、EP→扣非 TTM 口径的对照组合 + 因子级 IC 对照(可执行宇宙百分位)
         dec_d = score_deciles(sub_b, ep_col="EPD")

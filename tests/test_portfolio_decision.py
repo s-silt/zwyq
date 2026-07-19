@@ -65,13 +65,13 @@ def test_account_state_missing_gives_zero_shares():
 def test_held_stays_hold_without_new_buy_and_after_decile_drop():
     from ashare_gauntlet.portfolio_decision import decide_states
 
-    # 跌出 D10 的持仓:退出规则未过实验 → HOLD + EXIT_RULE_PENDING_RESEARCH(spec §7 不手拍)
+    # 跌出 D10 的持仓:生产退出规则=C2 月度审视(methodology §10),日频快照挂语义码不退
     ds = decide_states([_a("600003.SH", eligible=False, codes=["NOT_D10"])],
                        {"600003.SH": _held("600003.SH")}, POLICY,
                        account_value=100_000.0, cash=10_000.0)
     d = ds[0]
     assert d["state"] == "HOLD"
-    assert "EXIT_RULE_PENDING_RESEARCH" in d["reason_codes"]
+    assert "EXIT_RULE_C2_MONTHLY" in d["reason_codes"]
 
 
 def test_exit_only_from_predefined_reasons():

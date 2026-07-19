@@ -2,7 +2,7 @@
 
 关键约定:
 - HOLD:持仓未触发预定义退出即保留;跌出 D10 不手拍退出(spec §7,退出规则
-  待组合级实验)→ HOLD + EXIT_RULE_PENDING_RESEARCH;
+  经组合级实验定为 C2 月度规则)→ HOLD + EXIT_RULE_C2_MONTHLY;
 - EXIT 仅由预定义原因产生:GOVERNANCE_RED / RISK_LINE_BREACH(个人风险线,
   归因与因子模型分离)/ MANUAL_LOGIC_FAIL(人工逻辑失效覆盖);
 - BUY 分配:先保留 HOLD,再按 score 降序(同分 ts_code 升序)遍历,行业 20% 上限、
@@ -73,7 +73,10 @@ def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
             continue
         hold_codes = ["HELD"]
         if a is None or not a.get("eligible_buy"):
-            hold_codes.append("EXIT_RULE_PENDING_RESEARCH")   # 跌出生产资格≠自动退出(spec §7)
+            # 跌出生产资格≠当日退出:生产退出规则=C2(连续2个月度审视仍在D10档外才
+            # EXIT,methodology §10 退出规则实验:净+0.35% vs 立即退出+0.30%,换手减半);
+            # 月度审视由盘后例行执行,日频快照只挂语义码不累计
+            hold_codes.append("EXIT_RULE_C2_MONTHLY")
         decisions.append(_mk(ts, pos.get("name", ts), "HOLD", hold_codes, a, _exec(0, None)))
 
     # —— 未持仓:BUY 分配或 WAIT ——

@@ -48,7 +48,6 @@ import pandas as pd
 from ashare_gauntlet.backtest import (
     information_coefficient,
     newey_west_tstat,
-    quantile_spread,
     restated_visibility,
 )
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR, tushare_pro
@@ -314,6 +313,29 @@ def quantile_leg_means(factor: pd.Series, fwd_return: pd.Series, q: int = 5) -> 
     return float(df.loc[bucket == 0, "r"].mean()), float(df.loc[bucket == q - 1, "r"].mean())
 
 
+def full_pool_quantile_stats(neu: pd.Series, fwd: pd.Series,
+                             q: int = 5) -> "tuple[float, float, float, set[str], set[str]]":
+    """X-06:分位边界在**全因子池**上划,收益只在可成交成员上取均值。
+
+    旧口径(quantile_spread/quantile_leg_means/quantile_legs 的 join+dropna)把
+    T+1 一字涨停票先剔再划桶——桶界被 T+1 信息改写,与 composite P0-1 判前视的
+    同一形态。本函数:qcut 于 neu.dropna()(t 日可知信息),各桶收益均值 skipna
+    (涨停/停牌成员如实缺席不伪造);腿集合=桶成员∩有收益(换手口径=实际可持有,
+    P0② 语义保持)。样本 < q×5 无分位语义 → NaN + 空集(与 quantile_spread 同门槛)。
+    返回 (spread, qlo, qhi, low_exec, high_exec)。
+    """
+    f = neu.dropna()
+    if len(f) < q * 5:
+        return math.nan, math.nan, math.nan, set(), set()
+    b = pd.qcut(f.rank(method="first"), q, labels=False)
+    low_idx, high_idx = b.index[b == 0], b.index[b == q - 1]
+    qlo = float(fwd.reindex(low_idx).mean())
+    qhi = float(fwd.reindex(high_idx).mean())
+    low_exec = {str(c) for c in low_idx if pd.notna(fwd.get(c))}
+    high_exec = {str(c) for c in high_idx if pd.notna(fwd.get(c))}
+    return qhi - qlo, qlo, qhi, low_exec, high_exec
+
+
 def exclude_shell(mv: pd.Series) -> list[str]:
     """LSY(Liu-Stambaugh-Yuan 2019 JFE, CH-3)剔壳:剔除当期市值最小 30% 的股票。
 
@@ -445,14 +467,16 @@ def main(argv: list[str] | None = None) -> None:
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()]
                  if a.board != "main" or board_of(str(c)) in MAIN]
-        # 可成交性过滤:入场日 t+1 一字涨停买不进,剔出当期横截面(停牌股 entry 无行
-        # 天然 NaN,无需另处理);剔除数每期打印 surface,不悄悄改样本
+        if len(codes) < 50:
+            continue
+        # X-06(剔除后置):T+1 一字涨停=可成交性约束,**不再从打分/中性化/分位池
+        # 预先剔出**(t 日不知明天涨停名单,先剔后排=用 T+1 信息改写行业中位/size
+        # 桶/桶界,与 composite P0-1 判前视同一形态);锁定票留在全池划桶,只在
+        # 收益侧记 NaN(买不进=收益不可实现),经 IC 配对 dropna / 桶均值 skipna
+        # 如实缺席。锁定数照旧 surface。
         entry_date = dates[it + 1]
         locked = one_word_limit_up(fetch_market_day(pro, "daily", entry_date, CACHE),
                                    fetch_market_day(pro, "stk_limit", entry_date, CACHE), codes)
-        codes = [c for c in codes if c not in locked]
-        if len(codes) < 50:
-            continue
         idx = pd.Index(codes)
         # 未来收益:T+1 开盘买入 → 持有窗口内最后成交价(ffill,退市/停牌不丢崩盘收益)
         win = open_p.iloc[it + 1: it + 2 + a.fwd][codes]
@@ -478,7 +502,9 @@ def main(argv: list[str] | None = None) -> None:
         suspended_exit = {c for c in codes if pd.isna(open_p.iloc[exit_pos].get(c))
                           and pd.notna(entry.get(c))}   # 入场成功但退出日无行=停牌中
         n_deferred = n_unresolved = defer_days = 0
-        for c in locked_exit | suspended_exit:
+        # 入场锁定票从未建仓,不进退出顺延统计(Codex P2:计入会让退出约束
+        # 计数不再代表实际持仓;其 fwd 随后置 NaN,价格顺延对它们无意义)
+        for c in (locked_exit | suspended_exit) - locked:
             r = first_sellable_open(open_p[c], exit_pos + 1, lambda j, _c=c: _locked(j, _c))
             if r is None:
                 n_unresolved += 1            # 退市终局:保持窗口内最后成交价(已含崩盘)
@@ -487,7 +513,8 @@ def main(argv: list[str] | None = None) -> None:
                 n_deferred += 1
                 defer_days += r[1] + 1       # +1:从退出日顺延到可卖日至少隔 1 个交易日
         fwd = exit_ / entry - 1.0
-        print(f"  {k + 1}/{len(rebal)} {t} 入场{entry_date} 一字涨停剔除{len(locked)}只"
+        fwd.loc[[c for c in locked if c in fwd.index]] = float("nan")   # X-06 评估侧缺席
+        print(f"  {k + 1}/{len(rebal)} {t} 入场{entry_date} 一字涨停锁定{len(locked)}只(评估侧NaN)"
               f"{defer_note(n_deferred, defer_days, n_unresolved)}", flush=True)
         # 市值(size 中性)+ 估值(EP/BP 与生产 factor_rank 同口径:1/pe_ttm、1/pb,
         # 仅盈利/正净资产下有定义;旧版 eps/bps÷前复权价的复权乘数每只不同→横截面扭曲)
@@ -551,12 +578,12 @@ def main(argv: list[str] | None = None) -> None:
         neu_df = pd.DataFrame({fac: neutralize_industry_size(raw[fac], ind, logmv) for fac in FACTORS})
         for fac in FACTORS:
             row["IC_" + fac] = information_coefficient(neu_df[fac], fwd)
-            row["SPR_" + fac] = quantile_spread(neu_df[fac], fwd, 5)
-            row["QLO_" + fac], row["QHI_" + fac] = quantile_leg_means(neu_df[fac], fwd, 5)
-            # 真实换手折扣(P0②):腿成员只含**可执行**股(入场日有价;entry NaN=买不到,
-            # 进腿集合会让换手口径与实际组合脱节——review 第三批 P2);逐腿 τ 分存
-            # (TOLO/TOHI:多头腿成本要用对应腿的 τ,两腿平均会错估——第三批 P1)
-            low, high = quantile_legs(neu_df[fac][fwd.notna()], 5)
+            # X-06:桶界在全因子池上划(quantile_spread/quantile_leg_means 的
+            # join+dropna 会让桶界被 T+1 可成交性改写),腿集合=桶成员∩可执行
+            # (P0② 换手口径=实际可持有,语义保持;锁定/停牌成员收益侧 skipna 缺席)
+            spr, qlo, qhi, low, high = full_pool_quantile_stats(neu_df[fac], fwd, 5)
+            row["SPR_" + fac] = spr
+            row["QLO_" + fac], row["QHI_" + fac] = qlo, qhi
             pl = prev_legs.get(fac)
             tol = leg_turnover(pl[0] if pl else None, low)
             toh = leg_turnover(pl[1] if pl else None, high)

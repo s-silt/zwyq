@@ -40,10 +40,10 @@ from scripts.factor_backtest import (
     amihud_illiq,
     defer_note,
     first_sellable_open,
+    full_pool_quantile_stats,
     leg_turnover,
     one_word_limit_down,
     one_word_limit_up,
-    quantile_legs,
 )
 
 MOM_LB = 250     # 与 factor_backtest 同锚:换仓日集合一致(N 可比)
@@ -119,9 +119,10 @@ def main(argv: list[str] | None = None) -> None:
         if len(codes) < 50:
             continue
         entry_date = dates[it + 1]
+        # X-06(剔除后置,与引擎同修):锁定票**留在**打分/中性化/划桶全池,
+        # 不预先剔出;只在收益侧记 NaN(评估/腿集合如实缺席)
         locked = one_word_limit_up(fetch_market_day(pro, "daily", entry_date, CACHE),
                                    fetch_market_day(pro, "stk_limit", entry_date, CACHE), codes)
-        codes = [c for c in codes if c not in locked]
         idx = pd.Index(codes)
         # 前向收益:T+1 开盘 → 窗口末;退出一字跌停/停牌顺延(与引擎同——ILLIQ 腿
         # 恰是微流动性票,跳过退出约束会系统性高估该腿)
@@ -146,7 +147,9 @@ def main(argv: list[str] | None = None) -> None:
                      if pd.isna(open_p.iloc[exit_pos].get(c)) and pd.notna(entry.get(c))}
         constrained = locked_exit | suspended        # 退出受限票(顺延或未解)
         n_def = n_unres = def_days = 0
-        for c in constrained:
+        # 入场锁定票从未建仓,不进顺延统计(Codex P2;桶内 constr_b 不受影响——
+        # 腿成员=可执行,天然不含锁定票)
+        for c in constrained - locked:
             r = first_sellable_open(open_p[c], exit_pos + 1, lambda j, _c=c: _locked(j, _c))
             if r is None:
                 n_unres += 1
@@ -155,6 +158,7 @@ def main(argv: list[str] | None = None) -> None:
                 n_def += 1
                 def_days += r[1] + 1
         fwd = exit_ / entry - 1.0
+        fwd.loc[[c for c in locked if c in fwd.index]] = float("nan")   # 评估侧缺席
 
         db = fetch_market_day(pro, "daily_basic", t, CACHE).set_index("ts_code")
         mv = pd.to_numeric(db["total_mv"], errors="coerce").reindex(idx)
@@ -162,7 +166,8 @@ def main(argv: list[str] | None = None) -> None:
         ind = ind_all.reindex(idx).fillna("其他")
         raw = amihud_illiq(ret_p.iloc[: it + 1], amt_p.iloc[: it + 1], 21).reindex(idx)
         neu = neutralize_industry_size(raw, ind, logmv)
-        _, high = quantile_legs(neu[fwd.notna()], 5)   # 多头腿=高 ILLIQ 五分位(正向因子)
+        # 多头腿=高 ILLIQ 五分位(正向因子);桶界在全池上划,腿=桶成员∩可成交(X-06)
+        _, _, _, _, high = full_pool_quantile_stats(neu, fwd, 5)
         if not high:
             continue
         leg = pd.Index(sorted(high))

@@ -45,7 +45,12 @@ import os
 import numpy as np
 import pandas as pd
 
-from ashare_gauntlet.backtest import information_coefficient, newey_west_tstat, quantile_spread
+from ashare_gauntlet.backtest import (
+    information_coefficient,
+    newey_west_tstat,
+    quantile_spread,
+    restated_visibility,
+)
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR, tushare_pro
 from ashare_gauntlet.costs import round_trip_cost_rate
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
@@ -65,7 +70,9 @@ MAIN = ("沪主板", "深主板")
 def _load(ep: str, cols: list[str]) -> pd.DataFrame:
     # update_flag 参与排序:同 (end_date,ann_date) 的快照 vs 更正重述行,'1'=更正后(tushare 官方
     # 语义)排最后,_pit 的 tail(1) 才确定性取到更正值(fina_indicator 缓存暂无此列,自动降级两键)。
-    need = ["ts_code", "end_date", "ann_date", "update_flag"] + cols
+    # f_ann_date:重述行的**实际发布日**——restated_visibility 把它并入 ann_date,
+    # 否则更正值在原公告日即"可见"=前视(四镜头验证 P1;排序须在修正后做)。
+    need = ["ts_code", "end_date", "ann_date", "f_ann_date", "update_flag"] + cols
     out = []
     for f in glob.glob(f"{CACHE}/{ep}/*.parquet"):
         try:
@@ -78,6 +85,7 @@ def _load(ep: str, cols: list[str]) -> pd.DataFrame:
     df["end_date"] = df["end_date"].astype(str)
     for c in cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = restated_visibility(df)
     sort_keys = ["ts_code"] + [k for k in ("end_date", "ann_date", "update_flag") if k in df.columns]
     return df.sort_values(sort_keys, kind="mergesort")
 
@@ -318,6 +326,23 @@ def exclude_shell(mv: pd.Series) -> list[str]:
     return [str(i) for i in v[v > cut].index]
 
 
+def parse_ivol_windows(s: "str | None") -> list[int]:
+    """--ivol-windows 解析:逗号分隔正整数窗口,非法/重复 fail-loud。
+
+    X-01 预注册(docs/experiments.md):{21,63,252} 三点、同一日频 CAPM 残差定义,
+    仅窗口不同——不扫描不加点;重复窗口会生成同名因子列互相覆盖,拒绝。
+    """
+    if not s:
+        return []
+    try:
+        ws = [int(x) for x in s.split(",")]
+    except ValueError as e:
+        raise ValueError(f"--ivol-windows 含非整数:{s!r}") from e
+    if any(w <= 0 for w in ws) or len(set(ws)) != len(ws):
+        raise ValueError(f"--ivol-windows 须为不重复正整数:{s!r}")
+    return ws
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--board", default="main")
@@ -338,7 +363,11 @@ def main(argv: list[str] | None = None) -> None:
                     help="加评 P1 交易行为族候选:MAX/IVOL/ILLIQ/TURN/NLIMIT(需 daily_basic/"
                          "stk_limit 全史缓存;加载多三张面板,启动慢数分钟)。只评不入分:"
                          "入 composite 须过准入纪律(NW t>3+成本后>0+方向稳定+年度切片)")
+    ap.add_argument("--ivol-windows", default=None, dest="ivol_windows",
+                    help="逗号分隔额外 IVOL 窗口(X-01 预注册 {21,63,252}:同一日频 CAPM 残差"
+                         "定义仅窗口不同;结果另存 *_ivolwin.json 不覆盖权威读数)")
     a = ap.parse_args(argv)
+    ivol_ws = parse_ivol_windows(a.ivol_windows)
     MOM_LB, MOM_SKIP = 250, 21   # 12-1 动量:近250日、跳最近21日
 
     fina = _load("fina_indicator", ["roe"])
@@ -370,12 +399,13 @@ def main(argv: list[str] | None = None) -> None:
 
     # P1 候选因子的面板(仅 --candidates;窗口 月=21/年=252 与 MOM 同惯例)
     ret_p = amt_p = to_p = touched_p = mkt = None
-    if a.candidates:
+    if a.candidates or ivol_ws:
         # 停牌 NaN 保持 NaN(daily_returns,fill_method=None):默认 ffill 会把停牌日
         # 变 0% 收益,停牌股伪装成低波票在 IVOL 拿高分(review 第三批 P1)
         ret_p = daily_returns(close_p)
-        amt_p = px.pivot_table(index="trade_date", columns="ts_code", values="amount")
         mkt = ret_p.mean(axis=1)                           # 宇宙等权市场收益(CAPM 口径锚)
+    if a.candidates:
+        amt_p = px.pivot_table(index="trade_date", columns="ts_code", values="amount")
         print("加载 turnover 面板(daily_basic 全史)…", flush=True)
         to_files = date_partition_files(CACHE, "daily_basic")
         to_p = pd.concat([pd.read_parquet(f, columns=["ts_code", "trade_date", "turnover_rate"])
@@ -404,6 +434,7 @@ def main(argv: list[str] | None = None) -> None:
     FACTORS = ["EP", "BP", "ROE", "GP", "ACC", "MOM"]
     if a.candidates:
         FACTORS += ["MAX", "IVOL", "ILLIQ", "TURN", "NLIMIT", "TREND", "CGO"]
+    FACTORS += [f"IVOL{w}" for w in ivol_ws]   # X-01:同定义多窗口对照列
     print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)"
           f"{'·剔壳30%' if a.ex_shell30 else ''}…", flush=True)
     ic_rows: list[dict] = []
@@ -502,6 +533,10 @@ def main(argv: list[str] | None = None) -> None:
                 raw["NLIMIT"] = nl.reindex(idx)
             else:
                 raw["NLIMIT"] = pd.Series(float("nan"), index=idx)
+        # X-01:多窗口 IVOL(与现役 21 日同一 ivol_capm 定义;252 窗自带全窗有效收益
+        # 门槛,窗内有停牌日的股票如实 NaN——覆盖率差异在读数里按每因子 N 呈现)
+        for w in ivol_ws:
+            raw[f"IVOL{w}"] = ivol_capm(ret_p.iloc[: it + 1], mkt.iloc[: it + 1], w).reindex(idx)
         ind = ind_all.reindex(idx).fillna("其他")
         row: dict = {"date": t, "n": len(idx), "excl_limit_up": len(locked),
                      "exit_deferred": n_deferred, "exit_unresolved": n_unresolved,
@@ -547,7 +582,7 @@ def main(argv: list[str] | None = None) -> None:
           f" | 一字涨停均剔除{res['excl_limit_up'].mean():.1f}只/期")
     print(f"成本口径:佣金万{a.commission * 10000:g}+滑点{a.slippage * 10000:g}bp(单边)+卖出印花税(PIT分段);"
           f"成本后月差=Q5-Q1−round_trip(上界:假设月度全换手,实际换手更低则成本更低)")
-    print(f"{'因子':>5}{'IC均值':>8}{'ICIR':>7}{'t值(NW)':>8}{'lag':>5}{'Q5-Q1月%':>9}{'上界净%':>8}{'换手':>6}{'真实净%':>8}{'胜率':>6}  判定")
+    print(f"{'因子':>5}{'N':>5}{'IC均值':>8}{'ICIR':>7}{'t值(NW)':>8}{'lag':>5}{'Q5-Q1月%':>9}{'上界净%':>8}{'换手':>6}{'真实净%':>8}{'胜率':>6}  判定")
     for fac in FACTORS:
         ic = res["IC_" + fac].dropna()
         # 真 Newey-West HAC(Bartlett核,NW1994 自动带宽):旧版 adjusted_tstat 是 AR(1)
@@ -563,15 +598,18 @@ def main(argv: list[str] | None = None) -> None:
         m = ic.mean()
         v = "✓有效" if abs(tnw) > 2 and abs(m) > 0.02 else ("~弱" if abs(tnw) > 1.5 else "✗噪声")
         sign = "(反转)" if m < -0.02 else ""
-        print(f"{fac:>5}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{nwlag:>5d}{spr:>+8.2f}%{net:>+7.2f}%"
+        # 每因子 N=IC dropna 后有效期数(2026-07-10 教训:聚合 N 掩盖过六年缺口)
+        print(f"{fac:>5}{len(ic):>5d}{m:>+8.3f}{icir:>+7.2f}{tnw:>+8.2f}{nwlag:>5d}{spr:>+8.2f}%{net:>+7.2f}%"
               f"{to.mean():>6.0%}{real_net:>+7.2f}%{hit:>5.0f}%  {v}{sign}")
     os.makedirs(HOLDSCORE_DIR, exist_ok=True)
     if corr_sum is not None and corr_n:
         avg_corr = corr_sum / corr_cnt.replace(0, pd.NA)
         print(f"\n=== 因子横截面 Spearman 相关(逐期平均,N={corr_n};冗余审查:>0.65 触发合并/剔除评估)===")
         print(avg_corr.astype(float).round(2).to_string())
-    res.to_json(f"{HOLDSCORE_DIR}/factor_ic_backtest.json", orient="records", force_ascii=False, indent=2)
-    print("→ 明细 data/holdscore/factor_ic_backtest.json")
+    # X-01 多窗口跑另存,不覆盖 13 因子权威读数文件
+    out_name = "factor_ic_backtest_ivolwin.json" if ivol_ws else "factor_ic_backtest.json"
+    res.to_json(f"{HOLDSCORE_DIR}/{out_name}", orient="records", force_ascii=False, indent=2)
+    print(f"→ 明细 data/holdscore/{out_name}")
 
 
 if __name__ == "__main__":

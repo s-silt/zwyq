@@ -52,6 +52,7 @@ from ashare_gauntlet.namechange import load_namechange, st_codes_asof
 from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
 from scripts.aggressive_pick import load_excluded_industries
+from scripts.factor_rank import spec_crowd_flags
 from scripts.factor_backtest import (
     MAIN,
     _load,
@@ -154,6 +155,23 @@ def c2_step(prev_members: "set[str]", out_streak: dict[str, int], d10: "set[str]
     return d10 | keep_extra, new_streak
 
 
+def tag_exit_step(prev_members: "set[str]", d10: "set[str]", flagged: "set[str]",
+                  tradable: "set[str]") -> "set[str]":
+    """X-07 标签触发退出单步(可单测):当期 D10 成员中带"涨过头"标签的一律不持有。
+
+    动机(实盘归因 2026-08-07):生产在用"持仓涨出 🎰/TREND 顶格即卖"这条**从未
+    实证检验**的规则(X-03 只测了带标签的票该不该买、M3 只测了跌出 D10 何时退)。
+    本函数把该规则形式化以便回测证伪:成员 = (当期 D10 − 带标签) ∩ 可交易。
+    prev_members 仅用于签名对齐 c2_step(标签规则无跨期状态),显式接受不使用。
+    集合类型强制:传列表会让集合运算静默变形(fail-loud)。
+    """
+    for name, val in (("prev_members", prev_members), ("d10", d10),
+                      ("flagged", flagged), ("tradable", tradable)):
+        if not isinstance(val, (set, frozenset)):
+            raise TypeError(f"tag_exit_step: {name} 必须是集合,收到 {type(val).__name__}")
+    return (d10 - flagged) & tradable
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fwd", type=int, default=21)
@@ -162,6 +180,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="单边佣金率(万2.5,与 factor_backtest 同出处)")
     ap.add_argument("--slippage", type=float, default=0.0015,
                     help="单边滑点率(LWZ 2022 JFE 中国实测 15bp 下沿)")
+    ap.add_argument("--tag-exit", action="store_true", dest="tag_exit",
+                    help="X-07:标签触发退出三变体(PROD_XT 🎰退出 / PROD_XR TREND顶格退出 / "
+                         "PROD_XB 两者任一)——检验'持仓涨过头就卖'这条生产在用但从未验证的规则")
     ap.add_argument("--increments", action="store_true",
                     help="X-02/X-03:ACC/MAX/NLIMIT/TREND 对 composite 的 common-support "
                          "增量与冗余(加载财务三表+stk_limit 触板面板,启动慢数分钟)")
@@ -234,6 +255,8 @@ def main(argv: list[str] | None = None) -> None:
           f"构造与 factor_rank 同函数(factor_percentile/composite/to_decile)", flush=True)
 
     ports = list(PORTS)
+    if a.tag_exit:
+        ports += ["PROD_XT", "PROD_XR", "PROD_XB"]
     if a.increments:
         for x in INCR_FACTORS:
             ports += [f"CS3_{x}", f"P4_{x}"]   # 同池 3因子基线 / +x 的4因子(common-support 对)
@@ -295,12 +318,14 @@ def main(argv: list[str] | None = None) -> None:
         raw["EP"] = (1.0 / pe).where(pe > 0)
         raw["BP"] = (1.0 / pb_).where(pb_ > 0)
         raw["IVOL"] = ivol_capm(ret_p.iloc[: it + 1], mkt.iloc[: it + 1], 21).reindex(idx)
-        if a.increments:
-            # 增量因子原值(全部负向,构造与 factor_backtest 被验证的形态一致)
-            ni = _pit(inc_t, t)["n_income_attr_p"].reindex(idx)
-            ocf = _pit(cf_t, t)["n_cashflow_act"].reindex(idx)
-            ta = _pit(bs_t, t)["total_assets"].reindex(idx)
-            raw["ACC"] = (ni - ocf) / ta
+        if a.increments or a.tag_exit:
+            # 增量因子原值(全部负向,构造与 factor_backtest 被验证的形态一致);
+            # X-07 复用同一 MAX/NLIMIT/TREND 构造标签(与生产 factor_rank 同口径)
+            if a.increments:
+                ni = _pit(inc_t, t)["n_income_attr_p"].reindex(idx)
+                ocf = _pit(cf_t, t)["n_cashflow_act"].reindex(idx)
+                ta = _pit(bs_t, t)["total_assets"].reindex(idx)
+                raw["ACC"] = (ni - ocf) / ta
             raw["MAX"] = max_daily_ret(ret_p.iloc[: it + 1], 21).reindex(idx)
             raw["TREND"] = trend_ma_distance(close_p.iloc[: it + 1]).reindex(idx)
             win_days = dates[it - 20: it + 1]
@@ -404,6 +429,24 @@ def main(argv: list[str] | None = None) -> None:
             u3 = set().union(*d10_hist)
             members["PROD_U3"] = pd.Index(sorted(c for c in u3
                                                  if c in fwd.index and pd.notna(entry.get(c))))
+            # X-07 标签触发退出三变体(与生产 factor_rank 同口径构造标签:
+            # 🎰=IVOL/MAX/NLIMIT 任一 top decile 且 >0;TREND 顶格=分位≥90)
+            if a.tag_exit:
+                crowd = spec_crowd_flags(raw["IVOL"], raw["MAX"], raw["NLIMIT"])
+                tr_pct = factor_percentile(raw["TREND"], ind, True, logmv=logmv)
+                # 分位值域 [0,1](percentile_rank 用 rank(pct=True)),顶格=≥0.90;
+                # 首跑误写 ge(90) 恒假使该变体空转,已修(自查发现)
+                hot = tr_pct.ge(0.90).fillna(False)
+                f_crowd = {str(c) for c in d10b if bool(crowd.get(c, False))}
+                f_hot = {str(c) for c in d10b if bool(hot.get(c, False))}
+                row["n_tag_crowd"] = len(f_crowd)
+                row["n_tag_hot"] = len(f_hot)
+                members["PROD_XT"] = pd.Index(sorted(
+                    tag_exit_step(set(), d10_set, f_crowd, tradable)))
+                members["PROD_XR"] = pd.Index(sorted(
+                    tag_exit_step(set(), d10_set, f_hot, tradable)))
+                members["PROD_XB"] = pd.Index(sorted(
+                    tag_exit_step(set(), d10_set, f_crowd | f_hot, tradable)))
         # X-02/X-03:每个增量因子一对 common-support 组合——同一 pool_x(EP/BP/IVOL/x
         # 全可得)上分别跑 3因子基线与 +x 四因子;两者之差=纯因子增量,剥离覆盖池
         # 变化(R6 的 common-support 教训直接搬用)。冗余=pool 内双中性分位的秩相关。
@@ -529,6 +572,23 @@ def main(argv: list[str] | None = None) -> None:
     print(f"ST 剔除=PIT 名称面板(X-05,namechange 生效日区间):均 "
           f"{res['n_st_dyn'].mean():.0f} 只/期被判 ST;与旧'最终名称近似'的对称差均 "
           f"{res['st_sym_diff'].mean():.0f} 只/期(峰值 {res['st_sym_diff'].max():.0f})")
+    if a.tag_exit:
+        base_net = (res["ret_PROD"] - res["mkt_fwd"] - res["TO_PROD"] * res["cost_rt"])
+        _, t_base, _ = newey_west_tstat((res["ret_PROD"] - res["mkt_fwd"]).dropna())
+        print(f"\n=== X-07 标签触发退出(持仓涨出标签是否该卖;基线=PROD 立即退出)===")
+        print(f"{'口径':>10}{'净超额%':>9}{'毛NW t':>8}{'换手':>7}{'均只数':>7}{'vs基线净':>10}")
+        print(f"{'PROD(基线)':>10}{base_net.mean() * 100:>+8.3f}%{t_base:>+8.2f}"
+              f"{res['TO_PROD'].mean():>7.0%}{res['n_PROD'].mean():>7.0f}{'—':>10}")
+        for p, lab in (("PROD_XT", "🎰退出"), ("PROD_XR", "TREND退出"), ("PROD_XB", "两者任一")):
+            ex = res[f"ret_{p}"] - res["mkt_fwd"]
+            net = ex - res[f"TO_{p}"] * res["cost_rt"]
+            _, tv, _ = newey_west_tstat(ex.dropna())
+            d = (net - base_net).dropna().mean() * 100
+            print(f"{lab:>10}{net.mean() * 100:>+8.3f}%{tv:>+8.2f}{res[f'TO_{p}'].mean():>7.0%}"
+                  f"{res[f'n_{p}'].mean():>7.0f}{d:>+9.3f}%")
+        print(f"标签命中:🎰 均 {res['n_tag_crowd'].mean():.2f} 只/期、TREND顶格 均 "
+              f"{res['n_tag_hot'].mean():.2f} 只/期(占 D10 {res['n_PROD'].mean():.0f} 只)")
+        print("判据(预注册):三变体净超额均不优于基线 → 标签触发卖出被证伪,生产删除该规则")
     if a.increments:
         print(f"\n=== X-02/X-03 composite 增量(common-support:同池 4因子 − 3因子基线;"
               f"准入门=|NW t|>3 且经济意义为正)===")

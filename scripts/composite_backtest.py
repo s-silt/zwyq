@@ -53,6 +53,7 @@ from ashare_gauntlet.record import lean_tier
 from ashare_gauntlet.screen import board_of
 from scripts.aggressive_pick import load_excluded_industries
 from scripts.factor_rank import spec_crowd_flags
+from scripts.illiq_capacity import BUCKETS, break_even_slippage, mv_terciles
 from scripts.factor_backtest import (
     MAIN,
     _load,
@@ -172,6 +173,21 @@ def tag_exit_step(prev_members: "set[str]", d10: "set[str]", flagged: "set[str]"
     return (d10 - flagged) & tradable
 
 
+def size_tilt_members(d10: "set[str]", mv: pd.Series, bucket: str) -> "set[str]":
+    """X-08 市值三分位子组合单步(可单测):D10 成员内按市值切桶,取指定桶。
+
+    X-04 已证 ILLIQ 腿内超额集中于小桶(+1.33%/期 t4.04)但机构不可投资;X-08 检验
+    同一规模效应是否复制到 PROD D10 内部——对万元级账户小桶冲击成本近零,若成立
+    即为系统内唯一有证据的期望提升路径。复用 X-04 mv_terciles(腿内划分同精神,
+    零新参数):成员 <3 无三分位语义 → 空集;mv 缺失的成员不入任何桶(不伪造)。
+    """
+    if bucket not in BUCKETS:
+        raise ValueError(f"size_tilt_members: bucket 必须是 {BUCKETS} 之一,收到 {bucket!r}")
+    terc = mv_terciles(mv.reindex(sorted(d10)))
+    # pd.NA(成员<3 或 mv 缺失)不可参与布尔比较——显式跳过,不入任何桶
+    return {str(c) for c, b in terc.items() if pd.notna(b) and b == bucket}
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fwd", type=int, default=21)
@@ -180,6 +196,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="单边佣金率(万2.5,与 factor_backtest 同出处)")
     ap.add_argument("--slippage", type=float, default=0.0015,
                     help="单边滑点率(LWZ 2022 JFE 中国实测 15bp 下沿)")
+    ap.add_argument("--size-tilt", action="store_true", dest="size_tilt",
+                    help="X-08:D10 内市值三分位子组合(PROD_S/M/L)——检验 X-04 的规模效应"
+                         "是否复制到 PROD 内部;判据=PROD_S 净超额>PROD 且毛 NW t>3")
     ap.add_argument("--tag-exit", action="store_true", dest="tag_exit",
                     help="X-07:标签触发退出三变体(PROD_XT 🎰退出 / PROD_XR TREND顶格退出 / "
                          "PROD_XB 两者任一)——检验'持仓涨过头就卖'这条生产在用但从未验证的规则")
@@ -255,6 +274,8 @@ def main(argv: list[str] | None = None) -> None:
           f"构造与 factor_rank 同函数(factor_percentile/composite/to_decile)", flush=True)
 
     ports = list(PORTS)
+    if a.size_tilt:
+        ports += ["PROD_S", "PROD_M", "PROD_L"]
     if a.tag_exit:
         ports += ["PROD_XT", "PROD_XR", "PROD_XB"]
     if a.increments:
@@ -429,6 +450,18 @@ def main(argv: list[str] | None = None) -> None:
             u3 = set().union(*d10_hist)
             members["PROD_U3"] = pd.Index(sorted(c for c in u3
                                                  if c in fwd.index and pd.notna(entry.get(c))))
+            # X-08 市值三分位子组合(mv=total_mv 万元)。切桶在**剔 locked 之前**的
+            # D10 全集上——桶界只用 t 日信息(ex-ante 可实施),选完桶再剔 T+1 锁定
+            # 与不可交易,与 PROD"想买没买进"的被动语义一致(对抗验证 P1 修正;
+            # 修正前后读数差 0.001pp 级,14/150 期受影响)
+            if a.size_tilt:
+                d10_full = set(str(c) for c in dec_b.index[dec_b == 10])
+                locked_set = set(str(c) for c in locked_idx)
+                for b_, p_ in (("小", "PROD_S"), ("中", "PROD_M"), ("大", "PROD_L")):
+                    members[p_] = pd.Index(sorted((size_tilt_members(d10_full, mv, b_)
+                                                   - locked_set) & tradable))
+                if len(members["PROD_S"]):
+                    row["mv_med_S"] = float(mv.reindex(members["PROD_S"]).median())
             # X-07 标签触发退出三变体(与生产 factor_rank 同口径构造标签:
             # 🎰=IVOL/MAX/NLIMIT 任一 top decile 且 >0;TREND 顶格=分位≥90)
             if a.tag_exit:
@@ -572,6 +605,60 @@ def main(argv: list[str] | None = None) -> None:
     print(f"ST 剔除=PIT 名称面板(X-05,namechange 生效日区间):均 "
           f"{res['n_st_dyn'].mean():.0f} 只/期被判 ST;与旧'最终名称近似'的对称差均 "
           f"{res['st_sym_diff'].mean():.0f} 只/期(峰值 {res['st_sym_diff'].max():.0f})")
+    if a.size_tilt:
+        base_net = (res["ret_PROD"] - res["mkt_fwd"] - res["TO_PROD"] * res["cost_rt"])
+        print("\n=== X-08 市值三分位子组合(D10 内部;判据=PROD_S 净超额>PROD 且毛 NW t>3)===")
+        print(f"{'口径':>8}{'净超额%':>9}{'毛NW t':>8}{'换手':>7}{'均只数':>7}{'绝对MaxDD':>10}{'vs PROD净':>10}")
+        for p, lab in (("PROD", "PROD基线"), ("PROD_S", "小桶"), ("PROD_M", "中桶"),
+                       ("PROD_L", "大桶")):
+            ex = res[f"ret_{p}"] - res["mkt_fwd"]
+            net = ex - res[f"TO_{p}"] * res["cost_rt"]
+            _, tv, _ = newey_west_tstat(ex.dropna())
+            absn = res[f"ret_{p}"] - res[f"TO_{p}"] * res["cost_rt"]
+            d = "—" if p == "PROD" else f"{(net - base_net).dropna().mean() * 100:+9.3f}%"
+            print(f"{lab:>8}{net.mean() * 100:>+8.3f}%{tv:>+8.2f}{res[f'TO_{p}'].mean():>7.0%}"
+                  f"{res[f'n_{p}'].replace(0, np.nan).mean():>7.0f}"
+                  f"{max_drawdown(absn):>10.1%}{d:>10}")
+        # 小桶 break-even 单边滑点(X-04 同代数逆解,零新常数;stamp 均值由 cost_rt 反解)
+        ex_s = (res["ret_PROD_S"] - res["mkt_fwd"]).dropna()
+        stamp_mean = float(res["cost_rt"].mean() - 2 * a.commission - 2 * a.slippage)
+        be = break_even_slippage(float(ex_s.mean()), float(res["TO_PROD_S"].mean()),
+                                 a.commission, stamp_mean)
+        if "mv_med_S" in res.columns:
+            print(f"小桶市值中位:期均 {res['mv_med_S'].mean() / 1e4:.1f} 亿元;"
+                  f"break-even 单边滑点 {be * 1e4:.0f}bp(现役成本假设 {a.slippage * 1e4:.0f}bp)")
+        yr_s = ((res["ret_PROD_S"] - res["mkt_fwd"] - res["TO_PROD_S"] * res["cost_rt"])
+                .groupby(y))
+        print("PROD_S 逐年净超额%(期均):" + " ".join(
+            f"{yy}:{v.mean() * 100:+.2f}" for yy, v in yr_s if v.notna().any()))
+        # 增量统计(对抗验证 P1:决策命题是 S−PROD 增量,不得用单列 t 背书;
+        # 与 X-02/X-03 同标准:增量自身过 NW t 门)+ β 分解 + regime 拆分
+        d_g = (res["ret_PROD_S"] - res["ret_PROD"]).dropna()
+        d_n = ((res["ret_PROD_S"] - res["TO_PROD_S"] * res["cost_rt"])
+               - (res["ret_PROD"] - res["TO_PROD"] * res["cost_rt"])).dropna()
+        _, t_dg, _ = newey_west_tstat(d_g)
+        _, t_dn, _ = newey_west_tstat(d_n)
+        mk = res["mkt_fwd"].reindex(d_g.index)
+        b_d = float(np.polyfit(mk, d_g, 1)[0])
+        _, t_neut, _ = newey_west_tstat((d_g - b_d * mk).dropna())
+        print(f"增量(S−PROD):毛 {d_g.mean() * 100:+.3f}%/期 NW t{t_dg:+.2f} | "
+              f"净 {d_n.mean() * 100:+.3f}% t{t_dn:+.2f} | β载荷 {b_d:+.3f}"
+              f"(β通道 {b_d * float(mk.mean()) * 100:+.3f}%/期)| 市场中性化残差 t{t_neut:+.2f}"
+              f" —— 增量按 X-02/X-03 门(|t|>3)判读")
+        m17 = res["date"] >= "20170101"
+        exs17 = (res.loc[m17, "ret_PROD_S"] - res.loc[m17, "mkt_fwd"]).dropna()
+        net17 = (exs17 - (res.loc[m17, "TO_PROD_S"] * res.loc[m17, "cost_rt"])
+                 .reindex(exs17.index)).dropna()
+        _, t_s17, _ = newey_west_tstat(exs17)
+        _, t_d17, _ = newey_west_tstat((res.loc[m17, "ret_PROD_S"]
+                                        - res.loc[m17, "ret_PROD"]).dropna())
+        print(f"剔 2014-16 壳价值时代(N={len(exs17)}):PROD_S 净 {net17.mean() * 100:+.3f}%/期"
+              f" 毛t{t_s17:+.2f} | 增量毛t{t_d17:+.2f}"
+              f" —— 2014-16 为 regime 依赖段,引用读数须并列本行")
+        print("成本口径警示:上表为比率口径,**不含 5 元佣金地板与 100 股整手**——小账户"
+              "复制 56 只等权不可行(一手合计≈6 万+,地板在 ≤2 万仓位使净超额翻负);"
+              "统计不迁移到 5-6 只抽样,实盘语义仅为'选股偏好'")
+        print("提醒:微盘=壳/治理风险集中带——通过判据≠可直接实盘,须逐票治理核实+ADV 冲击检查")
     if a.tag_exit:
         base_net = (res["ret_PROD"] - res["mkt_fwd"] - res["TO_PROD"] * res["cost_rt"])
         _, t_base, _ = newey_west_tstat((res["ret_PROD"] - res["mkt_fwd"]).dropna())

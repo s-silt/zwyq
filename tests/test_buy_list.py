@@ -41,7 +41,8 @@ def _setup(tmp_path, monkeypatch, snap_date="20260101", rows=None, holdings=None
 def _row(ts="600001.SH", **kw):
     base = {"ts_code": ts, "name": "甲", "industry": "化工原料", "decile": 10,
             "tier": "🟢", "spec_crowd": False, "spike_limit": False,
-            "score": 0.9, "last": 10.0, "f_EP": 0.9, "f_BP": 0.9, "f_IVOL": 0.9}
+            "score": 0.9, "last": 10.0, "mv": 400_000.0,   # X-08:mv 为必备字段(万元)
+            "f_EP": 0.9, "f_BP": 0.9, "f_IVOL": 0.9}
     base.update(kw)
     return base
 

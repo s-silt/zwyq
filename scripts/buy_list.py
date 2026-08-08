@@ -14,19 +14,46 @@ import math
 import os
 from datetime import datetime, timezone, timedelta
 
+import pandas as pd
+
 from ashare_gauntlet.candidates import candidate_assessment
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH
 from ashare_gauntlet.data.partition import date_partition_files
 from ashare_gauntlet.portfolio_decision import decide_states, validate_policy
+from scripts.illiq_capacity import BUCKETS, mv_terciles
 
 FACTOR_DIR = "data/holdscore"
 DECISION_DIR = "data/decisions"
 POLICY_PATH = "data/trading_policy.json"
 OVERRIDES_PATH = "data/factcheck_overrides.json"
 REQUIRED_ROW_FIELDS = ("ts_code", "name", "industry", "decile", "tier",
-                       "spec_crowd", "spike_limit", "score", "last",
+                       "spec_crowd", "spike_limit", "score", "last", "mv",
                        "f_EP", "f_BP", "f_IVOL")   # 生产因子字段在场=snapshot 出自现役口径
 ENTRY_MODEL_VERSION = "research-only"   # M2 过门前不得宣称择时(spec §13)
+SIZE_BUCKET_RANK = {b: i for i, b in enumerate(BUCKETS)}   # 小0/中1/大2(X-08 接线)
+
+
+def size_tercile_ranks(rows: list[dict]) -> "dict[str, tuple[int, str]]":
+    """X-08 生产接线(用户批准 2026-08-08):D10 全档内按 panel mv 三分位 → 排序秩。
+
+    桶在 D10 **全档**上划(ex-ante,与 X-08 修正后口径一致),BUY/WAIT 排序第一键;
+    依据=增量(S−PROD)净 +0.601%/期 NW t3.07(贴线,含 ~1/3 β),语义=选股偏好。
+    fail-loud:D10 行 mv 非正有限数 → 排序静默失效,整场失败。<3 行=无三分位语义
+    (X-04 mv_terciles 同精神)→ 空映射,排序回退 score,属合法退化截面非数据损坏。
+    """
+    d10 = [r for r in rows if r.get("decile") == 10]
+    if len(d10) < 3:
+        return {}
+    mv: dict[str, float] = {}
+    for r in d10:
+        v = r.get("mv")
+        if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                or not math.isfinite(v) or v <= 0):
+            raise SystemExit(f"D10 行 {r['ts_code']} mv={v!r} 无效——市值桶排序无法执行,"
+                             "不生成决策")
+        mv[str(r["ts_code"])] = float(v)
+    terc = mv_terciles(pd.Series(mv))
+    return {str(c): (SIZE_BUCKET_RANK[str(b)], str(b)) for c, b in terc.items()}
 
 
 def latest_trade_date(cache: "str | None" = None) -> str:
@@ -144,6 +171,11 @@ def main(argv: list[str] | None = None) -> None:
                             "spike_limit": None, "eligible_buy": False,
                             "reason_codes": ["SNAPSHOT_MISSING"],
                             "governance_red": bool(ov) and str(ov["verdict"]) == "red"})
+    ranks = size_tercile_ranks(rows)                     # X-08:D10 全档划桶(ex-ante)
+    for a_ in assessments:
+        rk = ranks.get(str(a_["ts_code"]))
+        if rk is not None:
+            a_["size_rank"], a_["size_bucket"] = rk
     decisions = decide_states(assessments, held, policy,
                               account_value=account_value,
                               cash=float(cash) if cash is not None else None,
@@ -173,7 +205,10 @@ def main(argv: list[str] | None = None) -> None:
             ex = d["execution"]
             qty = f" {ex['shares']}股" if ex["shares"] else ""
             # 每行自带数据日期(spec §9:截屏/复制传播时单行不脱离口径)
-            print(f"  {d['name']:　<6}{d['ts_code']}{qty}  {'/'.join(d['reason_codes'])}  [{as_of}]")
+            bk = d["evidence"].get("size_bucket")
+            tag = f" {bk}桶" if bk else ""
+            print(f"  {d['name']:　<6}{d['ts_code']}{qty}  {'/'.join(d['reason_codes'])}"
+                  f"  [{as_of}]{tag}")
         if extra:
             print(f"  …另 {extra} 只 WAIT(完整名单见 JSON)")
     print(f"→ {out_path}(机器唯一真相源;非荐股,执行须人工确认)")

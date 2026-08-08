@@ -32,6 +32,12 @@ def _exec(shares: int, weight: "float | None") -> dict:
             "target_weight": weight, "shares": shares}
 
 
+# X-08 生产接线(用户批准 2026-08-08):BUY 候选排序第一键=D10 内市值桶
+# (小0/中1/大2,由 buy_list.size_tercile_ranks 注入;增量净 +0.601%/期 NW t3.07 贴线,
+# 语义=选股偏好,四关/治理/行业上限/资金分配不变)。无桶信息的候选按中桶排
+# (不奖励不惩罚,旧调用方行为不变)。
+SIZE_RANK_NEUTRAL = 1
+
 # spec §9:失效条件(持有/买入后何种事件使决策作废,advisory 列表)
 _INVALIDATIONS = {"BUY": ["LEAVE_PRODUCTION_UNIVERSE", "RISK_RED_FLAG", "FACTCHECK_EXPIRED"],
                   "HOLD": ["RISK_RED_FLAG", "MANUAL_LOGIC_FAIL"],
@@ -81,7 +87,8 @@ def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
 
     # —— 未持仓:BUY 分配或 WAIT ——
     buyable = sorted((a for a in assessments if a["ts_code"] not in held and a["eligible_buy"]),
-                     key=lambda a: (-(a.get("score") or 0.0), a["ts_code"]))
+                     key=lambda a: (a.get("size_rank", SIZE_RANK_NEUTRAL),
+                                    -(a.get("score") or 0.0), a["ts_code"]))
     slots = int(policy["target_positions"]) - len(held)
     lot = int(policy["lot_size"])
     w_target = float(policy["target_weight"])
@@ -145,6 +152,7 @@ def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
     # 分组顺序与 CLI 一致(spec §9:BUY/WAIT/HOLD/EXIT)
     order = {"BUY": 0, "WAIT": 1, "HOLD": 2, "EXIT": 3}
     decisions.sort(key=lambda d: (order[d["state"]],
+                                  d["evidence"].get("size_rank", SIZE_RANK_NEUTRAL),
                                   -(d["evidence"].get("score") or 0.0), d["ts_code"]))
     return decisions
 
@@ -152,6 +160,9 @@ def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
 def _ev(a: "dict | None") -> dict:
     if a is None:
         return {}
-    return {"score": a.get("score"), "industry": a.get("industry"), "last": a.get("last"),
-            "decile": a.get("decile"), "spec_crowd": a.get("spec_crowd"),
-            "spike_limit": a.get("spike_limit")}
+    ev = {"score": a.get("score"), "industry": a.get("industry"), "last": a.get("last"),
+          "decile": a.get("decile"), "spec_crowd": a.get("spec_crowd"),
+          "spike_limit": a.get("spike_limit")}
+    if "size_rank" in a:
+        ev["size_rank"], ev["size_bucket"] = a["size_rank"], a.get("size_bucket")
+    return ev

@@ -311,6 +311,7 @@ def build_market_tables(daily: pd.DataFrame, adj_factor: pd.DataFrame) -> tuple[
     if bool(bad_ohlc.any()):
         raise DecisionEvaluationError("daily OHLC 关系非法")
     px["adj_open"] = px["open"] * px["adj_factor"]
+    px["adj_close"] = px["close"] * px["adj_factor"]
     trade_days = sorted(str(x) for x in px["trade_date"].unique())
     return trade_days, {d: g.reset_index(drop=True) for d, g in px.groupby("trade_date")}
 
@@ -504,7 +505,69 @@ def evaluate_episodes(episodes: list[dict[str, Any]], factors_by_date: dict[str,
                     if outcome["d10_net_return"] is not None else None)
             event["outcomes"][str(horizon)] = outcome
         enriched.append(event)
-    return enriched, aggregate_metrics(enriched, horizons)
+    metrics = aggregate_metrics(enriched, horizons)
+    # calendar-time 组合规则就位后回撤可实算(替换 aggregate_metrics 的
+    # not_computed 默认);aggregate_metrics 自身无行情输入,保持纯 events 层。
+    for horizon in horizons:
+        metrics[str(horizon)].update(
+            calendar_time_drawdown(enriched, horizon, trade_days, market_by_date))
+    return enriched, metrics
+
+
+def calendar_time_drawdown(events: list[dict[str, Any]], horizon: int,
+                           trade_days: list[str],
+                           market_by_date: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    """calendar-time 等权组合的最大回撤(Fama 1998 / Mitchell-Stafford 2000 惯例)。
+
+    规则(预先指定,用户批准 2026-08-12,纯测量层不改生产分配):每日组合收益 =
+    当日活跃(已按次日开盘成交入场、尚未按开盘退出)episode 日收益的等权均值
+    (每日再平衡);无活跃 episode 的日子净值不变。episode 逐日路径:入场日
+    entry_open→close、中间日 close→close、退出日 prev_close→exit_open;停牌日
+    收益记 0(净值冻结),复牌跳跃计入复牌日。未成交(一字涨停/停牌/超限价)
+    episode 不占仓;未到期/未能退出的 episode 持有至数据尾——不事后剔除。
+    回撤按毛价格路径计(成本在出入场两端一次性,不摊日频)。
+    """
+    daily_returns: dict[str, list[float]] = {}
+    filled = 0
+    for event in events:
+        outcome = event.get("outcomes", {}).get(str(horizon), {})
+        if outcome.get("status") != "fillable_next_open":
+            continue
+        filled += 1
+        code = str(event["ts_code"])
+        entry_date = str(outcome["entry_date"])
+        exit_date = outcome.get("exit_date")
+        idx0 = trade_days.index(entry_date)
+        idx1 = trade_days.index(str(exit_date)) if exit_date else len(trade_days) - 1
+        prev = float(outcome["entry_price"])
+        for pos in range(idx0, idx1 + 1):
+            date = trade_days[pos]
+            row = market_by_date[date]
+            match = row[row["ts_code"] == code]
+            if pos == idx1 and exit_date is not None:
+                price = float(outcome["exit_price"])
+            elif match.empty or pd.isna(match.iloc[0]["adj_close"]):
+                daily_returns.setdefault(date, []).append(0.0)   # 停牌冻结
+                continue
+            else:
+                price = float(match.iloc[0]["adj_close"])
+            daily_returns.setdefault(date, []).append(price / prev - 1.0)
+            prev = price
+    if not filled:
+        return {"max_drawdown": None, "max_drawdown_status": "no_filled_episodes"}
+    nav = peak = 1.0
+    drawdown = 0.0
+    for date in sorted(daily_returns):
+        returns = daily_returns[date]
+        nav *= 1.0 + sum(returns) / len(returns)
+        peak = max(peak, nav)
+        drawdown = min(drawdown, nav / peak - 1.0)
+    return {
+        "max_drawdown": drawdown,
+        "max_drawdown_status": "computed_calendar_time_equal_weight",
+        "max_drawdown_basis": "gross_price_path_entry_open_to_exit_open",
+        "active_portfolio_days": len(daily_returns),
+    }
 
 
 def aggregate_metrics(events: list[dict[str, Any]], horizons: tuple[int, ...]) -> dict[str, Any]:

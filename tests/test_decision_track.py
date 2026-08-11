@@ -199,6 +199,17 @@ def test_pre_partition_calendar_open_day_missing_all_cores_fails_loud(tmp_path):
         dt.build_report(tmp_path, horizons=(1,))
 
 
+def test_metrics_upgrade_max_drawdown_via_calendar_time_rule(tmp_path):
+    """calendar-time 组合规则就位后,回撤从 not_computed 升格为实算。"""
+    _fixture(tmp_path)
+    report = dt.build_report(tmp_path, horizons=(1,))
+    row = report["metrics"]["1"]
+    assert row["max_drawdown_status"] == "computed_calendar_time_equal_weight"
+    # fixture 路径:entry 0102 open 10.0 → close 10.0 → exit 0105 open 11.0,无回撤
+    assert row["max_drawdown"] == pytest.approx(0.0)
+    assert row["active_portfolio_days"] == 2
+
+
 def test_report_carries_x09_increment_verdict(tmp_path):
     """X-09 判定接线:报告必含 increment_verdict,当前样本 → insufficient/未评估。"""
     _fixture(tmp_path)

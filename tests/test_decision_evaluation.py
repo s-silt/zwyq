@@ -290,6 +290,61 @@ def test_known_trade_day_gap_between_snapshots_is_unknown_boundary():
     assert [e["as_of"] for e in outside] == ["20260101"]
 
 
+def _ct_event(entry_date, entry_price, exit_date, exit_price, *,
+              code="600001.SH", status="fillable_next_open", horizon=1):
+    outcome = {"status": status, "entry_date": entry_date, "entry_price": entry_price}
+    if exit_date is not None:
+        outcome.update({"exit_date": exit_date, "exit_price": exit_price,
+                        "outcome_status": "resolved"})
+    return {"ts_code": code, "outcomes": {str(horizon): outcome}}
+
+
+def test_calendar_time_drawdown_matches_hand_computed_path():
+    """净值:入场日 10→11(+10%),退出日开盘 9(−2/11)→ mdd = 0.9/1.1 − 1。"""
+    from ashare_gauntlet.decision_evaluation import calendar_time_drawdown
+    dates = ["20260102", "20260105", "20260106"]
+    trade_days, market = _market({d: p for d, p in zip(dates, (10.0, 10.9, 9.0))})
+    # _market close = open+0.1 → 0102 close=10.1;0105 close=11.0;0106 exit open=9.0
+    event = _ct_event("20260102", 10.0, "20260106", 9.0)
+    out = calendar_time_drawdown([event], 1, trade_days, market)
+    assert out["max_drawdown_status"] == "computed_calendar_time_equal_weight"
+    # nav: 10.1/10=1.01 → 11.0/10.1 → nav=1.10;exit 9/11 → nav=0.90;peak=1.10
+    assert out["max_drawdown"] == pytest.approx(0.90 / 1.10 - 1.0)
+    assert out["active_portfolio_days"] == 3
+
+
+def test_calendar_time_drawdown_freezes_nav_on_suspension():
+    from ashare_gauntlet.decision_evaluation import calendar_time_drawdown
+    dates = ["20260102", "20260105", "20260106"]
+    trade_days, market = _market(
+        {d: p for d, p in zip(dates, (10.0, 10.9, 9.0))}, missing=["20260105"])
+    event = _ct_event("20260102", 10.0, "20260106", 9.0)
+    out = calendar_time_drawdown([event], 1, trade_days, market)
+    # 0105 停牌收益 0;0106 exit 9/10.1(对停牌前 close)→ mdd = 9/10.1 − 1
+    assert out["max_drawdown"] == pytest.approx(9.0 / 10.1 - 1.0)
+
+
+def test_calendar_time_drawdown_excludes_unfilled_episodes():
+    from ashare_gauntlet.decision_evaluation import calendar_time_drawdown
+    dates = ["20260102", "20260105"]
+    trade_days, market = _market({d: p for d, p in zip(dates, (10.0, 11.0))})
+    event = _ct_event("20260102", 10.0, None, None, status="one_word_limit_up")
+    out = calendar_time_drawdown([event], 1, trade_days, market)
+    assert out["max_drawdown"] is None
+    assert out["max_drawdown_status"] == "no_filled_episodes"
+
+
+def test_calendar_time_drawdown_holds_immature_episode_to_data_end():
+    """未到期 episode 持有至数据尾,不事后剔除——跌幅要体现在回撤里。"""
+    from ashare_gauntlet.decision_evaluation import calendar_time_drawdown
+    dates = ["20260102", "20260105"]
+    trade_days, market = _market({d: p for d, p in zip(dates, (10.0, 8.0))})
+    event = _ct_event("20260102", 10.0, None, None)   # 无 exit → 持有到尾
+    out = calendar_time_drawdown([event], 1, trade_days, market)
+    # 0102 close 10.1;0105 close 8.1 → nav 谷 = 8.1/10 vs peak 1.01
+    assert out["max_drawdown"] == pytest.approx((8.1 / 10.0) / 1.01 - 1.0)
+
+
 def _metrics_row(count: int, t: "float | None", mean: float = 0.001) -> dict:
     return {"21": {"increment_signal_date_count": count, "increment_nw_t": t,
                    "mean_increment_vs_d10": mean}}

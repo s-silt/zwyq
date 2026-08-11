@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from ashare_gauntlet.screen import board_of
 
 MAIN = ("沪主板", "深主板")
@@ -16,7 +18,18 @@ MAIN = ("沪主板", "深主板")
 # 固定检查序(spec §12:reason code 完整且顺序确定)
 _CHECKS = ("NOT_MAIN_BOARD", "ST_NAME", "NOT_D10", "TIER_NOT_GREEN",
            "SPEC_CROWD", "SPIKE_LIMIT", "POLLUTION_PENDING_FACTCHECK",
-           "GOVERNANCE_RED", "FACTCHECK_EXPIRED", "FACTCHECK_REQUIRED")
+           "FACTCHECK_AFTER_AS_OF", "GOVERNANCE_RED", "FACTCHECK_EXPIRED",
+           "FACTCHECK_REQUIRED")
+
+
+def _date8(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} 必须是真实 YYYYMMDD,得到 {value!r}")
+    try:
+        datetime.strptime(value, "%Y%m%d")
+    except ValueError as exc:
+        raise ValueError(f"{field} 必须是真实 YYYYMMDD,得到 {value!r}") from exc
+    return value
 
 
 def override_status(override: "dict | None", as_of: str) -> str:
@@ -25,14 +38,23 @@ def override_status(override: "dict | None", as_of: str) -> str:
     verdict 白名单 {clear, red},其余值(笔误/pending/大小写)fail-loud——
     第四关是 BUY 的硬闸,把未知当安全=红灯笔误直接放行(对抗审查 P1)。
     """
+    decision_as_of = _date8(as_of, "decision as_of")
     if override is None:
         return "missing"
+    if not isinstance(override, dict):
+        raise ValueError("factcheck 覆盖必须是对象")
     v = str(override["verdict"])
     if v not in ("clear", "red"):
         raise ValueError(f"factcheck 覆盖 verdict={v!r} 不在白名单 {{clear,red}}——请修正覆盖文件")
+    override_as_of = _date8(override["as_of"], "factcheck as_of")
+    expires_on = _date8(override["expires_on"], "factcheck expires_on")
+    if expires_on < override_as_of:
+        raise ValueError("factcheck expires_on 不能早于 factcheck as_of")
+    if override_as_of > decision_as_of:
+        return "future"
     if v == "red":
         return "red"
-    if str(override["expires_on"]) < as_of:
+    if expires_on < decision_as_of:
         return "expired"
     return "clear"
 
@@ -60,7 +82,9 @@ def candidate_assessment(row: dict, override: "dict | None", as_of: str) -> dict
         hits.add("SPIKE_LIMIT")
     if bool(row.get("poll_mark", False)):
         hits.add("POLLUTION_PENDING_FACTCHECK")
-    if ov == "red":
+    if ov == "future":
+        hits.add("FACTCHECK_AFTER_AS_OF")
+    elif ov == "red":
         hits.add("GOVERNANCE_RED")
     elif ov == "expired":
         hits.add("FACTCHECK_EXPIRED")

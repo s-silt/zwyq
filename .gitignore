@@ -22,5 +22,25 @@ _smoke*
 # 年报原文文本 / 关键词提取实验残留(非代码,不入库)
 _yake_*.txt
 
-# CodeGraph 本地索引(每台机器本地,随时可重建,不入库)
+# CodeGraph / Cherry Studio 本地状态与会话附件(可重建/可能含个人内容)
 .codegraph/
+.cherry-studio/
+
+# OpenHarness 本地配置、凭据与运行态；项目 skills 允许入库
+.openharness/*
+!.openharness/skills/
+!.openharness/skills/**
+.openharness/settings.json
+.openharness/credentials.json
+.openharness/copilot_auth.json
+.openharness/data/
+.openharness/logs/
+.openharness/teams/
+.openharness/worktrees/
+.openharness/runtime/
+.openharness/issue.md
+.openharness/pr_comments.md
+
+# Understand Anything 默认不启用；生成物可能包含语义化源码摘要
+.ua/
+.understand-anything/

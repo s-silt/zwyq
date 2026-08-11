@@ -7,14 +7,12 @@ Usage: PYTHONIOENCODING=utf-8 python scripts/factcard.py
 """
 
 import glob
-import os
 import sys
 
 import pandas as pd
 
-from ashare_gauntlet.config import CACHE_DIR as CACHE
+from ashare_gauntlet.config import CACHE_DIR as CACHE, tushare_pro
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_history, fetch_symbol_table
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
 from ashare_gauntlet.lit_factors import (
     accrual_ratio,
@@ -98,7 +96,7 @@ def main() -> None:
     mr = market_returns(daily, adj, (5, 20))
     rank20 = (mr[20].rank(pct=True) * 100).to_dict()
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
 
     frames = [fetch_symbol_history(pro, "index_daily", c, "20251001", as_of, CACHE) for c, _ in INDEXES]
     ch = index_changes(pd.concat(frames, ignore_index=True), as_of)

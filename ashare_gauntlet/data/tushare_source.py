@@ -27,18 +27,21 @@ _PROXY_ENV_VARS = (
 )
 
 
-def make_pro_api(token: str, http_url: str, timeout: int = 120):
-    """Build a tushare ``pro_api`` client pinned to ``http_url`` and reachable
-    directly (no proxy) for the mirror host.
+def make_pro_api(token: str, http_url: str | None = None, timeout: int = 120):
+    """Build a Tushare client, optionally pinned directly to a mirror.
 
-    ``timeout`` defaults to 120s rather than tushare's 30s: a full-market
-    single-day pull (~5000 rows) can take longer than 30s on a cold call and
-    would otherwise raise a ReadTimeout.
+    With no explicit URL, the SDK's official endpoint and the caller's proxy
+    environment are left untouched.  Mirror mode retains the Windows direct-
+    connection workaround and the generous timeout needed by full-market pulls.
     """
+    mirror_url = http_url.strip() if http_url else ""
+    if not mirror_url:
+        return ts.pro_api(token)
+
     for var in _PROXY_ENV_VARS:
         os.environ.pop(var, None)
 
-    host = urlparse(http_url).hostname
+    host = urlparse(mirror_url).hostname
     if host:
         existing = os.environ.get("NO_PROXY", "")
         entries = [e for e in existing.split(",") if e]
@@ -49,6 +52,6 @@ def make_pro_api(token: str, http_url: str, timeout: int = 120):
         os.environ["no_proxy"] = merged
 
     pro = ts.pro_api(token)
-    pro._DataApi__http_url = http_url
+    pro._DataApi__http_url = mirror_url
     pro._DataApi__timeout = timeout
     return pro

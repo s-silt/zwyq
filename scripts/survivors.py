@@ -22,10 +22,9 @@ from typing import Any, cast
 
 import pandas as pd
 
-from ashare_gauntlet.config import CACHE_DIR as CACHE, SURVIVORS_DIR as OUT_DIR
+from ashare_gauntlet.config import CACHE_DIR as CACHE, SURVIVORS_DIR as OUT_DIR, tushare_pro
 from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
 from ashare_gauntlet.record import build_record
 from ashare_gauntlet.screen import board_of, screen_candidates
@@ -102,7 +101,7 @@ def main(argv: list[str] | None = None) -> None:
     mr = market_returns(daily, adj, (5, 20))
     df, as_of = _tech_table(daily, adj, mr, a)
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     # 估值表(daily_basic)常比行情(daily)晚发布几小时 —— 当天 as_of 取不到时
     # 优雅回退到最近一个有估值的交易日(PE/PB 慢变,隔一两个交易日口径可接受),
     # 免得 "估值还没发" 把整个筛选卡死(周五早跑的周更任务也吃这个保护)。

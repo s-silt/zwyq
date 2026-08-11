@@ -13,6 +13,33 @@ import os
 from ashare_gauntlet.data.tushare_source import make_pro_api
 
 
+def test_make_pro_api_without_mirror_preserves_sdk_defaults_and_proxy(monkeypatch):
+    class FakePro:
+        pass
+
+    fake = FakePro()
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7891")
+    monkeypatch.setenv("NO_PROXY", "localhost")
+    monkeypatch.setattr("ashare_gauntlet.data.tushare_source.ts.pro_api", lambda token: fake)
+
+    assert make_pro_api("tok123", None) is fake
+    assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:7891"
+    assert os.environ["NO_PROXY"] == "localhost"
+    assert not hasattr(fake, "_DataApi__http_url")
+    assert not hasattr(fake, "_DataApi__timeout")
+
+
+def test_make_pro_api_blank_mirror_uses_official_mode(monkeypatch):
+    class FakePro:
+        pass
+
+    fake = FakePro()
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy")
+    monkeypatch.setattr("ashare_gauntlet.data.tushare_source.ts.pro_api", lambda token: fake)
+    assert make_pro_api("tok123", "   ") is fake
+    assert os.environ["HTTPS_PROXY"] == "http://proxy"
+
+
 def test_make_pro_api_bypasses_proxy_for_mirror_host_and_pins_url(monkeypatch):
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7891")
     monkeypatch.setenv("https_proxy", "http://127.0.0.1:7891")

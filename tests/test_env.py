@@ -31,3 +31,33 @@ def test_load_env_local_skips_comments_and_blank_lines(tmp_path, monkeypatch):
 def test_load_env_local_noop_when_file_missing(tmp_path):
     # 文件不存在时安静返回,不抛(调用方无需先判存在)。
     load_env_local(tmp_path / "nonexistent.env")
+
+
+def test_load_env_local_allowed_keys_failure_is_atomic(tmp_path, monkeypatch):
+    path = tmp_path / ".env.local"
+    path.write_text(
+        "TUSHARE_TOKEN=newtoken\nUNSUPPORTED=value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TUSHARE_TOKEN", "oldtoken")
+    monkeypatch.delenv("UNSUPPORTED", raising=False)
+
+    try:
+        load_env_local(path, allowed_keys={"TUSHARE_TOKEN"})
+    except ValueError as exc:
+        assert "UNSUPPORTED" in str(exc)
+    else:
+        raise AssertionError("unsupported key must fail")
+
+    assert os.environ["TUSHARE_TOKEN"] == "oldtoken"
+    assert "UNSUPPORTED" not in os.environ
+
+
+def test_load_env_local_duplicate_key_uses_last_value(tmp_path, monkeypatch):
+    path = tmp_path / ".env.local"
+    path.write_text("FOO=first\nFOO=second\n", encoding="utf-8")
+    monkeypatch.delenv("FOO", raising=False)
+
+    load_env_local(path, allowed_keys={"FOO"})
+
+    assert os.environ["FOO"] == "second"

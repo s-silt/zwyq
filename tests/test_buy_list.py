@@ -6,6 +6,7 @@ import json
 import pytest
 
 import scripts.buy_list as bl
+from ashare_gauntlet.account_state import AccountFreshnessError
 
 
 def _setup(tmp_path, monkeypatch, snap_date="20260101", rows=None, holdings=None):
@@ -18,7 +19,7 @@ def _setup(tmp_path, monkeypatch, snap_date="20260101", rows=None, holdings=None
     rows = rows if rows is not None else []
     (fdir / f"{snap_date}_factor.json").write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
     hpath = tmp_path / "holdings.json"
-    holdings = holdings if holdings is not None else {"positions": [], "cash": 100000.0}
+    holdings = holdings if holdings is not None else {"as_of": snap_date, "positions": [], "cash": 100000.0}
     hpath.write_text(json.dumps(holdings, ensure_ascii=False), encoding="utf-8")
     ppath = tmp_path / "policy.json"
     ppath.write_text(json.dumps({"policy_version": "1", "target_positions": 10,
@@ -71,7 +72,7 @@ def test_end_to_end_states_and_determinism(tmp_path, monkeypatch, capsys):
         rows=[_row(),                                     # 完美候选(有覆盖)→ BUY
               _row(ts="600002.SH", name="乙", tier="🟡"),  # 🟡 → WAIT
               _row(ts="600003.SH", name="丙")],            # 无覆盖 → WAIT FACTCHECK_REQUIRED
-        holdings={"positions": [
+        holdings={"as_of": "20260101", "positions": [
             {"ts_code": "600009.SH", "name": "破线股", "industry": "航空", "shares": 100,
              "cost": 5.0, "last": 3.9, "mv": 390.0, "stop": 4.0}],   # last≤stop → EXIT
             "cash": 100000.0})
@@ -115,6 +116,7 @@ def test_nonfinite_score_or_bad_shares_fail_loud(tmp_path, monkeypatch):
 def test_held_missing_from_snapshot_with_red_override_exits(tmp_path, monkeypatch):
     # 对抗审查 P0:持仓股掉出 snapshot(恰是最危险情形)时红灯覆盖仍须触发 EXIT
     out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "as_of": "20260101",
         "positions": [{"ts_code": "600666.SH", "name": "掉档股", "industry": "医药",
                        "shares": 100, "cost": 8.0, "last": 7.0, "mv": 700.0, "stop": 5.0}],
         "cash": 10000.0})
@@ -138,6 +140,20 @@ def test_invalid_override_verdict_fails_loud(tmp_path, monkeypatch):
         bl.main([])
 
 
+def test_load_overrides_rejects_duplicate_or_malformed_rows(tmp_path):
+    path = tmp_path / "overrides.json"
+    row = {"ts_code": "600001.SH", "as_of": "20260101",
+           "verdict": "clear", "expires_on": "20270101"}
+    path.write_text(json.dumps({"overrides": [row, dict(row)]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="重复"):
+        bl.load_overrides(str(path))
+
+    path.write_text(json.dumps({"overrides": [{"ts_code": "600001.SH"}]}),
+                    encoding="utf-8")
+    with pytest.raises(ValueError, match="缺字段"):
+        bl.load_overrides(str(path))
+
+
 def test_holdings_missing_industry_fails_loud(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
         "positions": [{"ts_code": "600009.SH", "name": "乙", "shares": 100,
@@ -153,3 +169,82 @@ def test_empty_buy_is_honest(tmp_path, monkeypatch, capsys):
     bl.main([])
     out = json.loads(out_path.read_text(encoding="utf-8"))
     assert all(d["state"] != "BUY" for d in out["decisions"])   # 空 BUY 合法,不降门槛
+
+
+# ── P0-1: 账户状态门禁 ──
+
+def test_aligned_account_passes_and_outputs_account_fields(tmp_path, monkeypatch):
+    """as_of aligned → 门禁通过,输出含 account_as_of / account_source_schema。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "as_of": "20260101",
+        "positions": [],
+        "cash": 100000.0,
+    })
+    bl.main([])
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert out["account_as_of"] == "20260101"
+    assert out["account_source_schema"] == "legacy_unversioned"
+
+
+def test_missing_account_as_of_fails_loud_before_write(tmp_path, monkeypatch):
+    """holdings 无 as_of → normalize 后 freshness=MISSING → fail-loud,不写 decision。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "positions": [],
+        "cash": 100000.0,
+    })
+    with pytest.raises((SystemExit, AccountFreshnessError), match="ACCOUNT_AS_OF_MISSING"):
+        bl.main([])
+    # 不应创建 decision 文件
+    assert not out_path.exists()
+
+
+def test_stale_account_as_of_fails_loud_before_write(tmp_path, monkeypatch):
+    """holdings as_of 早于 snapshot → STALE → fail-loud。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "as_of": "20251231",
+        "positions": [],
+        "cash": 100000.0,
+    })
+    with pytest.raises((SystemExit, AccountFreshnessError), match="ACCOUNT_AS_OF_STALE"):
+        bl.main([])
+    assert not out_path.exists()
+
+
+def test_future_account_as_of_fails_loud_before_write(tmp_path, monkeypatch):
+    """holdings as_of 晚于 snapshot → FUTURE → fail-loud。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "as_of": "20260102",
+        "positions": [],
+        "cash": 100000.0,
+    })
+    with pytest.raises((SystemExit, AccountFreshnessError), match="ACCOUNT_AS_OF_FUTURE"):
+        bl.main([])
+    assert not out_path.exists()
+
+
+def test_invalid_date_account_as_of_fails_loud_before_write(tmp_path, monkeypatch):
+    """holdings as_of 非法日期 → INVALID → fail-loud。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "as_of": "20260132",
+        "positions": [],
+        "cash": 100000.0,
+    })
+    with pytest.raises((SystemExit, AccountFreshnessError), match="ACCOUNT_AS_OF_INVALID"):
+        bl.main([])
+    assert not out_path.exists()
+
+
+def test_existing_decision_not_overwritten_on_fail(tmp_path, monkeypatch):
+    """门禁失败不覆盖已有旧 decision 文件。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
+        "as_of": "20251231",  # stale
+        "positions": [],
+        "cash": 100000.0,
+    })
+    # 先手工创建一个旧文件
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    old_content = '{"old": true}'
+    out_path.write_text(old_content, encoding="utf-8")
+    with pytest.raises((SystemExit, AccountFreshnessError)):
+        bl.main([])
+    assert out_path.read_text(encoding="utf-8") == old_content

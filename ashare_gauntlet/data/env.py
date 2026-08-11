@@ -12,7 +12,8 @@ import os
 from pathlib import Path
 
 
-def load_env_local(path: str | Path = ".env.local") -> None:
+def load_env_local(path: str | Path = ".env.local", *,
+                   allowed_keys: set[str] | None = None) -> None:
     """把 ``.env.local`` 里的 ``KEY=VALUE`` 读入并**覆盖** ``os.environ``。
 
     文件不存在时安静返回(调用方无需先判存在)。跳过空行与 ``#`` 注释,
@@ -21,9 +22,14 @@ def load_env_local(path: str | Path = ".env.local") -> None:
     p = Path(path)
     if not p.exists():
         return
+    parsed: dict[str, str] = {}
     for line in p.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s or s.startswith("#") or "=" not in s:
             continue
         key, value = s.split("=", 1)
-        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+        key = key.strip()
+        if allowed_keys is not None and key not in allowed_keys:
+            raise ValueError(f"unsupported key in {p}: {key}")
+        parsed[key] = value.strip().strip('"').strip("'")
+    os.environ.update(parsed)

@@ -14,10 +14,14 @@ from __future__ import annotations
 import re
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from itertools import islice
 from typing import Iterator
+from zoneinfo import ZoneInfo
 
-_FIELD_NAME, _FIELD_CODE, _FIELD_LAST, _FIELD_PREV, _FIELD_PCT = 1, 2, 3, 4, 32
+_FIELD_NAME, _FIELD_CODE, _FIELD_LAST, _FIELD_PREV = 1, 2, 3, 4
+_FIELD_QUOTE_TIME, _FIELD_PCT = 30, 32
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 _RECORD = re.compile(r'v_(\w+)="([^"]*)"')   # 记录级正则:换行/分号两种物理分隔都覆盖
 # 单批符号上限(stock-sdk MAX_BATCH_SIZE 同款;URL 超长脆断的操作参数,非评分常数)
 BATCH = 500
@@ -56,11 +60,28 @@ def parse_tencent_quote(text: str) -> dict[str, dict]:
         if sym[:2] not in ("sh", "sz"):
             continue
         try:   # 单行字段异常('--'/空串)跳过该行,不崩整批(哨兵要报出其余持仓)
-            out[f"{parts[_FIELD_CODE]}.{sym[:2].upper()}"] = {
+            code = parts[_FIELD_CODE]
+            if (len(code) != 6 or not code.isdigit()
+                    or not sym[2:].isdigit() or sym[2:] != code):
+                continue
+            raw_time = parts[_FIELD_QUOTE_TIME] if len(parts) > _FIELD_QUOTE_TIME else ""
+            quote_as_of = None
+            timestamp_status = "missing"
+            if raw_time:
+                try:
+                    parsed = datetime.strptime(raw_time, "%Y%m%d%H%M%S").replace(tzinfo=_SHANGHAI)
+                    quote_as_of = parsed.isoformat(timespec="seconds")
+                    timestamp_status = "valid"
+                except ValueError:
+                    timestamp_status = "invalid"
+            out[f"{code}.{sym[:2].upper()}"] = {
                 "name": parts[_FIELD_NAME],
                 "last": float(parts[_FIELD_LAST]),
                 "prev_close": float(parts[_FIELD_PREV]),
                 "pct": float(parts[_FIELD_PCT]),
+                "quote_as_of": quote_as_of,
+                "trade_date": raw_time[:8] if timestamp_status == "valid" else None,
+                "timestamp_status": timestamp_status,
             }
         except ValueError:
             continue

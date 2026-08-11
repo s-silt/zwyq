@@ -11,6 +11,7 @@ as CACHE``)保持原有代码体不变。
 from __future__ import annotations
 
 import os
+from urllib.parse import urlparse
 
 from ashare_gauntlet.data.env import load_env_local
 
@@ -29,19 +30,29 @@ TRIGGER_BANDS_PATH = "data/trigger_bands.json"    # 观察名单触发带(哨兵
 WATCHLIST_PATH = "data/watchlist.json"            # 6/19 种子名单(cards/tech_report 消费)
 TRADE_JOURNAL_PATH = "data/trade_journal.json"    # 交易流水
 INTRADAY_STATE_PATH = "data/intraday_alert_state.json"  # 哨兵去重状态(可删)
+ACCOUNT_STATE_DIR = "data/account_state"          # EOD 账户估值快照(运行态,可再生)
 PROFILE_PATH = "data/profile.json"                # 个人投资约束 profile(非研究结论)
 
 
-def tushare_pro():
-    """标准 tushare 装配:``.env.local`` 权威覆盖 → ``make_pro_api(TOKEN, HTTP_URL)``。
+def tushare_pro(*, env_path: str | os.PathLike[str] = ".env.local",
+                strict_env: bool = False):
+    """标准 Tushare 装配:token 必需，HTTP URL 为可选镜像覆盖。
 
-    TUSHARE_TOKEN / TUSHARE_HTTP_URL 任一缺失即 KeyError fail-loud(与散落各
-    脚本的历史语义一致,不静默降级到官方网关)。tushare_source 延迟导入,
-    使只读路径常量的轻消费方(如盘中哨兵)不背 tushare 依赖。
+    ``.env.local`` 仍是权威覆盖源。未配置或留空 ``TUSHARE_HTTP_URL`` 时
+    保留 SDK 官方端点与调用方代理；显式镜像由 ``make_pro_api`` 处理直连。
+    tushare_source 延迟导入，避免路径常量消费方承担 Tushare 依赖。
     """
-    load_env_local()
+    allowed = {"TUSHARE_TOKEN", "TUSHARE_HTTP_URL"} if strict_env else None
+    load_env_local(env_path, allowed_keys=allowed)
     from ashare_gauntlet.data import tushare_source
 
-    return tushare_source.make_pro_api(
-        os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"]
-    )
+    token = os.environ.get("TUSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TUSHARE_TOKEN is required")
+    http_url = (os.environ.get("TUSHARE_HTTP_URL") or "").strip() or None
+    if strict_env and http_url:
+        parsed = urlparse(http_url)
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and parsed.hostname not in local_hosts:
+            raise RuntimeError("TUSHARE_HTTP_URL must use HTTPS in MCP mode")
+    return tushare_source.make_pro_api(token, http_url)

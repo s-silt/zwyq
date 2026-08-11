@@ -18,6 +18,8 @@ from typing import cast
 
 import pandas as pd
 
+from ashare_gauntlet.config import tushare_pro
+from ashare_gauntlet.data.env import load_env_local
 from ashare_gauntlet.data.partition import date_partition_files
 from ashare_gauntlet.factsheet import daily_tech_facts, entry_rank, market_returns
 from ashare_gauntlet.screen import board_of, screen_candidates
@@ -93,11 +95,11 @@ def main() -> None:
              and c in last_d and 0.0 < last_d[c] <= a.max_price]
     df = _facts_table(daily, adj, codes, mr)
 
-    have_token = "TUSHARE_TOKEN" in os.environ and "TUSHARE_HTTP_URL" in os.environ
+    load_env_local()
+    have_token = bool(os.environ.get("TUSHARE_TOKEN", "").strip())
     if have_token:
         from ashare_gauntlet.data.fetch import call_with_retry
-        from ashare_gauntlet.data.tushare_source import make_pro_api
-        pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+        pro = tushare_pro()
         db = call_with_retry(lambda: pro.daily_basic(trade_date=as_of, fields="ts_code,pe_ttm,pb,total_mv"))
         _EXCHANGE = {"sh_main": "SSE", "sz_main": "SZSE", "main": "", "all": ""}
         sb = call_with_retry(lambda: pro.stock_basic(

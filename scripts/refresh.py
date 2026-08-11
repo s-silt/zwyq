@@ -8,13 +8,11 @@ Usage: python scripts/refresh.py [lookback_days] [cache_dir]
 """
 
 import datetime as dt
-import os
 import sys
 from pathlib import Path
 
-from ashare_gauntlet.config import CACHE_DIR
+from ashare_gauntlet.config import CACHE_DIR, tushare_pro
 from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day, trading_days_from_cal
-from ashare_gauntlet.data.tushare_source import make_pro_api
 
 # moneyflow_hsgt is market-level (1 row/day): 北向总成交额(沪/深股通). Post
 # 2024-08-19 its north_money column is TURNOVER, not net flow — see
@@ -25,7 +23,7 @@ ENDPOINTS = ("daily", "adj_factor", "hk_hold", "moneyflow_hsgt")
 def main(lookback_days: int = 10, cache_dir: str = CACHE_DIR) -> None:
     today = dt.date.today()
     start = today - dt.timedelta(days=lookback_days)
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     cal = pro.trade_cal(
         exchange="SSE", start_date=start.strftime("%Y%m%d"), end_date=today.strftime("%Y%m%d")
     )

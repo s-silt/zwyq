@@ -16,7 +16,11 @@ from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 
-from ashare_gauntlet.candidates import candidate_assessment
+from ashare_gauntlet.account_state import (
+    normalize_account_state,
+    require_account_as_of,
+)
+from ashare_gauntlet.candidates import candidate_assessment, override_status
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH
 from ashare_gauntlet.data.partition import date_partition_files
 from ashare_gauntlet.portfolio_decision import decide_states, validate_policy
@@ -105,7 +109,24 @@ def load_overrides(path: "str | None" = None) -> dict[str, dict]:
         data = json.load(open(path or OVERRIDES_PATH, encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    return {o["ts_code"]: o for o in data["overrides"]}
+    if not isinstance(data, dict) or not isinstance(data.get("overrides"), list):
+        raise ValueError("factcheck_overrides 顶层必须含 overrides 列表")
+    result: dict[str, dict] = {}
+    for index, item in enumerate(data["overrides"]):
+        if not isinstance(item, dict):
+            raise ValueError(f"factcheck_overrides 第 {index} 行必须是对象")
+        required = {"ts_code", "as_of", "verdict", "expires_on"}
+        missing = sorted(required - set(item))
+        if missing:
+            raise ValueError(f"factcheck_overrides 第 {index} 行缺字段 {missing}")
+        code = item["ts_code"]
+        if (not isinstance(code, str) or len(code) != 9 or code[6] != "."
+                or not code[:6].isdigit() or code[7:] not in {"SH", "SZ"}
+                or code in result):
+            raise ValueError(f"factcheck_overrides 股票代码无效或重复: {code!r}")
+        override_status(item, item["as_of"])
+        result[code] = item
+    return result
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -130,6 +151,9 @@ def main(argv: list[str] | None = None) -> None:
     rows = json.load(open(snap_path, encoding="utf-8"))
     hold = json.load(open(HOLDINGS_PATH, encoding="utf-8"))
     validate_holdings(hold)
+    # P0-1: 账户状态归一化 + 严格日期门禁(任何 missing/invalid/stale/future → fail-loud)
+    account = normalize_account_state(hold, expected_as_of=as_of)
+    require_account_as_of(account, as_of)
     validate_rows(rows, held={p["ts_code"] for p in hold["positions"]})
     policy = json.load(open(POLICY_PATH, encoding="utf-8"))
     validate_policy(policy)
@@ -170,7 +194,7 @@ def main(argv: list[str] | None = None) -> None:
                             "last": p.get("last"), "decile": None, "spec_crowd": None,
                             "spike_limit": None, "eligible_buy": False,
                             "reason_codes": ["SNAPSHOT_MISSING"],
-                            "governance_red": bool(ov) and str(ov["verdict"]) == "red"})
+                            "governance_red": override_status(ov, as_of) == "red"})
     ranks = size_tercile_ranks(rows)                     # X-08:D10 全档划桶(ex-ante)
     for a_ in assessments:
         rk = ranks.get(str(a_["ts_code"]))
@@ -182,6 +206,8 @@ def main(argv: list[str] | None = None) -> None:
                               risk_breach=risk_breach, manual_exit=manual_exit)
 
     out = {"as_of": as_of,
+           "account_as_of": account["as_of"],
+           "account_source_schema": account["source_schema"],
            "generated_at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
            "factor_snapshot": snap_path,
            "policy_version": str(policy["policy_version"]),

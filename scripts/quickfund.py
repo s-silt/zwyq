@@ -12,11 +12,10 @@ import time
 import pandas as pd
 
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_symbol_table
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.fundamentals import balance_facts, cashflow_facts, latest_quarter, peg, receivables_ratio
 import os
 
-from ashare_gauntlet.config import CACHE_DIR as CACHE
+from ashare_gauntlet.config import CACHE_DIR as CACHE, tushare_pro
 
 TABLES = ("income", "fina_indicator", "balancesheet", "cashflow")
 
@@ -39,7 +38,7 @@ def _dedt_yoy(code: str, end_date: str) -> float | None:
 
 
 def main(codes: list[str], sleep_s: float) -> None:
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     as_of = _as_of()
     for i, code in enumerate(codes):
         try:

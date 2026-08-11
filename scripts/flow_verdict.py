@@ -14,13 +14,12 @@ Usage: python scripts/flow_verdict.py [cache_dir]
 """
 
 import glob
-import os
 import sys
 
 import pandas as pd
 
+from ashare_gauntlet.config import tushare_pro
 from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day
-from ashare_gauntlet.data.tushare_source import make_pro_api
 from ashare_gauntlet.gauntlet import run_gauntlet
 from ashare_gauntlet.panel import assemble_flow_panel, universe_from_daily
 
@@ -37,7 +36,7 @@ def main(cache_dir: str = "data/cache") -> None:
     dates = sorted(daily["trade_date"].unique())
     print(f"price dates={len(dates)} ({dates[0]}..{dates[-1]}); pulling hk_hold...", flush=True)
 
-    pro = make_pro_api(os.environ["TUSHARE_TOKEN"], os.environ["TUSHARE_HTTP_URL"])
+    pro = tushare_pro()
     try:
         for i, day in enumerate(dates, 1):
             fetch_market_day(pro, "hk_hold", day, cache_dir)

@@ -23,18 +23,37 @@ def test_paths_pin_historical_strings():
     assert config.WATCHLIST_PATH == "data/watchlist.json"
     assert config.TRADE_JOURNAL_PATH == "data/trade_journal.json"
     assert config.INTRADAY_STATE_PATH == "data/intraday_alert_state.json"
+    assert config.ACCOUNT_STATE_DIR == "data/account_state"
     assert config.PROFILE_PATH == "data/profile.json"
 
 
 def test_tushare_pro_fails_loud_without_token(tmp_path, monkeypatch):
-    """无 .env.local 且环境无 token → KeyError(与散落各脚本的历史语义一致,不静默降级)。"""
+    """无 .env.local 且环境无 token → 明确失败，不静默创建匿名客户端。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
     monkeypatch.delenv("TUSHARE_HTTP_URL", raising=False)
     from ashare_gauntlet import config
 
-    with pytest.raises(KeyError):
+    with pytest.raises(RuntimeError, match="TUSHARE_TOKEN"):
         config.tushare_pro()
+
+
+def test_tushare_pro_allows_token_without_http_url(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TUSHARE_TOKEN", "tk")
+    monkeypatch.delenv("TUSHARE_HTTP_URL", raising=False)
+    from ashare_gauntlet import config
+    from ashare_gauntlet.data import tushare_source
+
+    captured: dict = {}
+
+    def fake(token: str, http_url: str | None = None, timeout: int = 120):
+        captured.update(token=token, url=http_url)
+        return "PRO"
+
+    monkeypatch.setattr(tushare_source, "make_pro_api", fake)
+    assert config.tushare_pro() == "PRO"
+    assert captured == {"token": "tk", "url": None}
 
 
 def test_tushare_pro_assembles_from_env_local(tmp_path, monkeypatch):

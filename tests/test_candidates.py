@@ -56,6 +56,36 @@ def test_factcheck_gate():
     assert c["eligible_buy"] is False and "GOVERNANCE_RED" in c["reason_codes"]
 
 
+def test_future_factcheck_does_not_rewrite_old_decision():
+    from ashare_gauntlet.candidates import candidate_assessment
+
+    for verdict in ("clear", "red"):
+        future = _ov(verdict=verdict)
+        future["as_of"] = "20260809"
+        result = candidate_assessment(_row(), future, "20260807")
+        assert result["eligible_buy"] is False
+        assert "FACTCHECK_AFTER_AS_OF" in result["reason_codes"]
+        assert "GOVERNANCE_RED" not in result["reason_codes"]
+
+
+def test_factcheck_dates_fail_loud_when_invalid_or_reversed():
+    import pytest
+    from ashare_gauntlet.candidates import candidate_assessment
+
+    bad_decision_date = _ov()
+    with pytest.raises(ValueError, match="decision as_of"):
+        candidate_assessment(_row(), bad_decision_date, "20260230")
+
+    bad_factcheck_date = _ov()
+    bad_factcheck_date["as_of"] = "20260230"
+    with pytest.raises(ValueError, match="factcheck as_of"):
+        candidate_assessment(_row(), bad_factcheck_date, AS_OF)
+
+    reversed_window = _ov(expires="20260630")
+    with pytest.raises(ValueError, match="不能早于"):
+        candidate_assessment(_row(), reversed_window, AS_OF)
+
+
 def test_reason_codes_deterministic_order():
     from ashare_gauntlet.candidates import candidate_assessment
 

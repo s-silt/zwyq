@@ -23,6 +23,9 @@ def test_parse_tencent_quote_fields():
     assert q["600875.SH"]["last"] == pytest.approx(27.71)
     assert q["600875.SH"]["prev_close"] == pytest.approx(28.40)
     assert q["600875.SH"]["pct"] == pytest.approx(-2.43)
+    assert q["600875.SH"]["quote_as_of"] == "2026-07-08T15:00:00+08:00"
+    assert q["600875.SH"]["trade_date"] == "20260708"
+    assert q["600875.SH"]["timestamp_status"] == "valid"
 
 
 def test_parse_tencent_quote_multiple_and_junk_lines():
@@ -30,6 +33,12 @@ def test_parse_tencent_quote_multiple_and_junk_lines():
         "600875", "000589").replace("东方电气", "贵州轮胎")
     q = parse_tencent_quote(two)
     assert set(q) == {"600875.SH", "000589.SZ"}
+
+
+def test_parse_tencent_quote_rejects_symbol_code_mismatch():
+    mismatched = SAMPLE.replace("v_sh600875", "v_sh600001", 1)
+    with pytest.raises(ValueError, match="无有效行"):
+        parse_tencent_quote(mismatched)
 
 
 def test_parse_tencent_quote_empty_fails_loud():

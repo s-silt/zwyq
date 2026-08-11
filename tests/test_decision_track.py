@@ -149,9 +149,11 @@ def test_four_core_date_mismatch_fails_loud(tmp_path):
 
 
 def _write_trade_cal(root: Path, is_open: list[int]) -> None:
-    dates = ["20260101", "20260102", "20260103", "20260104", "20260105"]
-    cal = pd.DataFrame({"cal_date": dates, "is_open": is_open})
-    path = root / "data/cache/trade_cal/20260101_20260105.parquet"
+    # 核对窗口从最早快照日(20251231)起,日历必须覆盖到它;fixture 世界里该日
+    # 无 EOD 分区,标休市以保持数据自洽(is_open 形参只管 0101..0105)。
+    dates = ["20251231", "20260101", "20260102", "20260103", "20260104", "20260105"]
+    cal = pd.DataFrame({"cal_date": dates, "is_open": [0] + is_open})
+    path = root / "data/cache/trade_cal/20251231_20260105.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     cal.to_parquet(path, index=False)
 
@@ -179,6 +181,34 @@ def test_complete_calendar_marks_t_plus_one_verified(tmp_path):
     assert report["calendar_coverage"]["status"] == "complete"
     assert (report["metrics"]["1"]["t_plus_one_basis"]
             == "verified_against_complete_calendar")
+
+
+def test_pre_partition_calendar_open_day_missing_all_cores_fails_loud(tmp_path):
+    """codex 复核二轮 P1:最早现存分区之前,日历标开市但快照与四核心分区共同
+    缺失的日期必须被视为确凿数据缺口——否则该段的 BUY 会拿错误的 T+1 映射。"""
+    _fixture(tmp_path)
+    for day in ("20260101", "20260102"):
+        for endpoint in ("daily", "adj_factor", "daily_basic", "stk_limit"):
+            (tmp_path / f"data/cache/{endpoint}/{day}.parquet").unlink()
+    dates = ["20251231", "20260101", "20260102", "20260103", "20260104", "20260105"]
+    cal = pd.DataFrame({"cal_date": dates, "is_open": [1, 1, 1, 0, 0, 1]})
+    path = tmp_path / "data/cache/trade_cal/20251231_20260105.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cal.to_parquet(path, index=False)
+    with pytest.raises(DecisionEvaluationError, match="四核心分区"):
+        dt.build_report(tmp_path, horizons=(1,))
+
+
+def test_metrics_schema_is_stable_without_valid_snapshots(tmp_path):
+    """codex 复核二轮 P2:全部快照审计失败时 metrics 仍含 t_plus_one_basis。"""
+    broken = _snapshot()
+    broken["decisions"][0]["reason_codes"] = ["FACTCHECK_REQUIRED"]
+    _write_json(tmp_path / "data/decisions/20260101_buy_decisions.json", broken)
+    _write_json(tmp_path / "data/holdscore/20260101_factor.json",
+                [{"ts_code": "600001.SH", "decile": 10}])
+    report = dt.build_report(tmp_path, horizons=(1,))
+    assert (report["metrics"]["1"]["t_plus_one_basis"]
+            == "not_evaluated_no_valid_snapshots")
 
 
 def test_snapshot_gap_over_known_trade_day_breaks_episode(tmp_path):

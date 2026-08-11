@@ -133,10 +133,17 @@ def _load_index_cache(root: Path) -> pd.DataFrame | None:
     return pd.read_parquet(path, columns=["trade_date", "open"])
 
 
-def _calendar_coverage(root: Path, trade_days: list[str]) -> dict[str, Any]:
-    """核对已归档 trade_cal；历史日历拉取不全时只标 partial，不伪称完整。"""
+def _calendar_coverage(root: Path, trade_days: list[str],
+                       *, start: str | None = None) -> dict[str, Any]:
+    """核对已归档 trade_cal；历史日历拉取不全时只标 partial，不伪称完整。
+
+    ``start``(可选)把核对窗口向前扩到最早快照日:最早现存分区之前的段落里,
+    日历标记开市却无任何四核心分区的日期同样是确凿数据缺口,起点取
+    ``trade_days[0]`` 会让这段盲区漏检(codex 复核二轮 P1)。
+    """
     if not trade_days:
         return {"status": "unavailable", "reason": "no_trade_days"}
+    window_start = min(start, trade_days[0]) if start else trade_days[0]
     directory = _inside_root(root, root / CACHE_DIR / "trade_cal")
     paths = [_inside_root(root, path) for path in directory.glob("*.parquet")] if directory.exists() else []
     frames: list[pd.DataFrame] = []
@@ -150,9 +157,9 @@ def _calendar_coverage(root: Path, trade_days: list[str]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "trade_cal_cache_missing"}
     cal = pd.concat(frames, ignore_index=True)
     cal["cal_date"] = cal["cal_date"].astype(str)
-    cal = cal[(cal["cal_date"] >= trade_days[0]) & (cal["cal_date"] <= trade_days[-1])]
+    cal = cal[(cal["cal_date"] >= window_start) & (cal["cal_date"] <= trade_days[-1])]
     cal = cal.drop_duplicates("cal_date", keep="last")
-    expected_calendar = {d.strftime("%Y%m%d") for d in pd.date_range(trade_days[0], trade_days[-1])}
+    expected_calendar = {d.strftime("%Y%m%d") for d in pd.date_range(window_start, trade_days[-1])}
     covered = set(cal["cal_date"])
     open_days = set(cal.loc[pd.to_numeric(cal["is_open"], errors="coerce") == 1, "cal_date"])
     missing_calendar = sorted(expected_calendar - covered)
@@ -257,7 +264,12 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
     left_censored: list[dict[str, Any]] = []
     episodes: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
-    metrics: dict[str, Any] = {str(h): {"episode_count": 0} for h in horizons}
+    # metrics schema 恒含 t_plus_one_basis(codex 复核二轮 P2):无有效快照时为
+    # 明确的 not_evaluated,评估分支再按日历状态覆盖为 verified/unverified。
+    metrics: dict[str, Any] = {
+        str(h): {"episode_count": 0,
+                 "t_plus_one_basis": "not_evaluated_no_valid_snapshots"}
+        for h in horizons}
     calendar_coverage: dict[str, Any] = {"status": "unavailable", "reason": "no_valid_snapshots"}
     benchmark_coverage = {"status": "not_checked"}
     generated_through = (max(str(x.get("as_of")) for x in valid_snapshots)
@@ -267,7 +279,7 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
         first_as_of = earliest_valid_as_of or min(str(x["as_of"]) for x in valid_snapshots)
         trade_days, market, limits = _load_market(root, first_as_of)
         generated_through = trade_days[-1]
-        calendar_coverage = _calendar_coverage(root, trade_days)
+        calendar_coverage = _calendar_coverage(root, trade_days, start=first_as_of)
         # codex P1-2a:归档日历完整却有开市日缺全部四核心分区 → T+1 映射必错
         # (下一个有分区的日期会被误当次日开盘),确凿数据缺口不得继续评估。
         if (not calendar_coverage.get("missing_calendar_dates")

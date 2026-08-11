@@ -12,9 +12,10 @@ __pycache__/
 
 # Data cache (raw Tushare pulls, parquet) — large, regenerable, not for git
 # Anchored to repo root so it does NOT swallow the ashare_gauntlet/data/ source package.
-# 2026-08-12 起 data/holdings.json、data/profile.json、data/trading_policy.json
-# (个人持仓/约束/政策)已从版本库移除,永不再入公开仓;勿 `git add -f` 加回。
+# 2026-08-12 用户决定:data/ 与 docs/ 整目录(个人账户状态、研究方法论与实验档案)
+# 一律不入公开仓;勿 `git add -f` 加回。本地文件保留,仅移出版本控制。
 /data/
+/docs/
 *.parquet
 
 # Scratch / smoke scripts

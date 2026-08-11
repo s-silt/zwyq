@@ -334,6 +334,44 @@ def test_calendar_time_drawdown_excludes_unfilled_episodes():
     assert out["max_drawdown_status"] == "no_filled_episodes"
 
 
+def test_calendar_time_drawdown_equal_weights_overlapping_episodes():
+    """codex P2:重叠 episode 必须逐日简单等权(分母=当日活跃数,非累计权重)。"""
+    from ashare_gauntlet.decision_evaluation import calendar_time_drawdown
+    dates = ["20260102", "20260105", "20260106"]
+    trade_days, market = _market({d: p for d, p in zip(dates, (10.0, 10.9, 9.0))})
+    a = _ct_event("20260102", 10.0, "20260106", 9.0)
+    b = _ct_event("20260102", 5.0, None, None, code="600999.SH")   # 陪衬价恒 5.0,日收益 0
+    out = calendar_time_drawdown([a, b], 1, trade_days, market)
+    # 末日组合收益 = ((9/11−1)+0)/2 = −1/11,且恰接在峰值日之后 → mdd = −1/11;
+    # 若误按累计权重(不除当日活跃数),末日为 −2/11,本断言变红
+    assert out["max_drawdown"] == pytest.approx(-1.0 / 11.0)
+
+
+def test_calendar_time_drawdown_covers_deferred_exit_path():
+    """codex P2:一字跌停顺延期间的持仓路径必须计入组合净值(端到端)。"""
+    dates = ["20260101", "20260102", "20260105", "20260106"]
+    trade_days, market = _market(dict(zip(dates, [9.0, 10.0, 8.0, 9.0])))
+    locked = market["20260105"]["ts_code"] == "600001.SH"
+    market["20260105"].loc[
+        locked, ["open", "high", "low", "close", "adj_open", "adj_close"]] = 8.0
+    limits = _limits(dates)
+    limits["20260105"].loc[
+        limits["20260105"]["ts_code"] == "600001.SH", "down_limit"] = 8.0
+    episodes = [{"episode_id": "20260101:600001.SH", "as_of": "20260101",
+                 "generated_at": None, "ts_code": "600001.SH", "name": "甲",
+                 "shares_advised": 100, "max_entry_price": None,
+                 "factcheck_status": "clear_as_recorded", "left_censored": False,
+                 "actual_execution": False}]
+    _, metrics = evaluate_episodes(episodes, {"20260101": []}, trade_days,
+                                   market, limits, (1,),
+                                   commission_rate=0.0, slippage_rate=0.0)
+    row = metrics["1"]
+    assert row["max_drawdown_status"] == "computed_calendar_time_equal_weight"
+    # entry 0102 open 10.0 → close 10.1(nav 1.01=峰);0105 一字跌停 close 8.0
+    # (顺延持仓,nav 0.8);0106 顺延卖出 open 9.0(nav 0.9)→ mdd = 0.8/1.01 − 1
+    assert row["max_drawdown"] == pytest.approx(0.8 / 1.01 - 1.0)
+
+
 def test_calendar_time_drawdown_holds_immature_episode_to_data_end():
     """未到期 episode 持有至数据尾,不事后剔除——跌幅要体现在回撤里。"""
     from ashare_gauntlet.decision_evaluation import calendar_time_drawdown

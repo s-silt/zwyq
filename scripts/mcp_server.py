@@ -86,7 +86,7 @@ def check_governance(ts_codes: list[str], force_refresh: bool = False) -> dict:
 
 @mcp.prompt()
 def daily_recommendation_prompt(max_recommendations: int = 3) -> str:
-    """生成每日9万元账户荐股任务模板。"""
+    """生成每日实盘账户荐股任务模板(账户规模由 get_account_snapshot 提供)。"""
     if not 1 <= max_recommendations <= 3:
         raise ValueError("max_recommendations must be 1..3")
     return f"""先调用 healthcheck。只有 recommendation_readiness.ready=true 才能正式荐股；

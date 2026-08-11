@@ -32,20 +32,13 @@ _yake_*.txt
 # Claude Code 项目配置与 workflows(本地协作配置,不入公开仓;2026-08-12 用户决定)
 /.claude/
 
-# OpenHarness 本地配置、凭据与运行态；项目 skills 允许入库
-.openharness/*
-!.openharness/skills/
-!.openharness/skills/**
-.openharness/settings.json
-.openharness/credentials.json
-.openharness/copilot_auth.json
-.openharness/data/
-.openharness/logs/
-.openharness/teams/
-.openharness/worktrees/
-.openharness/runtime/
-.openharness/issue.md
-.openharness/pr_comments.md
+# OpenHarness 全目录(含 skills)不入公开仓(2026-08-12 用户决定)
+.openharness/
+
+# 协作与工具配置、项目说明(内嵌个人流程/参数描述)不入公开仓(2026-08-12 用户决定)
+/.mcp.json
+/CLAUDE.md
+/README.md
 
 # Understand Anything 默认不启用；生成物可能包含语义化源码摘要
 .ua/

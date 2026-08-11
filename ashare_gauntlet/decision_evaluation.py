@@ -560,6 +560,50 @@ def aggregate_metrics(events: list[dict[str, Any]], horizons: tuple[int, ...]) -
     return metrics
 
 
+# X-09 预注册参数(docs/experiments.md,用户批准 2026-08-12;零新常数:
+# 主评窗=生产月频 21 日,最小信号日=aggregate_metrics 既有 NW lag 契约 max(4, lag+2))
+X09_PRIMARY_HORIZON = 21
+X09_MIN_SIGNAL_DATES = max(4, (X09_PRIMARY_HORIZON - 1) + 2)
+X09_T_THRESHOLD = 2.0
+
+
+def increment_verdict(metrics: dict[str, Any], *,
+                      horizon: int = X09_PRIMARY_HORIZON,
+                      min_signal_dates: int = X09_MIN_SIGNAL_DATES,
+                      t_threshold: float = X09_T_THRESHOLD) -> dict[str, Any]:
+    """X-09:决策链 BUY vs 同日 D10 可执行等权的增量方向判定(预注册判据)。
+
+    只输出判定与建议处置文本,绝不自动改生产——三分支处置(开启置信度连续化
+    预注册 / 复审四关过滤 / 继续积累)永远由人工执行。判据在样本积累前预先
+    指定,防事后挑窗挑门槛;NW t 与均值必然同号,分支只看 t。
+    """
+    base = {"experiment_id": "X-09", "primary_horizon": horizon,
+            "min_signal_dates": min_signal_dates, "t_threshold": t_threshold,
+            "production_action": "none_automatic"}
+    row = metrics.get(str(horizon))
+    if row is None:
+        return {**base, "status": "primary_horizon_not_evaluated",
+                "disposition": "在 horizons 中加入主评窗后重跑"}
+    count = row.get("increment_signal_date_count") or 0
+    t = row.get("increment_nw_t")
+    base.update({"signal_date_count": count, "increment_nw_t": t,
+                 "mean_increment_vs_d10": row.get("mean_increment_vs_d10")})
+    if count < min_signal_dates:
+        return {**base, "status": "insufficient_sample",
+                "disposition": "继续积累,不下结论"}
+    if t is None:
+        return {**base, "status": "not_computable",
+                "disposition": "样本达标但 NW t 不可算——检查增量序列退化"}
+    if t >= t_threshold:
+        return {**base, "status": "positive_direction_evidence",
+                "disposition": "人工:登记置信度连续化预注册实验"}
+    if t <= -t_threshold:
+        return {**base, "status": "negative_direction_evidence",
+                "disposition": "人工:复审四关+factcheck 是否过滤掉好股票"}
+    return {**base, "status": "not_significant",
+            "disposition": "继续积累,不下结论"}
+
+
 def snapshot_summary(valid_snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     states: Counter[str] = Counter()
     reasons: Counter[str] = Counter()

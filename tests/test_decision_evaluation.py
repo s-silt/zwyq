@@ -290,6 +290,32 @@ def test_known_trade_day_gap_between_snapshots_is_unknown_boundary():
     assert [e["as_of"] for e in outside] == ["20260101"]
 
 
+def _metrics_row(count: int, t: "float | None", mean: float = 0.001) -> dict:
+    return {"21": {"increment_signal_date_count": count, "increment_nw_t": t,
+                   "mean_increment_vs_d10": mean}}
+
+
+def test_increment_verdict_branches_follow_preregistration():
+    """X-09 预注册三分支 + 样本门(experiments.md,用户批准 2026-08-12)。"""
+    from ashare_gauntlet.decision_evaluation import increment_verdict
+    v = increment_verdict(_metrics_row(3, None))
+    assert v["status"] == "insufficient_sample"
+    assert v["production_action"] == "none_automatic"
+    v = increment_verdict(_metrics_row(22, 2.4))
+    assert v["status"] == "positive_direction_evidence"
+    v = increment_verdict(_metrics_row(22, -2.4, mean=-0.001))
+    assert v["status"] == "negative_direction_evidence"
+    v = increment_verdict(_metrics_row(30, 1.1))
+    assert v["status"] == "not_significant"
+    v = increment_verdict(_metrics_row(22, None))
+    assert v["status"] == "not_computable"
+    v = increment_verdict({"5": {}})   # 主评窗 21 未评估
+    assert v["status"] == "primary_horizon_not_evaluated"
+    # 边界:恰好达门槛
+    assert increment_verdict(_metrics_row(22, 2.0))["status"] == "positive_direction_evidence"
+    assert increment_verdict(_metrics_row(21, 2.4))["status"] == "insufficient_sample"
+
+
 def test_nw_requires_both_four_dates_and_requested_lag_support():
     events = []
     for i in range(3):

@@ -199,6 +199,18 @@ def test_pre_partition_calendar_open_day_missing_all_cores_fails_loud(tmp_path):
         dt.build_report(tmp_path, horizons=(1,))
 
 
+def test_report_carries_x09_increment_verdict(tmp_path):
+    """X-09 判定接线:报告必含 increment_verdict,当前样本 → insufficient/未评估。"""
+    _fixture(tmp_path)
+    report = dt.build_report(tmp_path, horizons=(1,))
+    verdict = report["increment_verdict"]
+    assert verdict["experiment_id"] == "X-09"
+    assert verdict["status"] == "primary_horizon_not_evaluated"   # horizons 无 21
+    assert verdict["production_action"] == "none_automatic"
+    report21 = dt.build_report(tmp_path, horizons=(1, 21))
+    assert report21["increment_verdict"]["status"] == "insufficient_sample"
+
+
 def test_metrics_schema_is_stable_without_valid_snapshots(tmp_path):
     """codex 复核二轮 P2:全部快照审计失败时 metrics 仍含 t_plus_one_basis。"""
     broken = _snapshot()

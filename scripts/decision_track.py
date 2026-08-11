@@ -26,6 +26,7 @@ from ashare_gauntlet.decision_evaluation import (
     build_market_tables,
     evaluate_episodes,
     extract_buy_episodes,
+    increment_verdict,
     snapshot_summary,
 )
 
@@ -320,6 +321,7 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
         "schema": "decision_chain_evaluation.v1",
         "generated_through": generated_through,
         "horizons": list(horizons),
+        "increment_verdict": increment_verdict(metrics),
         "scope": {
             "source": "frozen_decision_snapshots",
             "actual_execution": False,
@@ -405,6 +407,10 @@ def main(argv: list[str] | None = None) -> None:
         row = report["metrics"][str(horizon)]
         print(f"  {horizon}日: resolved={row.get('resolved_count', 0)}/"
               f"{row.get('episode_count', 0)} mean_net={row.get('mean_net_return')}")
+    verdict = report["increment_verdict"]
+    print(f"  X-09 增量判定({verdict['primary_horizon']}日主窗): {verdict['status']}"
+          f"(信号日 {verdict.get('signal_date_count', 0)}/{verdict['min_signal_dates']})"
+          f" → {verdict['disposition']}")
     print(f"→ {output}(只读历史反事实评估;非真实成交/非推荐概率)")
 
 

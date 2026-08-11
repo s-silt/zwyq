@@ -29,6 +29,9 @@ _yake_*.txt
 .codegraph/
 .cherry-studio/
 
+# Claude Code 项目配置与 workflows(本地协作配置,不入公开仓;2026-08-12 用户决定)
+/.claude/
+
 # OpenHarness 本地配置、凭据与运行态；项目 skills 允许入库
 .openharness/*
 !.openharness/skills/

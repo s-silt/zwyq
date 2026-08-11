@@ -272,6 +272,24 @@ def test_unknown_boundary_marks_new_buy_left_censored():
     assert [e["left_censored"] for e in episodes] == [True, True]
 
 
+def test_known_trade_day_gap_between_snapshots_is_unknown_boundary():
+    """codex P1-3:相邻快照之间隔着已知交易日却无快照文件 → 不得跨缺口合并。"""
+    sequence = [
+        _snapshot("20260101", [_decision(state="BUY")]),
+        _snapshot("20260105", [_decision(state="BUY")]),
+    ]
+    # 无缺口信息(退回旧语义):20260105 视为同一 episode 的延续,不开新事件
+    merged = extract_buy_episodes(sequence)
+    assert [e["as_of"] for e in merged] == ["20260101"]
+    # 已知 20260102 是交易日却无快照:缺口=unknown boundary,20260105 新开且左删失
+    split = extract_buy_episodes(sequence, known_trade_days=["20260102"])
+    assert [(e["as_of"], e["left_censored"]) for e in split] == [
+        ("20260101", True), ("20260105", True)]
+    # 缺口日不在快照区间内(如周末)时不触发
+    outside = extract_buy_episodes(sequence, known_trade_days=["20251230", "20260106"])
+    assert [e["as_of"] for e in outside] == ["20260101"]
+
+
 def test_nw_requires_both_four_dates_and_requested_lag_support():
     events = []
     for i in range(3):

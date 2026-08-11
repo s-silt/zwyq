@@ -201,8 +201,11 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
     valid_snapshots: list[dict[str, Any]] = []
     episode_sequence: list[dict[str, Any]] = []
     factors_by_date: dict[str, list[dict[str, Any]]] = {}
+    snapshot_file_dates: set[str] = set()
+    earliest_valid_as_of: str | None = None
     for path in paths:
         file_date = DECISION_RE.fullmatch(path.name).group(1)  # discover 已验证
+        snapshot_file_dates.add(file_date)
         in_scope = (start is None or file_date >= start) and (end is None or file_date <= end)
         try:
             snapshot = _json(path)
@@ -242,17 +245,17 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
         if audit["valid"]:
             episode_sequence.append(snapshot)
             factors_by_date[str(snapshot["as_of"])] = factor_rows
+            snap_as_of = str(snapshot["as_of"])
+            if earliest_valid_as_of is None or snap_as_of < earliest_valid_as_of:
+                earliest_valid_as_of = snap_as_of
             if in_scope:
                 valid_snapshots.append(snapshot)
         else:
             episode_sequence.append({"_unknown_boundary": True, "as_of": file_date})
 
-    scoped_episodes = [event for event in extract_buy_episodes(episode_sequence)
-                       if (start is None or event["as_of"] >= start)
-                       and (end is None or event["as_of"] <= end)]
-    left_censored = [event for event in scoped_episodes if event.get("left_censored")]
-    # 左边界未知的首个 BUY 可能是早已持续的 episode，只保留覆盖计数，不纳入主效果。
-    episodes = [event for event in scoped_episodes if not event.get("left_censored")]
+    scoped_episodes: list[dict[str, Any]] = []
+    left_censored: list[dict[str, Any]] = []
+    episodes: list[dict[str, Any]] = []
     enriched: list[dict[str, Any]] = []
     metrics: dict[str, Any] = {str(h): {"episode_count": 0} for h in horizons}
     calendar_coverage: dict[str, Any] = {"status": "unavailable", "reason": "no_valid_snapshots"}
@@ -260,10 +263,29 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
     generated_through = (max(str(x.get("as_of")) for x in valid_snapshots)
                          if valid_snapshots else (audits[-1]["file_date"] if audits else paths[-1].stem[:8]))
     if valid_snapshots:
-        first_as_of = min(str(x["as_of"]) for x in valid_snapshots)
+        # 行情从最早可用快照(含区间前置锚)加载,快照间缺口检测才覆盖前置段。
+        first_as_of = earliest_valid_as_of or min(str(x["as_of"]) for x in valid_snapshots)
         trade_days, market, limits = _load_market(root, first_as_of)
         generated_through = trade_days[-1]
         calendar_coverage = _calendar_coverage(root, trade_days)
+        # codex P1-2a:归档日历完整却有开市日缺全部四核心分区 → T+1 映射必错
+        # (下一个有分区的日期会被误当次日开盘),确凿数据缺口不得继续评估。
+        if (not calendar_coverage.get("missing_calendar_dates")
+                and calendar_coverage.get("open_days_without_four_core_partitions")):
+            raise DecisionEvaluationError(
+                "归档日历证明存在开市日缺全部四核心分区: "
+                f"{calendar_coverage['open_days_without_four_core_partitions'][:5]}"
+                "——T+1 映射不可信,先补齐 EOD 再评估")
+        # codex P1-3:已知交易日 = EOD 分区日 ∪ 快照文件日;相邻快照之间隔着
+        # 已知交易日却无快照文件 → unknown boundary,不跨缺口合并 episode。
+        known_days = set(trade_days) | snapshot_file_dates
+        scoped_episodes = [event for event in
+                           extract_buy_episodes(episode_sequence, known_days)
+                           if (start is None or event["as_of"] >= start)
+                           and (end is None or event["as_of"] <= end)]
+        left_censored = [event for event in scoped_episodes if event.get("left_censored")]
+        # 左边界未知的首个 BUY 可能是早已持续的 episode，只保留覆盖计数，不纳入主效果。
+        episodes = [event for event in scoped_episodes if not event.get("left_censored")]
         index_daily = _load_index_cache(root)
         benchmark_coverage = {
             "status": "available" if index_daily is not None else "unavailable",
@@ -273,6 +295,14 @@ def build_report(root: Path, *, start: str | None = None, end: str | None = None
             episodes, factors_by_date, trade_days, market, limits, horizons,
             index_daily, commission_rate=commission_rate,
             slippage_rate=slippage_rate)
+        # codex P1-2b:T+1 判定的依据逐窗口显式标注——归档日历不完整时,交易日
+        # 序列只来自现存分区,无法排除"四端点共同缺日",读数须按未验对待。
+        t_plus_one_basis = (
+            "verified_against_complete_calendar"
+            if calendar_coverage.get("status") == "complete"
+            else "partition_dates_only_unverified")
+        for row in metrics.values():
+            row["t_plus_one_basis"] = t_plus_one_basis
 
     return {
         "schema": "decision_chain_evaluation.v1",

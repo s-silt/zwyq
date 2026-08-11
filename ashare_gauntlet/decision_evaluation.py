@@ -221,12 +221,28 @@ def _audit_result(file_date: str, *, errors: list[str], warnings: list[str] | No
     }
 
 
-def extract_buy_episodes(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把连续 BUY 压成 episode；``_unknown_boundary`` 禁止跨坏快照合并。"""
+def extract_buy_episodes(snapshots: list[dict[str, Any]],
+                         known_trade_days: "Iterable[str] | None" = None) -> list[dict[str, Any]]:
+    """把连续 BUY 压成 episode；``_unknown_boundary`` 禁止跨坏快照合并。
+
+    ``known_trade_days``(可选)提供本地已知交易日全集:相邻两份快照之间若存在
+    已知交易日却没有任何快照文件,该缺口视同 unknown boundary——那天可能生成过
+    WAIT/EXIT 快照后丢失,直接把后一份的 BUY 当延续会少计 episode 并漏掉左删失
+    标记(codex review P1-3)。未知不解释为"未运行"。
+    """
+    known = sorted(set(str(d) for d in known_trade_days)) if known_trade_days else []
     episodes: list[dict[str, Any]] = []
     previous: dict[str, str] = {}
     boundary_known = False
+    prev_as_of: str | None = None
     for snapshot in snapshots:
+        cur_as_of = str(snapshot.get("as_of") or "") or None
+        if prev_as_of and cur_as_of and any(
+                prev_as_of < day < cur_as_of for day in known):
+            previous = {}
+            boundary_known = False
+        if cur_as_of:
+            prev_as_of = cur_as_of
         if snapshot.get("_unknown_boundary"):
             previous = {}
             boundary_known = False

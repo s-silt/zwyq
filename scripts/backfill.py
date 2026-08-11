@@ -73,6 +73,15 @@ def _validate_trade_cal(cal: pd.DataFrame, start: str, end: str) -> pd.DataFrame
     if out_of_range:
         raise TradeCalendarUnavailableError(
             f"trade_cal 日期超出请求区间 {start}..{end}: {out_of_range[:5]}")
+    # trade_cal 语义是区间内每个自然日一行(开市/休市都在表里);子集返回意味着
+    # 缺失日的开闭市状态未知,漏掉的开市日不会进拉取队列,却仍会得出
+    # completed_pairs == expected_pairs 的假阳性 ok(codex review P1-1)。
+    expected_days = {d.strftime("%Y%m%d") for d in pd.date_range(start, end)}
+    missing_days = sorted(expected_days - set(dates))
+    if missing_days:
+        raise TradeCalendarUnavailableError(
+            f"trade_cal 未覆盖区间内全部自然日(缺 {missing_days[:5]} 共 "
+            f"{len(missing_days)} 天)——缺失日开市状态未知,不能当作休市")
     is_open = pd.to_numeric(normalized["is_open"], errors="coerce")
     if is_open.isna().any() or not is_open.isin([0, 1]).all():
         raise TradeCalendarUnavailableError("trade_cal is_open 必须逐行是 0 或 1")

@@ -146,3 +146,52 @@ def test_four_core_date_mismatch_fails_loud(tmp_path):
     (tmp_path / "data/cache/daily_basic/20260102.parquet").unlink()
     with pytest.raises(DecisionEvaluationError, match="四核心 EOD 日期集合不一致"):
         dt.build_report(tmp_path, horizons=(1,))
+
+
+def _write_trade_cal(root: Path, is_open: list[int]) -> None:
+    dates = ["20260101", "20260102", "20260103", "20260104", "20260105"]
+    cal = pd.DataFrame({"cal_date": dates, "is_open": is_open})
+    path = root / "data/cache/trade_cal/20260101_20260105.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cal.to_parquet(path, index=False)
+
+
+def test_calendar_proven_missing_open_day_fails_loud(tmp_path):
+    """codex P1-2a:归档日历完整且证明某开市日缺全部四核心分区 → 不得继续评估。"""
+    _fixture(tmp_path)  # 分区日 0101/0102/0105
+    _write_trade_cal(tmp_path, [1, 1, 0, 1, 1])  # 0104 开市但无分区
+    with pytest.raises(DecisionEvaluationError, match="四核心分区"):
+        dt.build_report(tmp_path, horizons=(1,))
+
+
+def test_partial_calendar_marks_t_plus_one_unverified(tmp_path):
+    """codex P1-2b:日历归档不完整时,T+1 依据须逐窗口标 unverified。"""
+    _fixture(tmp_path)  # 无 trade_cal 归档
+    report = dt.build_report(tmp_path, horizons=(1,))
+    assert report["calendar_coverage"]["status"] != "complete"
+    assert report["metrics"]["1"]["t_plus_one_basis"] == "partition_dates_only_unverified"
+
+
+def test_complete_calendar_marks_t_plus_one_verified(tmp_path):
+    _fixture(tmp_path)
+    _write_trade_cal(tmp_path, [1, 1, 0, 0, 1])  # 开市日与分区日一致
+    report = dt.build_report(tmp_path, horizons=(1,))
+    assert report["calendar_coverage"]["status"] == "complete"
+    assert (report["metrics"]["1"]["t_plus_one_basis"]
+            == "verified_against_complete_calendar")
+
+
+def test_snapshot_gap_over_known_trade_day_breaks_episode(tmp_path):
+    """codex P1-3:0102 是已知交易日却无快照,0105 的 BUY 不得并入 0101 episode。
+
+    突变锁:把 extract_buy_episodes 的 known_trade_days 传参退回不传,
+    本测试必须变红(0105 被当延续,left_censored=0)。
+    """
+    _fixture(tmp_path)  # 20251231 WAIT + 20260101 BUY;分区 0101/0102/0105
+    _write_json(tmp_path / "data/decisions/20260105_buy_decisions.json",
+                _snapshot("20260105"))
+    _write_json(tmp_path / "data/holdscore/20260105_factor.json",
+                [{"ts_code": "600001.SH", "name": "甲", "decile": 10, "score": 0.9}])
+    report = dt.build_report(tmp_path, horizons=(1,))
+    assert report["coverage"]["left_censored_buy_count"] == 1
+    assert report["coverage"]["buy_episode_count"] == 1

@@ -242,3 +242,43 @@ def test_strict_zero_open_days_is_valid_complete_range(
     assert result["ok"] is True
     assert result["open_days"] == []
     assert result["expected_pairs"] == result["completed_pairs"] == 0
+
+
+def test_strict_calendar_subset_of_range_is_rejected(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """codex P1-1:日历只返回区间子集时,缺失日开市状态未知,不得判 complete。"""
+    cal = pd.DataFrame({"cal_date": ["20260808"], "is_open": [0]})  # 缺 0807
+    monkeypatch.setattr(backfill, "read_or_fetch", lambda path, pull: cal)
+    with pytest.raises(backfill.TradeCalendarUnavailableError, match="自然日"):
+        backfill.fetch_trade_cal(
+            object(), "20260807", "20260809", tmp_path, strict=True,
+        )
+
+
+def test_legacy_calendar_subset_falls_back_to_day_by_day(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    cal = pd.DataFrame({"cal_date": ["20260808"], "is_open": [0]})
+    monkeypatch.setattr(backfill, "read_or_fetch", lambda path, pull: cal)
+    assert backfill.fetch_trade_cal(
+        object(), "20260807", "20260809", tmp_path, strict=False,
+    ) is None
+
+
+def test_strict_run_with_subset_calendar_is_not_ok(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """端到端锁死假阳性:子集日历 → run_backfill 必须 ok=False,而非零开市日成功。"""
+    cal = pd.DataFrame({"cal_date": ["20260808"], "is_open": [0]})
+    monkeypatch.setattr(backfill, "read_or_fetch", lambda path, pull: cal)
+    monkeypatch.setattr(
+        backfill, "fetch_market_day", lambda *args, **kwargs: pytest.fail("pull attempted")
+    )
+    result = backfill.run_backfill(
+        object(), "20260807", "20260809", tmp_path,
+        strict_market=True, max_workers=1,
+    )
+    assert result["ok"] is False
+    assert result["calendar_status"] == "failed"
+    assert result["fatal_error"]["error_type"] == "TradeCalendarUnavailableError"

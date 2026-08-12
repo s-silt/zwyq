@@ -77,12 +77,31 @@ def test_confirm_rejects_unknown_trade_day(tmp_path):
     assert path.read_text(encoding="utf-8") == before
 
 
-@pytest.mark.parametrize("bad", ["2026-08-11", "20261301", "近日", ""])
+@pytest.mark.parametrize("bad", [
+    "2026-08-11", "20261301", "近日", "",
+    "2026811", "202608111",   # strptime 接受不补零输入,必须被 8 位锁拒(codex)
+])
 def test_confirm_rejects_malformed_date(tmp_path, bad):
     path = _fixture(tmp_path)
     with pytest.raises(SystemExit):
         confirm_as_of(bad, holdings_path=str(path),
                       cache_dir=str(tmp_path / "cache"))
+
+
+def test_flush_failure_leaves_original_intact_and_no_tmp(tmp_path, monkeypatch):
+    path = _fixture(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    import scripts.holdings_confirm as hc
+
+    def boom(*args, **kwargs):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(hc.os, "fsync", boom)
+    with pytest.raises(OSError, match="fsync failed"):
+        confirm_as_of("20260811", holdings_path=str(path),
+                      cache_dir=str(tmp_path / "cache"))
+    assert path.read_text(encoding="utf-8") == before
+    assert not list(tmp_path.glob(".tmp_holdings_*"))
 
 
 def test_confirm_rejects_broken_holdings_without_write(tmp_path):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -21,9 +22,14 @@ from ashare_gauntlet.config import CACHE_DIR, HOLDINGS_PATH
 
 
 def _date8(value: str) -> str:
+    # 先锁 8 位数字再解析:strptime 的 %m/%d 接受不补零输入("2026811" 会被
+    # 解析成 2026-08-11),放行会把 7 字符 as_of 写进账户文件,下游 _DATE8
+    # 门禁将整个账户状态判非法(codex review)。
+    if not isinstance(value, str) or not re.fullmatch(r"\d{8}", value):
+        raise SystemExit(f"as_of 必须是真实 YYYYMMDD,得到 {value!r}")
     try:
         datetime.strptime(value, "%Y%m%d")
-    except (TypeError, ValueError):
+    except ValueError:
         raise SystemExit(f"as_of 必须是真实 YYYYMMDD,得到 {value!r}")
     return value
 

@@ -152,6 +152,37 @@ def test_extract_facts_fail_loud_on_missing_fields():
         fp.extract_facts(http, "d", "X", "000001.SZ", [{"url": "u", "text": "t"}])
 
 
+def test_extract_facts_rejects_string_sources_forging_dual_source():
+    """codex P1:q1_sources 若是字符串,可迭代出"两个来源"伪造 confirmed——必须拒收。"""
+    bad = {"q1_net_profit_yi": 1.0, "q1_sources": "ab", "risks": [],
+           "not_found": [], "contradictions": []}
+    http = _Http(post_responses=[_deepseek_resp(bad)])
+    with pytest.raises(fp.FactcheckProbeError, match="必须是列表"):
+        fp.extract_facts(http, "d", "X", "000001.SZ", [{"url": "u", "text": "t"}])
+
+
+def test_extract_facts_rejects_malformed_risk_items():
+    bad = {"q1_net_profit_yi": None, "q1_sources": [], "risks": ["纯字符串"],
+           "not_found": [], "contradictions": []}
+    http = _Http(post_responses=[_deepseek_resp(bad)])
+    with pytest.raises(fp.FactcheckProbeError, match="claim/source_url"):
+        fp.extract_facts(http, "d", "X", "000001.SZ", [{"url": "u", "text": "t"}])
+
+
+def test_cninfo_announcements_paginates_past_first_page():
+    """codex P1:首页 30 条塞满噪声时必须翻页,否则漏减持/质押公告。"""
+    top = _Resp(payload=[{"code": "002479", "orgId": "org1"}])
+    page1 = _Resp(payload={"hasMore": True, "announcements": [
+        {"announcementTitle": f"日常公告{i}", "adjunctUrl": f"f/n{i}.PDF"} for i in range(30)]})
+    page2 = _Resp(payload={"hasMore": False, "announcements": [
+        {"announcementTitle": "关于控股股东减持股份的公告", "adjunctUrl": "f/cut.PDF"}]})
+    http = _Http(post_responses=[top, page1, page2])
+    got = fp.cninfo_announcements(http, "002479.SZ", "2026-04-01~2026-08-14")
+    assert [x["title"] for x in got] == ["关于控股股东减持股份的公告"]
+    assert http.post_calls[1]["data"]["pageNum"] == 1
+    assert http.post_calls[2]["data"]["pageNum"] == 2
+
+
 def test_cross_source_confirmed_needs_two_distinct_sources():
     base = {"q1_net_profit_yi": 1.0, "contradictions": []}
     assert fp.cross_source_confirmed({**base, "q1_sources": ["a", "b"]})

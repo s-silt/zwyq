@@ -30,9 +30,15 @@ STEPS: tuple[tuple[str, list[str]], ...] = (
 
 
 def run_step(args: list[str]) -> tuple[bool, str]:
-    """跑一步管线;返回 (成功, 输出尾部)。不吞错——失败原文进 ALERT。"""
-    proc = subprocess.run([sys.executable, *args], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=1800)
+    """跑一步管线;返回 (成功, 输出尾部)。不吞错——失败/超时原文进 ALERT(codex P1)。"""
+    try:
+        proc = subprocess.run([sys.executable, *args], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired as exc:
+        out = ((exc.stdout or b"").decode("utf-8", "replace")
+               if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
+        tail = "\n".join(out.strip().splitlines()[-3:])
+        return False, f"超时(>{exc.timeout:.0f}s): {tail}"
     tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
                      .splitlines()[-6:])
     return proc.returncode == 0, tail
@@ -99,10 +105,11 @@ def main(argv: "list[str] | None" = None) -> None:
                 alerts.append(f"{name} 失败: {tail}")
             break   # 后续步骤依赖前置产物,断链即停(不在残缺数据上继续)
 
+    # 按内容而非文件名判断快照更新:同一交易日重跑 buy_list 会覆盖同名文件,
+    # 比较路径会漏报当次新产生的 BUY/EXIT/候选变化(codex P1)
     after = snapshot_paths()
-    new_snapshot = None
-    if after and (not before or after[-1] != before[-1]):
-        new_snapshot = json.load(open(after[-1], encoding="utf-8"))
+    new_snapshot = json.load(open(after[-1], encoding="utf-8")) if after else None
+    if new_snapshot is not None and new_snapshot != prev_snapshot:
         alerts.extend(diff_alerts(prev_snapshot, new_snapshot))
         pending_new = (pending_factcheck_set(new_snapshot)
                        - (pending_factcheck_set(prev_snapshot) if prev_snapshot else set()))

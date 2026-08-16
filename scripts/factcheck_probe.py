@@ -35,6 +35,7 @@ CNINFO_QUERY_URL = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
 CNINFO_STATIC = "http://static.cninfo.com.cn/"
 PDF_MAX_CHARS = 10000        # 公告 PDF 截断(定期报告摘要的主要财务数据在前部)
 MAX_ANNOUNCEMENTS = 6        # 每股最多入料的公告数(控成本)
+MAX_ANNOUNCEMENT_PAGES = 5   # 公告分页上限(150 天×30 条/页,5 页覆盖极端公告密度)
 CNINFO_LOOKBACK_DAYS = 150   # 公告回看窗(覆盖一季报以来)
 # 入料公告标题关键词:定期报告 + 风险事项(减持/质押/监管);其余公告噪声不入料
 ANNOUNCEMENT_KEYWORDS = ("季度报告", "半年度报告", "业绩预告", "业绩快报", "减持",
@@ -116,25 +117,30 @@ def cninfo_announcements(http: Any, ts_code: str, se_date: str) -> list[dict[str
     code6, suffix = ts_code.split(".")
     column, plate = (("szse", "sz") if suffix == "SZ" else ("sse", "sh"))
     org_id = cninfo_org_id(http, ts_code)
-    resp = http.post(CNINFO_QUERY_URL, data={
-        "stock": f"{code6},{org_id}", "tabName": "fulltext", "column": column,
-        "plate": plate, "pageNum": 1, "pageSize": 30, "category": "",
-        "seDate": se_date, "searchkey": "", "secid": "", "sortName": "",
-        "sortType": "", "isHLtitle": "false",
-    }, headers={"User-Agent": "Mozilla/5.0 (factcheck-probe)"}, timeout=HTTP_TIMEOUT)
-    if resp.status_code != 200:
-        raise FactcheckProbeError(f"cninfo 公告查询失败 HTTP {resp.status_code}: {ts_code}")
-    announcements = resp.json().get("announcements") or []
     picked: list[dict[str, str]] = []
-    for ann in announcements:
-        if not isinstance(ann, dict):
-            continue
-        title = str(ann.get("announcementTitle") or "")
-        adjunct = str(ann.get("adjunctUrl") or "")
-        if not adjunct or not any(k in title for k in ANNOUNCEMENT_KEYWORDS):
-            continue
-        picked.append({"title": title, "url": CNINFO_STATIC + adjunct})
-        if len(picked) >= MAX_ANNOUNCEMENTS:
+    # 逐页取(codex P1:150 天窗口公告可超一页,单页截断会漏减持/质押/问询公告)
+    for page_num in range(1, MAX_ANNOUNCEMENT_PAGES + 1):
+        resp = http.post(CNINFO_QUERY_URL, data={
+            "stock": f"{code6},{org_id}", "tabName": "fulltext", "column": column,
+            "plate": plate, "pageNum": page_num, "pageSize": 30, "category": "",
+            "seDate": se_date, "searchkey": "", "secid": "", "sortName": "",
+            "sortType": "", "isHLtitle": "false",
+        }, headers={"User-Agent": "Mozilla/5.0 (factcheck-probe)"}, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            raise FactcheckProbeError(f"cninfo 公告查询失败 HTTP {resp.status_code}: {ts_code}")
+        payload = resp.json()
+        announcements = payload.get("announcements") or []
+        for ann in announcements:
+            if not isinstance(ann, dict):
+                continue
+            title = str(ann.get("announcementTitle") or "")
+            adjunct = str(ann.get("adjunctUrl") or "")
+            if not adjunct or not any(k in title for k in ANNOUNCEMENT_KEYWORDS):
+                continue
+            picked.append({"title": title, "url": CNINFO_STATIC + adjunct})
+            if len(picked) >= MAX_ANNOUNCEMENTS:
+                return picked
+        if not payload.get("hasMore") and len(announcements) < 30:
             break
     return picked
 
@@ -244,6 +250,18 @@ def extract_facts(http: Any, api_key: str, name: str, ts_code: str,
     missing = sorted(required - set(parsed))
     if missing:
         raise FactcheckProbeError(f"{ts_code} 抽取结果缺字段 {missing}")
+    # 类型硬校验(codex P1):字符串会被当可迭代物伪造"双源",畸形输出必须 fail-loud
+    for field in ("q1_sources", "risks", "not_found", "contradictions"):
+        if not isinstance(parsed[field], list):
+            raise FactcheckProbeError(f"{ts_code} 字段 {field} 必须是列表,得到 {type(parsed[field]).__name__}")
+    if not all(isinstance(u, str) and u.strip() for u in parsed["q1_sources"]):
+        raise FactcheckProbeError(f"{ts_code} q1_sources 含非法来源(须为非空 URL 字符串)")
+    for item in parsed["risks"]:
+        if not (isinstance(item, dict) and item.get("claim") and item.get("source_url")):
+            raise FactcheckProbeError(f"{ts_code} risks 项必须是含 claim/source_url 的对象: {item!r}")
+    value = parsed["q1_net_profit_yi"]
+    if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+        raise FactcheckProbeError(f"{ts_code} q1_net_profit_yi 必须是数值或 null: {value!r}")
     return parsed
 
 
@@ -384,6 +402,7 @@ def main(argv: "list[str] | None" = None) -> None:
         return
 
     report: dict[str, Any] = {}
+    unverified: list[str] = []
     now = datetime.now(timezone(timedelta(hours=8)))
     start = (datetime.strptime(as_of, "%Y%m%d")
              - timedelta(days=CNINFO_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
@@ -400,8 +419,10 @@ def main(argv: "list[str] | None" = None) -> None:
                 print(f"  [{cand['ts_code']}] 巨潮公告入料 {len(anns)} 条: "
                       + ("; ".join(x['title'] for x in anns) or "(关键词窗口内无匹配)"))
             if not urls:
-                # 纯巨潮模式下无公告=无一手材料;如实跳过并声明,绝不无据抽取
-                print(f"  [{cand['ts_code']}] 无可用一手材料——跳过(未核查≠通过)")
+                # 纯巨潮模式下无公告=无一手材料;显式记未核查并以退出码 2 上报
+                # (codex P1:静默跳过会让"未核查"与"没有候选"不可区分)
+                print(f"  [{cand['ts_code']}] 无可用一手材料——未核查(未核查≠通过)")
+                unverified.append(cand["ts_code"])
                 continue
             record = probe_from_urls(requests, deepseek_key, cand["name"],
                                      cand["ts_code"], urls)
@@ -418,9 +439,13 @@ def main(argv: "list[str] | None" = None) -> None:
     json.dump({"as_of": as_of, "generated_at": now.isoformat(timespec="seconds"),
                "machine_generated": True,
                "note": "机器证据报告,仅供人工复核;verdict 须人工写入 factcheck_overrides.json",
+               "unverified": sorted(unverified),
                "stocks": report},
               open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     print(f"→ {out_path}(证据报告;不修改 factcheck_overrides.json,verdict 由人工定)")
+    if unverified:
+        print(f"⚠ {len(unverified)} 只无一手材料未核查: {','.join(sorted(unverified))}")
+        raise SystemExit(2)   # 需人工:未核查绝不解释为通过
 
 
 if __name__ == "__main__":

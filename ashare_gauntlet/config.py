@@ -34,6 +34,13 @@ ACCOUNT_STATE_DIR = "data/account_state"          # EOD 账户估值快照(运�
 PROFILE_PATH = "data/profile.json"                # 个人投资约束 profile(非研究结论)
 
 
+# strict 模式下 .env.local 允许的键全集:Tushare 装配 + factcheck_probe 的检索/抽取
+# 密钥(密钥只被各自消费方读取,互不越权;新增键须同步 scripts/backfill.py 帮助文本)
+STRICT_ENV_KEYS = {"TUSHARE_TOKEN", "TUSHARE_HTTP_URL",
+                   "KAGI_API_KEY", "DEEPSEEK_API_KEY",
+                   "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"}
+
+
 def tushare_pro(*, env_path: str | os.PathLike[str] = ".env.local",
                 strict_env: bool = False):
     """标准 Tushare 装配:token 必需，HTTP URL 为可选镜像覆盖。
@@ -42,7 +49,7 @@ def tushare_pro(*, env_path: str | os.PathLike[str] = ".env.local",
     保留 SDK 官方端点与调用方代理；显式镜像由 ``make_pro_api`` 处理直连。
     tushare_source 延迟导入，避免路径常量消费方承担 Tushare 依赖。
     """
-    allowed = {"TUSHARE_TOKEN", "TUSHARE_HTTP_URL"} if strict_env else None
+    allowed = STRICT_ENV_KEYS if strict_env else None
     load_env_local(env_path, allowed_keys=allowed)
     from ashare_gauntlet.data import tushare_source
 

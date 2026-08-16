@@ -56,6 +56,25 @@ def test_tushare_pro_allows_token_without_http_url(tmp_path, monkeypatch):
     assert captured == {"token": "tk", "url": None}
 
 
+def test_tushare_pro_strict_env_admits_probe_keys(tmp_path, monkeypatch):
+    """strict 模式必须放行 factcheck_probe 的密钥(走 tushare_pro 真入口,锁接线):
+    mcp_service 以 strict_env=True 加载 .env.local,白名单漏键会把 MCP 掀翻。"""
+    monkeypatch.chdir(tmp_path)
+    keys = ("TUSHARE_TOKEN", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+            "DEEPSEEK_MODEL", "KAGI_API_KEY")
+    for key in keys:   # 先经 monkeypatch 登记,teardown 还原——load_env_local 会写全局 env
+        monkeypatch.setenv(key, "sentinel")
+    (tmp_path / ".env.local").write_text(
+        "TUSHARE_TOKEN=tk\nDEEPSEEK_API_KEY=d\nDEEPSEEK_BASE_URL=https://gw/v1\n"
+        "DEEPSEEK_MODEL=m\nKAGI_API_KEY=k\n", encoding="utf-8"
+    )
+    from ashare_gauntlet import config
+    from ashare_gauntlet.data import tushare_source
+
+    monkeypatch.setattr(tushare_source, "make_pro_api", lambda *a, **k: "PRO")
+    assert config.tushare_pro(strict_env=True) == "PRO"
+
+
 def test_tushare_pro_assembles_from_env_local(tmp_path, monkeypatch):
     """.env.local 权威覆盖进程环境后,按 (TOKEN, HTTP_URL) 装配 make_pro_api。"""
     monkeypatch.chdir(tmp_path)

@@ -304,7 +304,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-env",
         action="store_true",
-        help="allow only TUSHARE_TOKEN/TUSHARE_HTTP_URL in .env.local",
+        help="allow only STRICT_ENV_KEYS (ashare_gauntlet.config) in .env.local",
     )
     parser.add_argument(
         "--report-json",

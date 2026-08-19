@@ -121,8 +121,9 @@ def ivol_capm(ret: pd.DataFrame, mkt: pd.Series, window: int) -> pd.Series:
     """IVOL(Ang-Hodrick-Xing-Zhang 2006):市场模型残差的日波动,近 window 日。
 
     **口径显式标注:CAPM(单因子市场模型)残差,非 FF3/CH-3 残差**。mkt=宇宙等权
-    日收益。β 用窗内 OLS;面板历史不足 → 全 NaN。P1 门禁全过(N=149:NW t-14.7、
-    13折 LOYO 无变号、涨跌市同号、多头腿成本后+0.34%/期)后入 composite(负向),
+    日收益。β 用窗内 OLS;面板历史不足 → 全 NaN。五门全过(N=149,2026-07-20 复跑:
+    NW t−17.02、13折 LOYO 无变号、涨跌市同号、多头腿成本后+0.29%/期;读数以
+    docs/methodology.md §6 为准,不在此处留第二份会漂的副本)后入 composite(负向),
     生产/回测共用同一实现。
     """
     if len(ret) < window or len(mkt) < window:

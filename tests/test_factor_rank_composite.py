@@ -1,14 +1,17 @@
 """composite 因子集测试 —— 钉住"哪些因子入分"这一模型定义本身。
 
-演进(证据链见 memory factor-backtest-a-share):
-- 2026-07-05:5→3(EP+BP+ACC),剔 ROE/GP(12年噪声+互相冗余0.63);
-- 2026-07-06 上午:3→2(EP+BP),P0 三修后 ACC 现形(t 2.36/IC 0.008/真实净≈0);
-- 2026-07-06 晚:2→3(**EP+BP+IVOL负向**),P1 交易行为族过完整门禁:IVOL t-14.7、
-  13折 LOYO 无一变号、涨跌市同号、**多头腿成本后+0.34%/期**(纯多头拿得到),
-  与 EP/BP 相关仅 -0.2/-0.3(正交信息);同族 MAX/NLIMIT/TURN 多头腿≈0 → 风险标签层。
-新因子入 composite 须过准入纪律(NW t>3+成本后>0+LOYO+状态)**加腿分解**(多头腿
-成本后>0)——MOM 过四门但多头腿-0.28% 的教训。
+演进(权威读数=docs/methodology.md §5/§6/§10 增量表,代码与测试只复述不自带版本):
+- 2026-07-05:5→3(EP+BP+ACC),剔 ROE/GP(12年噪声+与 EP/BP 冗余~0.6);
+- 2026-07-06 上午:3→2(EP+BP),依据是当时的 ACC 读数(t 2.36/真实净≈0);
+- 2026-07-06 晚:2→3(**EP+BP+IVOL负向**),IVOL 过完整门禁;
+- **2026-07-10 数据修复(70 个月末 total_mv 空文件回填)推翻上面两条的读数依据**:
+  ACC 复跑后 t+4.05 五门全过,不入分的真实理由改为 X-02 common-support 增量 t+1.63
+  未过门;MAX/NLIMIT 同理(X-03 增量 t0.73/0.74、MAX-IVOL 冗余 0.78)。
+新因子入 composite 须先过五门(NW t>3+真实净>0+LOYO+市场状态+**多头腿成本后>0**),
+再过增量门(对现役 composite 的 common-support 增量 |NW t|>3)——两道门缺一不可。
 """
+from pathlib import Path
+
 import pandas as pd
 
 from scripts.factor_rank import COMPOSITE_FACTORS, composite_inputs_complete, composite_score
@@ -60,3 +63,57 @@ def test_spec_crowd_flags_union_of_family_top_decile():
     flags = spec_crowd_flags(ivol, mx, nl)
     assert bool(flags["c0"]) and bool(flags["c1"]) and bool(flags["c2"])
     assert not bool(flags["c5"])
+
+# ---- 读数漂移守卫 ----------------------------------------------------------
+# 为什么要机器核对而不是靠人盯:2026-07-10 修复 70 个月末 total_mv 空文件后权威 t
+# 全线上移(EP 4.36→6.59、ACC 2.36→4.05),但注释里的那份读数副本没跟着改,
+# "ACC/MAX 统计上就不行"这个错前提在仓库里活了一个多月——而它正是"某因子该不该
+# 重审"的直接依据。读数只准有一份源(methodology §5/§6/§10),代码只准复述:
+# 文档改了这里先红(逼同步),旧字面量复活这里也红(防回退)。
+
+REPO = Path(__file__).resolve().parents[1]
+AUTHORITATIVE_NW_T = {"EP": 6.59, "BP": 9.16, "IVOL": -17.02, "ACC": 4.05,
+                      "MOM": -2.20, "MAX": -14.08, "NLIMIT": -11.66, "TURN": -9.14}
+AUTHORITATIVE_INCREMENT_T = {"ACC": 1.63, "MAX": 0.73, "NLIMIT": 0.74}
+# 2026-07-10 修复前的旧读数字面量,不得再出现在生产源码里(本文件是白名单——
+# 旧值就存在这里当靶子)
+SUPERSEDED_LITERALS = ("t4.36", "t7.14", "t-14.7", "t2.36", "t 2.36",
+                       "+0.34%", "-0.28%", "多头腿≈0")
+CITING_SOURCES = ("scripts/factor_rank.py", "ashare_gauntlet/factor_model.py",
+                  "scripts/factor_tearsheet.py")
+
+
+def _table_nw_t(section: str, wanted: dict[str, float]) -> dict[str, float]:
+    """取 methodology 管道表的 NW t 列(第 3 列),只收 wanted 里的因子名。"""
+    out: dict[str, float] = {}
+    for line in section.splitlines():
+        cells = [c.strip().strip("*").strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 3 and cells[0] in wanted:
+            try:
+                out[cells[0]] = round(float(cells[2].replace("−", "-").replace("+", "")), 2)
+            except ValueError:
+                continue
+    return out
+
+
+def test_methodology_still_carries_the_readings_the_code_quotes():
+    doc = (REPO / "docs" / "methodology.md").read_text(encoding="utf-8")
+    five_six = doc.split("## 5.")[1].split("## 7.")[0]
+    assert _table_nw_t(five_six, AUTHORITATIVE_NW_T) == AUTHORITATIVE_NW_T
+    increments = doc.split("毛增量/期")[1].split("四者全军覆没")[0]
+    assert _table_nw_t(increments, AUTHORITATIVE_INCREMENT_T) == AUTHORITATIVE_INCREMENT_T
+
+
+def test_no_production_source_quotes_pre_20260710_readings():
+    for rel in CITING_SOURCES:
+        text = (REPO / rel).read_text(encoding="utf-8")
+        stale = [lit for lit in SUPERSEDED_LITERALS if lit in text]
+        assert stale == [], f"{rel} 仍在引用 2026-07-10 数据修复前的读数:{stale}"
+
+
+def test_factor_rank_states_the_real_reason_acc_and_max_are_out():
+    # "不入分"的理由必须落在增量门上而不是"统计不行":ACC 五门全过(t+4.05)、被
+    # X-02 增量 t+1.63 拦下,这两个数同时出现才算把理由写对
+    src = (REPO / "scripts" / "factor_rank.py").read_text(encoding="utf-8").replace("−", "-")
+    for lit in ("6.59", "9.16", "17.02", "+0.29%", "4.05", "1.63", "-2.20"):
+        assert lit in src, f"factor_rank.py 未复述权威读数 {lit}"

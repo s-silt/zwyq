@@ -19,7 +19,8 @@ testpaths = ["tests"]
 
 # 覆盖率按需跑(不进默认 addopts,避免拖慢日常 pytest):
 #   python -m pytest --cov=ashare_gauntlet --cov=scripts --cov-report=term
-# 2026-07-11 基线:核心包 ashare_gauntlet 96%(2108 语句漏 81),scripts 编排层
-# 拉低 TOTAL 至 55%(多为 CLI/IO 壳,核心逻辑在包内被测)。
+# 2026-07-11 快照(此后包内已增模块未重测,只作量级参考):核心包 ashare_gauntlet
+# 96%(2108 语句漏 81),scripts 编排层拉低 TOTAL 至 55%(多为 CLI/IO 壳,核心
+# 逻辑在包内被测)。
 [tool.coverage.run]
 source = ["ashare_gauntlet", "scripts"]

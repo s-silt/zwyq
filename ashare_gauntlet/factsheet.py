@@ -264,8 +264,13 @@ def entry_rank(facts: dict[str, Any]) -> tuple[float | None, str]:
       −60    if 空头 (downtrend) — don't catch a falling knife
       −20    if RSI > 70 — don't chase an overbought move
       +15    if 多头 and price within −5%..+3% of EMA20 — a pullback to support
-             inside an uptrend (the disciplined entry)
+             inside an uptrend
     Higher = better fits the lens. Tag summarizes the entry condition.
+
+    口径边界(methodology §11,2026-07 定谳):"回踩=更好买点"已被实证否决——D10 池内挑
+    破均线/近期回调的"更弱的"是负筛选(R_DMA20 −0.39% t−2.7、R_RET5 −0.34% t−2.9,
+    entry_readiness 子集 21 日净 −0.67%/期 t−2.9)。本函数只作技术面展示透镜保留,
+    生产 BUY 恒 entry_model_version='research-only',不得用本分做选股、择时或资金分配。
 
     缺关键技术输入(横截面分位 pct20 / 现价 close)时**不补 0/50/close 默认**
     伪造一个分(契约C2,数据源纯净):返回 ``(None, '数据缺失·无入场分')``。

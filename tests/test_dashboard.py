@@ -35,3 +35,27 @@ def test_partition_renderable_all_good_no_failures(monkeypatch) -> None:
     good, failures = d._partition_renderable(recs)
     assert good == recs
     assert failures == []
+
+
+def test_html_console_retired_cli_fails_loud() -> None:
+    """退役后 CLI 必须明确失败并指向 q today——静默产出旧页会让陈旧页面看起来像当前决策。
+
+    (跨层审计 Q3 + 用户 2026-08-19 拍板;历史页面只读留档并带废弃水印)
+    """
+    import pytest
+
+    with pytest.raises(SystemExit, match="已退役"):
+        d.main()
+    with pytest.raises(SystemExit, match="daily_brief"):
+        d.main("20260618")
+
+
+def test_cards_no_longer_emits_html() -> None:
+    """cards 的 render_outputs 只出 md;HTML 分支退役,不得再产出可被误读为决策的页面。"""
+    import inspect
+
+    from scripts import cards
+
+    src = inspect.getsource(cards.render_outputs)
+    assert "render_dashboard" not in src
+    assert '"html"' not in src

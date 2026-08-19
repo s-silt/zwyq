@@ -1,5 +1,5 @@
 """C 层(IO/CLI):读 data/cards/<as_of>.json,调纯渲染 render_dashboard,
-写 data/panels/dashboard_<as_of>.html(自含单文件多股总览决策台)。
+写 data/panels/dashboard_<as_of>.html(自含单文件多股观察名单总览;展示层,非决策口径)。
 
 纯渲染逻辑在 ashare_gauntlet/render_html.py(无 IO);此处只做读 json / 选最新 as_of /
 写产物文件,贴合 scripts/panel.py、scripts/card_svg.py 既有 pattern。cohort 即全量 records。
@@ -66,6 +66,20 @@ def _partition_renderable(
 
 
 def main(as_of: str | None = None) -> None:
+    # **已退役**(2026-08-19 用户拍板):明确失败而非静默产出旧页——静默成功会让
+    # 陈旧页面看起来像"当前决策",也会诱使后人恢复已被 §11 否决的 entry 档金额分配。
+    # 历史产物只读留档(带废弃水印),日常入口收敛到 q today + MCP。
+    raise SystemExit(
+        "HTML 决策台已退役(entry 择时档经 methodology §11 实证否决,金额分配清单已删;"
+        "剩余功能与 daily_brief/MCP 重叠)。\n"
+        "  日常一屏:  E:\\zwyq\\.venv\\Scripts\\python.exe -m scripts.daily_brief\n"
+        "  或统一入口: .\\scripts\\q.ps1 today\n"
+        "历史页面在 data/panels/dashboard_*.html(只读留档,顶部有废弃水印)。"
+    )
+
+
+def _retired_main(as_of: str | None = None) -> None:
+    """退役前的渲染实现,保留供历史复现/审计;不由 CLI 触达。"""
     resolved = as_of or _latest_as_of()
     records = _load_cards(resolved)
 
@@ -84,7 +98,7 @@ def main(as_of: str | None = None) -> None:
     out_path = f"{PANELS_DIR}/dashboard_{resolved}.html"
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
-    print(f"总览决策台 -> {out_path}（{len(good)}/{len(records)} 只渲染,{len(html)} 字符）")
+    print(f"观察名单总览 -> {out_path}（{len(good)}/{len(records)} 只渲染,{len(html)} 字符）")
 
 
 if __name__ == "__main__":

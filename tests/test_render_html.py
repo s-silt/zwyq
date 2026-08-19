@@ -1,7 +1,7 @@
-"""TDD:多股 HTML dashboard 总览决策台 render_dashboard 纯函数(无 IO,返回自含单文件 HTML)。
+"""TDD:多股 HTML dashboard 观察名单总览 render_dashboard 纯函数(无 IO,返回自含单文件 HTML)。
 
 断言结构性质而非像素:含 <table、含排序 JS(sort/onclick)、含过滤控件(tier/行业)、
-含组合层摘要(行业集中度文字 / 市值分桶 / tier 分布 / 预算参考且标注"参考非建议")、
+含组合层摘要(行业集中度文字 / 市值分桶 / tier 分布 / 口径边界且无资金分配数字)、
 含全部 41 行(真实底座)、None 值占位("—"/"N/A")而非 0、离散档文字(色盲安全)、
 事件中性(无红色恐吓触发器)、每只行内嵌 B 的 render_svg_card 可钻取、结论不裸出小数 score。
 
@@ -179,7 +179,7 @@ def test_entry_grade_letter_present_not_raw_score():
 
 
 # ---------------------------------------------------------------------------
-# 组合层摘要(顶部决策台)
+# 组合层摘要(顶部,展示层)
 # ---------------------------------------------------------------------------
 def test_portfolio_summary_industry_concentration_text():
     html = render_dashboard(_mixed_cohort())
@@ -215,21 +215,29 @@ def test_portfolio_summary_mv_bucket_counts_specific():
     assert "市值缺失 <b>1</b>" in html
 
 
-def test_portfolio_summary_budget_per_stock_amount_when_green_a():
-    """有 🟢×entryA 时,预算 chip 须给出单只金额字符串(等权占满)。"""
+def test_portfolio_summary_emits_no_capital_allocation_numbers():
+    """展示层不得出现可照抄的分配数字。mixed 有 2 只 🟢×entryA,旧口径会渲染
+    「60,000 元预算等权占满 2 只,单只 30,000 元」——那份分配绕过 D10/composite/
+    fact-check/治理否决/行业上限,且选股依据是 §11 已否决的择时透镜。"""
     html = render_dashboard(_mixed_cohort())
-    # mixed 中 🟢×A 共 2 只(两只 grade=🟢 entry=A),60000/2=30000
-    assert "30,000 元" in html
-    assert "2 只" in html
+    assert "30,000 元" not in html
+    assert "60,000" not in html
+    assert "等权占满" not in html
+    assert "本页不做资金分配" in html
 
 
-def test_portfolio_summary_budget_reference_marked_not_advice():
-    """预算参考须明确标注'参考/非建议',不臆造持仓规模。"""
+def test_portfolio_summary_points_buy_sizing_to_frozen_snapshot():
+    """口径边界须点名唯一出处(data/decisions 冻结快照)并保留非建议措辞;
+    "决策台"命名收回——"决策"二字只属于冻结快照。"""
     html = render_dashboard(_mixed_cohort())
-    assert "预算" in html or "参考" in html
-    # 铁律:标注为参考,非买入建议
-    assert ("参考" in html) or ("非建议" in html)
-    assert ("建议" in html)  # 出现"非建议/不构成建议"字样
+    assert "data/decisions" in html
+    assert "建议" in html          # 页脚「不构成选股、择时或仓位建议」
+    assert "决策台" not in html
+
+
+def test_empty_records_page_also_drops_decision_desk_naming():
+    """空 records 分支是另一条渲染路径,改名不能只改一半。"""
+    assert "决策台" not in render_dashboard([])
 
 
 # ---------------------------------------------------------------------------

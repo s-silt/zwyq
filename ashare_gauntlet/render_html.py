@@ -1,11 +1,13 @@
-"""多股 HTML dashboard 总览决策台(纯渲染,无 IO)。
+"""多股 HTML dashboard 观察名单总览(纯渲染,无 IO)。
+
+本页是展示层不是决策口径:"决策"二字留给 data/decisions 的四态冻结快照——本页不过
+D10/composite/fact-check/治理否决/行业上限,故不产出选股结论,也不产出资金分配。
 
 ``render_dashboard(records) -> str`` 返回自含单文件 HTML(内联 CSS/JS,零外链):
 
-  顶部组合层摘要(决策台):tier 分布(离散档计数)、行业集中度(top 占比文字)、
-    市值分桶分布、预算参考(memory trading-constraints:可买沪深主板、预算约 6 万、
-    逐步加仓;**不臆造持仓规模**,仅"若等权选中 🟢/entryA 若干只"的占用参考,
-    明确标注为参考、非买入建议)。
+  顶部组合层摘要:tier 分布(离散档计数)、行业集中度(top 占比文字)、市值分桶分布、
+    口径边界一句话(本页不做资金分配——entry 档的择时含义已被 methodology §11 实证
+    否决,且本页不过任一生产守卫;给出金额与只数等于在冻结快照之外立第二套买入口径)。
   可排序/过滤表:列 [质地档(emoji+文字) | 名称(代码) 行业 | entry 档 |
     技术/基本/资金 三条分项条 | 价格/营收/资金流 sparkline small-multiples | 旗标数]。
     表头点击排序、按 tier/行业过滤(纯原生 JS,无框架)。
@@ -30,9 +32,6 @@ from ashare_gauntlet.render_svg import _coverage_unknowns, render_svg_card
 # 常量(色盲安全:颜色仅辅助,文字档名+图标承载语义)
 # ---------------------------------------------------------------------------
 NA: str = "—"
-
-# 预算参考(memory trading-constraints):约 6 万、逐步加仓;不臆造持仓规模。
-BUDGET_YUAN: int = 60000
 
 _TIER_ORDER: dict[str, int] = {"🟢": 0, "🟡": 1, "🔴": 2, "⛔": 3}
 _TIER_LABEL: dict[str, str] = {
@@ -160,7 +159,7 @@ def _bar_cell(label: str, score: Optional[float], raw_txt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 组合层摘要(决策台顶部)
+# 组合层摘要(展示层顶部)
 # ---------------------------------------------------------------------------
 def _summary(records: list[dict[str, Any]]) -> str:
     n = len(records)
@@ -219,35 +218,29 @@ def _summary(records: list[dict[str, Any]]) -> str:
     if not mv_bits:
         mv_bits = NA
 
-    # 预算参考(不臆造持仓规模;仅"若等权选中 🟢/entryA 若干只"占用参考)
-    green_a = [
-        r for r in records
-        if str((r.get("tier") or {}).get("grade", "")) == "🟢"
-        and str((r.get("entry") or {}).get("grade", "")) == "A"
-    ]
-    k = len(green_a)
-    if k:
-        per = BUDGET_YUAN / k
-        budget_note = (
-            f"预算参考(非建议):若以约 {BUDGET_YUAN:,} 元预算等权占满当前 🟢 强干净 × entry A "
-            f"{k} 只,单只约 {per:,.0f} 元;逐步加仓、不一次性满仓。"
-        )
-    else:
-        budget_note = (
-            f"预算参考(非建议):约 {BUDGET_YUAN:,} 元预算;当前无 🟢×entryA 标的,留位、暂不占用。"
-        )
+    # 口径边界:entry 档用的是 methodology §11 已实证否决的择时透镜(entry_readiness 子集
+    # 21 日净 −0.67%/期 t−2.9;"D10 池内挑回踩/更弱的"是负筛选),且本页不过 D10、composite、
+    # fact-check、治理否决、行业与现金约束任一生产守卫。此处一旦给出金额与只数,就是在冻结
+    # 快照之外立第二套"买什么、买多少"口径——与"机器决策快照=真相源"直接冲突,故只声明边界、
+    # 不产出任何可照抄的分配数字。
+    scope_note = (
+        "本页不做资金分配:entry 档仅为技术面展示透镜(其择时含义已被 methodology §11 实证"
+        "否决),不构成选股或仓位依据;买什么、买多少以 data/decisions 冻结快照"
+        "(scripts.buy_list:D10 + composite + fact-check + 治理否决 + 行业/现金约束)"
+        "为唯一口径,终判与成交人工。"
+    )
 
     return (
         '<section class="summary" aria-label="组合层摘要">'
-        "<h2>组合层摘要 · 决策台<span class=\"sub\">（参考非建议；结论用离散档，非买卖信号）</span></h2>"
+        "<h2>组合层摘要<span class=\"sub\">（展示层，非决策口径；结论用离散档，非买卖信号）</span></h2>"
         f'<div class="srow"><span class="slabel">质地档分布</span>'
         f'<div class="chips">{tier_html}</div></div>'
         f'<div class="srow"><span class="slabel">行业集中度</span>'
         f'<div class="stext">{conc_note}</div></div>'
         f'<div class="srow"><span class="slabel">市值分布</span>'
         f'<div class="stext">{mv_bits}（按总市值 mv_yi 分桶，@交易日）</div></div>'
-        f'<div class="srow"><span class="slabel">预算参考</span>'
-        f'<div class="stext note">{_esc(budget_note)}</div></div>'
+        f'<div class="srow"><span class="slabel">口径边界</span>'
+        f'<div class="stext note">{_esc(scope_note)}</div></div>'
         "</section>"
     )
 
@@ -425,7 +418,7 @@ def _table(records: list[dict[str, Any]]) -> str:
         "fundamental.dedt_yoy": _collect(records, "fundamental.dedt_yoy"),
         "quality.net_cash_ratio": _collect(records, "quality.net_cash_ratio"),
     }
-    # 排序:与 md 一致 ⛔→🔴→🟡→🟢?这里默认 🟢 在前(决策台优先看强档),组内 entry.score 降序。
+    # 排序:与 md 一致 ⛔→🔴→🟡→🟢?这里默认 🟢 在前(总览优先看强档),组内 entry.score 降序。
     def _key(r: dict[str, Any]) -> tuple[int, float]:
         g = str((r.get("tier") or {}).get("grade", ""))
         s = (r.get("entry") or {}).get("score")
@@ -547,7 +540,7 @@ document.addEventListener('DOMContentLoaded',applyFilter);
 # 入口
 # ---------------------------------------------------------------------------
 def render_dashboard(records: list[dict[str, Any]]) -> str:
-    """渲染多股 HTML dashboard 决策台(纯函数,返回自含单文件 HTML 字符串)。
+    """渲染多股 HTML dashboard 观察名单总览(纯函数,返回自含单文件 HTML 字符串)。
 
     Args:
         records: 全量 card records(schema 见 data/cards/<as_of>.json)。任一数值可能为 None。
@@ -572,8 +565,8 @@ def render_dashboard(records: list[dict[str, Any]]) -> str:
     else:
         # 空集诚实成文,不崩
         body = (
-            '<section class="summary"><h2>组合层摘要 · 决策台'
-            '<span class="sub">（参考非建议）</span></h2>'
+            '<section class="summary"><h2>组合层摘要'
+            '<span class="sub">（展示层，非决策口径）</span></h2>'
             "<div class=\"srow\"><div class=\"stext\">无标的（空 records）。</div></div></section>"
             '<table id="grid"><thead><tr><th>质地档</th></tr></thead>'
             '<tbody id="tb"></tbody></table>'
@@ -583,16 +576,17 @@ def render_dashboard(records: list[dict[str, Any]]) -> str:
         "<!DOCTYPE html>\n"
         '<html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>A股选股总览决策台 · {_esc(as_of)}</title>"
+        f"<title>A股观察名单总览 · {_esc(as_of)}</title>"
         f"<style>{_CSS}</style></head><body><div class=\"wrap\">"
-        f"<h1>A股选股总览决策台<span class=\"sub\"></span></h1>"
+        f"<h1>A股观察名单总览<span class=\"sub\">展示层 · 买卖口径见 data/decisions 冻结快照</span></h1>"
         f'<p class="lead">标的 {n} 只 · 截面 {_esc(as_of)} · '
         "结论用离散档(质地 🟢🟡🔴⛔ / entry A·B·C),非买卖信号;"
         "事件为中性提示旗;缺失值以「—」占位;数值就近标注口径/时点/来源。</p>"
         f"{body}"
         '<footer>口径:估值/技术 @ 交易日 · 基本面/资产 @ 最新季 · 现金质量 @ 年报;'
         "三条分项条与雷达均为 cohort 百分位归一化,低分≠坏、仅偏科直觉,非买卖信号。"
-        "组合摘要的预算占用为参考、非买入建议,不臆造持仓规模。"
+        "本页为观察名单展示层:entry 档为技术面透镜(methodology §11 已否决其择时含义),"
+        "不构成选股、择时或仓位建议;买什么、买多少以 data/decisions 冻结快照为唯一口径。"
         "<br>数据来源 tushare 接口直出 + 规则定档;本页纯本地渲染、不联网。</footer>"
         f"</div><script>{_JS}</script></body></html>"
     )

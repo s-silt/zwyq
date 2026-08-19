@@ -4,7 +4,7 @@
 纯函数在 ashare_gauntlet/record.py;此处只做 IO/编排/打印,贴合 screen.py/fundamentals.py 既有 pattern。
 
 Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.cards [--limit N] [--no-render]
-落库 data/cards/<as_of>.json,默认顺带渲染诚实面板(.md)+决策台(.html)到 data/panels/
+落库 data/cards/<as_of>.json,默认顺带渲染诚实面板(.md)+观察名单总览(.html)到 data/panels/
 (render_outputs 复用 A/C 渲染器);--no-render 只出数据。单股 SVG 卡另由 scripts.card_svg 生成。
 """
 import glob
@@ -57,15 +57,19 @@ def dump_cards(records: list[dict[str, Any]], out_path: str) -> None:
 
 
 def render_outputs(records: list[dict[str, Any]], as_of: str, panels_dir: str = PANELS_DIR) -> dict[str, str]:
-    """从内存 records 直出 markdown 诚实面板 + HTML 决策台(一键出图,复用 A/C 渲染器)。"""
+    """从内存 records 直出 markdown 诚实面板。
+
+    **HTML 决策台已退役**(2026-08-19 用户拍板):它原本的核心用途是把"🟢×entry 档"
+    换算成可照抄的买入金额清单,而 entry 择时档已被 methodology §11 实证否决、且该路径
+    不过 D10/composite/fact-check/治理/行业上限任一守卫;金额已先行删除,剩余的"观察
+    名单总览"与 daily_brief(q today)+ MCP 完全重叠。多一个入口只会让状态不一致、
+    并诱使后人恢复旧金额逻辑。历史产物只读留档(见 render_html 的废弃水印)。
+    """
     os.makedirs(panels_dir, exist_ok=True)
     md_path = f"{panels_dir}/{as_of}.md"
-    html_path = f"{panels_dir}/dashboard_{as_of}.html"
     with open(md_path, "w", encoding="utf-8") as fh:
         fh.write(render_md(records))
-    with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(render_dashboard(records))
-    return {"md": md_path, "html": html_path}
+    return {"md": md_path}
 
 
 def main(limit: int | None = None, render: bool = True) -> None:
@@ -126,7 +130,7 @@ def main(limit: int | None = None, render: bool = True) -> None:
 
     if render:
         out = render_outputs(records, as_of)
-        print(f"渲染 {out['md']} + {out['html']}")
+        print(f"渲染 {out['md']}(HTML 决策台已退役,日常入口=q today)")
 
     prev = _prev_cards(as_of)
     if prev:

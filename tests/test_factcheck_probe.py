@@ -317,3 +317,46 @@ def test_main_never_touches_overrides(tmp_path, monkeypatch):
     assert out["stocks"]["002479.SZ"]["q1_net_profit_yi"] == 1.03
     # 覆盖文件一个字节都不许动
     assert overrides.read_text(encoding="utf-8") == '{"overrides": []}'
+
+
+def test_merge_existing_report_keeps_prior_evidence(tmp_path):
+    """★同日重跑必须合并而非覆盖:实测两次事故——先跑的证据(含"控股股东持股冻结+
+    交易所问询函"这类足以否决的信号)被后一批 --codes 静默抹掉,而 fact-check 是唯一
+    能把 WAIT 变 BUY 的闸门,证据链断裂无告警。"""
+    from scripts.factcheck_probe import merge_existing_report, write_report_atomic
+    from datetime import datetime, timezone
+
+    p = str(tmp_path / "20260819_probe.json")
+    now = datetime(2026, 8, 19, tzinfo=timezone.utc)
+    write_report_atomic(p, "20260819", now,
+                        {"A.SH": {"confirmed": False, "news": ["冻结"]}}, ["X.SH"])
+    # 第二批只跑 B:A 必须保留
+    merged, unver = merge_existing_report(p, {"B.SZ": {"confirmed": True}}, [])
+    assert set(merged) == {"A.SH", "B.SZ"}
+    assert merged["A.SH"]["news"] == ["冻结"]
+    assert unver == ["X.SH"]                      # 既有未核查状态不被抹掉
+
+    # 重跑同一只 → 以新结果为准(新证据更 as-of)
+    write_report_atomic(p, "20260819", now, merged, unver)
+    merged2, _ = merge_existing_report(p, {"A.SH": {"confirmed": True, "news": []}}, [])
+    assert merged2["A.SH"]["confirmed"] is True and merged2["A.SH"]["news"] == []
+    assert "B.SZ" in merged2
+
+    # 本次取到证据的 code 从 unverified 移除
+    _, unver3 = merge_existing_report(p, {"X.SH": {"confirmed": True}}, [])
+    assert "X.SH" not in unver3
+
+
+def test_merge_refuses_to_overwrite_corrupt_report(tmp_path):
+    """既有报告损坏时不得静默当空文件覆盖——那等于二次丢证据。"""
+    import json as _json
+    import pytest as _pytest
+    from scripts.factcheck_probe import merge_existing_report
+
+    p = tmp_path / "20260819_probe.json"
+    p.write_text("{ 坏文件", encoding="utf-8")
+    with _pytest.raises(_json.JSONDecodeError):
+        merge_existing_report(str(p), {"A.SH": {}}, [])
+    p.write_text('{"stocks": "不是对象"}', encoding="utf-8")
+    with _pytest.raises(ValueError, match="stocks"):
+        merge_existing_report(str(p), {"A.SH": {}}, [])

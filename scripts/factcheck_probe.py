@@ -15,6 +15,7 @@ import html
 import json
 import os
 import re
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -275,6 +276,65 @@ def cross_source_confirmed(extraction: dict[str, Any]) -> bool:
             and len(distinct) >= 2 and not extraction.get("contradictions"))
 
 
+def merge_existing_report(out_path: str, report: dict[str, Any],
+                          unverified: list[str]) -> tuple[dict[str, Any], list[str]]:
+    """同日重跑**合并**既有证据,不整体覆盖。
+
+    实测事故(2026-08-19,两次):eod_ops 自动对新增候选跑完 probe 后,手工再对另一批
+    `--codes` 补跑,同名 `<as_of>_probe.json` 被整体重写,先前抓到的证据全部静默消失
+    ——其中包括"控股股东 71.52% 持股冻结 + 交易所年报问询函"这类足以否决的信号。
+    fact-check 是本项目唯一能把 WAIT 变 BUY 的闸门,其证据链断裂却无告警,危害等同
+    于把风险当成不存在。故:按 ts_code 归并,**本次结果覆盖同 code 的旧值**(新证据
+    更 as-of),其余保留;unverified 同样并集(未核查状态不因分批跑而被抹掉)。
+
+    既有文件损坏/不可读时**不静默吞掉**:抛错由调用方处理,绝不当成"本来就没有"。
+    """
+    if not os.path.exists(out_path):
+        return dict(report), sorted(set(unverified))
+    with open(out_path, encoding="utf-8") as handle:
+        prior = json.load(handle)      # JSONDecodeError 向上抛:坏文件不当空文件
+    if not isinstance(prior, dict):
+        raise ValueError(f"{out_path} 顶层应为对象——既有证据报告结构异常,拒绝覆盖")
+    prior_stocks = prior.get("stocks")
+    if prior_stocks is not None and not isinstance(prior_stocks, dict):
+        raise ValueError(f"{out_path} 的 stocks 应为对象——拒绝覆盖")
+    merged = dict(prior_stocks or {})
+    merged.update(report)              # 同 code 以本次为准
+    prior_unverified = prior.get("unverified") or []
+    if not isinstance(prior_unverified, list):
+        prior_unverified = []
+    # 本次已成功取证的 code 从 unverified 里移除(它不再是"未核查")
+    all_unverified = (set(prior_unverified) | set(unverified)) - set(report)
+    return merged, sorted(all_unverified)
+
+
+def write_report_atomic(out_path: str, as_of: str, now: datetime,
+                        stocks: dict[str, Any], unverified: list[str]) -> None:
+    """原子写证据报告(tempfile + fsync + os.replace):写失败不损坏既有报告。"""
+    payload = {
+        "as_of": as_of, "generated_at": now.isoformat(timespec="seconds"),
+        "machine_generated": True,
+        "note": "机器证据报告,仅供人工复核;verdict 须人工写入 factcheck_overrides.json",
+        "unverified": sorted(unverified),
+        "stocks": stocks,
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+    directory = os.path.dirname(out_path) or "."
+    fd, tmp = tempfile.mkstemp(suffix=".json", prefix=".tmp_probe_", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def select_candidates(snapshot: dict[str, Any], limit: int) -> list[dict[str, str]]:
     """从决策快照选出"仅差 fact-check"的 WAIT 候选,小桶优先、同桶按 score 降序。"""
     picked = []
@@ -439,13 +499,12 @@ def main(argv: "list[str] | None" = None) -> None:
 
     os.makedirs(FACTCHECK_DIR, exist_ok=True)
     out_path = os.path.join(FACTCHECK_DIR, f"{as_of}_probe.json")
-    json.dump({"as_of": as_of, "generated_at": now.isoformat(timespec="seconds"),
-               "machine_generated": True,
-               "note": "机器证据报告,仅供人工复核;verdict 须人工写入 factcheck_overrides.json",
-               "unverified": sorted(unverified),
-               "stocks": report},
-              open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print(f"→ {out_path}(证据报告;不修改 factcheck_overrides.json,verdict 由人工定)")
+    merged, prior_unverified = merge_existing_report(out_path, report, unverified)
+    write_report_atomic(out_path, as_of, now, merged, prior_unverified)
+    kept = len(merged) - len(report)
+    print(f"→ {out_path}(本次 {len(report)} 只"
+          + (f",合并保留既有 {kept} 只" if kept > 0 else "")
+          + ";证据报告,不修改 factcheck_overrides.json,verdict 由人工定)")
     if unverified:
         print(f"⚠ {len(unverified)} 只无一手材料未核查: {','.join(sorted(unverified))}")
         raise SystemExit(2)   # 需人工:未核查绝不解释为通过

@@ -1,6 +1,7 @@
 # q.ps1 — ashare-gauntlet 统一入口:把常用命令收敛成短动词。
 # 只读命令直呈;账本写命令(confirm/ledger)仍是"运行=人工签字",不代跑代判、不下单。
 # 用法:  .\scripts\q.ps1 <verb> [args...]
+#   close   <YYYYMMDD>      收盘一条龙:EOD→人工确认→估值→一屏 -> scripts.eod_close
 #   today   [--json]        每日一屏简报(只读)            -> scripts.daily_brief
 #   eod     [--skip-probe]  每日 EOD 编排(刷新→排名→决策) -> scripts.eod_ops
 #   watch   [--dedupe]      盘中哨兵                         -> scripts.intraday_watch
@@ -26,10 +27,12 @@ $map = @{
   ledger  = "scripts.trade_record"
   audit   = "scripts.ledger_reconcile"
   gate    = "scripts.gate_check"
+  close   = "scripts.eod_close"
 }
 
 function Show-Help {
   Write-Host "q — ashare-gauntlet 统一入口"
+  Write-Host "  q close   <YYYYMMDD>      收盘一条龙:EOD→人工确认→估值→一屏"
   Write-Host "  q today   [--json]        每日一屏简报(只读)"
   Write-Host "  q eod     [--skip-probe]  每日 EOD 编排"
   Write-Host "  q watch   [--dedupe]      盘中哨兵"

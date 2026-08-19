@@ -67,6 +67,8 @@ from scripts.factor_backtest import (
 )
 
 INCR_FACTORS = ("ACC", "MAX", "NLIMIT", "TREND")   # X-02/X-03:全部负向(低者好)
+INCR_DIR = {"ACC": False, "MAX": False, "NLIMIT": False, "TREND": False,
+            "DP": True}   # 增量因子方向(True=高者好;X-10 DP=股息率正向,余为反向)
 
 MOM_LB = 250   # 与 factor_backtest 同锚:保证换仓日集合一致(N 可比),非本实验用到动量
 
@@ -205,7 +207,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--increments", action="store_true",
                     help="X-02/X-03:ACC/MAX/NLIMIT/TREND 对 composite 的 common-support "
                          "增量与冗余(加载财务三表+stk_limit 触板面板,启动慢数分钟)")
+    ap.add_argument("--dp", action="store_true",
+                    help="X-10:把 DP=股息率(dv_ttm,正向)加入增量门评测(须配 --increments);"
+                         "结果另存 composite_backtest_dp.json,不覆盖权威读数")
     a = ap.parse_args(argv)
+    if a.dp and not a.increments:
+        raise SystemExit("--dp 须配合 --increments(DP 走 common-support 增量门评测)")
+    incr_factors = INCR_FACTORS + (("DP",) if a.dp else ())
 
     excluded = load_excluded_industries()
     fina = _load("fina_indicator", ["roe", "netprofit_yoy", "dt_netprofit_yoy", "tr_yoy", "ocfps"])
@@ -279,7 +287,7 @@ def main(argv: list[str] | None = None) -> None:
     if a.tag_exit:
         ports += ["PROD_XT", "PROD_XR", "PROD_XB"]
     if a.increments:
-        for x in INCR_FACTORS:
+        for x in incr_factors:
             ports += [f"CS3_{x}", f"P4_{x}"]   # 同池 3因子基线 / +x 的4因子(common-support 对)
     rows: list[dict] = []
     prev_sets: dict[str, set | None] = {p: None for p in ports}
@@ -357,6 +365,9 @@ def main(argv: list[str] | None = None) -> None:
                 raw["NLIMIT"] = nl.reindex(idx)
             else:
                 raw["NLIMIT"] = pd.Series(float("nan"), index=idx)
+        if a.dp:
+            # X-10:DP=近12月股息率(daily_basic dv_ttm,当日 PIT 可见);正向(高股息高分)
+            raw["DP"] = pd.to_numeric(db["dv_ttm"], errors="coerce").reindex(idx)
         # 扣非 EP(R4/R6):严格 PIT TTM(元)/ 总市值(daily_basic total_mv 单位=万元);
         # 与 EP 同样仅在 E>0 下有定义(价值因子语义)
         dedt = dedt_ttm_pit(fdedt, t).reindex(idx)
@@ -373,7 +384,8 @@ def main(argv: list[str] | None = None) -> None:
              for c in idx], index=idx)
 
         def score_deciles(sub: pd.Index, ep_col: str = "EP",
-                          extra: "str | None" = None) -> "pd.Series | None":
+                          extra: "str | None" = None,
+                          extra_dir: bool = False) -> "pd.Series | None":
             """给定宇宙内按生产构造打分定档。**先滤后排**(对抗审查 P1-1:生产是
             tier→剔ST→pe>0→三因子全齐先过滤、再在滤后池算百分位;先排后滤会让
             pe≤0 等出局票污染 BP/IVOL 的百分位池/行业中位/size 桶界)。
@@ -392,7 +404,7 @@ def main(argv: list[str] | None = None) -> None:
             f["f_BP"] = factor_percentile(raw.loc[pool, "BP"], ind[pool], True, logmv=logmv[pool])
             f["f_IVOL"] = factor_percentile(raw.loc[pool, "IVOL"], ind[pool], False, logmv=logmv[pool])
             if extra:
-                f[f"f_{extra}"] = factor_percentile(raw.loc[pool, extra], ind[pool], False,
+                f[f"f_{extra}"] = factor_percentile(raw.loc[pool, extra], ind[pool], extra_dir,
                                                     logmv=logmv[pool])
             return to_decile(composite(f))
 
@@ -484,10 +496,10 @@ def main(argv: list[str] | None = None) -> None:
         # 全可得)上分别跑 3因子基线与 +x 四因子;两者之差=纯因子增量,剥离覆盖池
         # 变化(R6 的 common-support 教训直接搬用)。冗余=pool 内双中性分位的秩相关。
         if a.increments and dec_b is not None:
-            for x in INCR_FACTORS:
+            for x in incr_factors:
                 pool_x = sub_b[raw.loc[sub_b, ["EP", "BP", "IVOL", x]].notna().all(axis=1)]
                 d3 = score_deciles(pool_x)
-                d4 = score_deciles(pool_x, extra=x)
+                d4 = score_deciles(pool_x, extra=x, extra_dir=INCR_DIR[x])
                 if d3 is None or d4 is None:
                     continue
                 members[f"CS3_{x}"] = d3.index[d3 == 10].difference(locked_idx)
@@ -547,7 +559,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("无有效换仓期(检查 --start / 缓存覆盖)")
     # 先落盘再报告:149 期逐日计算约数十分钟,报告层的任何 bug 不允许毁掉计算成果
     os.makedirs(HOLDSCORE_DIR, exist_ok=True)
-    res.to_json(f"{HOLDSCORE_DIR}/composite_backtest.json", orient="records", force_ascii=False, indent=2)
+    cb_out = "composite_backtest_dp.json" if a.dp else "composite_backtest.json"
+    res.to_json(f"{HOLDSCORE_DIR}/{cb_out}", orient="records", force_ascii=False, indent=2)
     # PROD 成员逐期落盘(M2 入场实验的 common-support 基础:入场规则只在已审计的
     # 生产 D10 成员上评测,不得另造候选口径——spec §6.2)
     import json as _json
@@ -679,7 +692,7 @@ def main(argv: list[str] | None = None) -> None:
     if a.increments:
         print(f"\n=== X-02/X-03 composite 增量(common-support:同池 4因子 − 3因子基线;"
               f"准入门=|NW t|>3 且经济意义为正)===")
-        for x in INCR_FACTORS:
+        for x in incr_factors:
             inc = res[f"ret_P4_{x}"] - res[f"ret_CS3_{x}"]
             _, t_inc, _ = newey_west_tstat(inc.dropna())
             net_inc = ((res[f"ret_P4_{x}"] - res[f"TO_P4_{x}"] * res["cost_rt"])

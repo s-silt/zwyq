@@ -380,7 +380,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="YYYYMMDD,只跑该日及之后的换仓日(默认不截;回填完 2013 数据后跑长样本用)")
     ap.add_argument("--every", type=int, default=1,
                     help="每第 N 个月末取一个换仓日(默认1=月度)。fwd=63 配 --every 3 得"
-                         "非重叠季度采样——月度采样 63 日收益强重叠,均值 t 会虚高(对抗轮点名)")
+                         "近似非重叠的季度采样(严格说仍重叠:季度均 60.6 交易日 < 63,实测"
+                         "73% 的相邻期重叠、均值 2.6 日,残余靠 NW HAC 吸收)——它压掉的是"
+                         "月度采样 63 日收益那种每对约 43 日的强重叠(对抗轮点名)")
     ap.add_argument("--candidates", action="store_true",
                     help="加评 P1 交易行为族候选:MAX/IVOL/ILLIQ/TURN/NLIMIT(需 daily_basic/"
                          "stk_limit 全史缓存;加载多三张面板,启动慢数分钟)。只评不入分:"
@@ -388,6 +390,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--ivol-windows", default=None, dest="ivol_windows",
                     help="逗号分隔额外 IVOL 窗口(X-01 预注册 {21,63,252}:同一日频 CAPM 残差"
                          "定义仅窗口不同;结果另存 *_ivolwin.json 不覆盖权威读数)")
+    ap.add_argument("--dp", action="store_true",
+                    help="X-10 预注册:加评 DP=股息率(daily_basic dv_ttm,正向=高股息高分)"
+                         "候选因子;结果另存 factor_ic_backtest_dp.json,不覆盖权威读数")
     a = ap.parse_args(argv)
     ivol_ws = parse_ivol_windows(a.ivol_windows)
     MOM_LB, MOM_SKIP = 250, 21   # 12-1 动量:近250日、跳最近21日
@@ -457,6 +462,8 @@ def main(argv: list[str] | None = None) -> None:
     if a.candidates:
         FACTORS += ["MAX", "IVOL", "ILLIQ", "TURN", "NLIMIT", "TREND", "CGO"]
     FACTORS += [f"IVOL{w}" for w in ivol_ws]   # X-01:同定义多窗口对照列
+    if a.dp:
+        FACTORS.append("DP")   # X-10:股息率候选(正向;daily_basic dv_ttm,与 EP/BP 同源)
     print(f"加载完成:{len(dates)}交易日 → {len(rebal)}个月度换仓日,逐期算 IC(行业+市值双中性)"
           f"{'·剔壳30%' if a.ex_shell30 else ''}…", flush=True)
     ic_rows: list[dict] = []
@@ -540,6 +547,10 @@ def main(argv: list[str] | None = None) -> None:
         raw["GP"] = (rev - cogs) / ta
         raw["ACC"] = -((ni - ocf) / ta)
         raw["MOM"] = (close_p.iloc[it - MOM_SKIP][list(idx)] / close_p.iloc[it - MOM_LB][list(idx)] - 1.0)
+        if a.dp:
+            # X-10:DP=近12月股息率(daily_basic dv_ttm,当日 PIT 可见);非付息股 dv_ttm=0
+            # 为合法低分,NaN(无数据)如实缺席不填 0;正向由 neutralize+IC 自然处理
+            raw["DP"] = pd.to_numeric(db["dv_ttm"], errors="coerce").reindex(idx)
         if a.candidates:
             hist = slice(None, it + 1)
             raw["MAX"] = max_daily_ret(ret_p.iloc[hist], 21).reindex(idx)
@@ -633,8 +644,13 @@ def main(argv: list[str] | None = None) -> None:
         avg_corr = corr_sum / corr_cnt.replace(0, pd.NA)
         print(f"\n=== 因子横截面 Spearman 相关(逐期平均,N={corr_n};冗余审查:>0.65 触发合并/剔除评估)===")
         print(avg_corr.astype(float).round(2).to_string())
-    # X-01 多窗口跑另存,不覆盖 13 因子权威读数文件
-    out_name = "factor_ic_backtest_ivolwin.json" if ivol_ws else "factor_ic_backtest.json"
+    # X-01 多窗口 / X-10 DP 跑另存,不覆盖权威读数文件
+    if ivol_ws:
+        out_name = "factor_ic_backtest_ivolwin.json"
+    elif a.dp:
+        out_name = "factor_ic_backtest_dp.json"
+    else:
+        out_name = "factor_ic_backtest.json"
     res.to_json(f"{HOLDSCORE_DIR}/{out_name}", orient="records", force_ascii=False, indent=2)
     print(f"→ 明细 data/holdscore/{out_name}")
 

@@ -14,6 +14,7 @@ Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.factor_tearshe
 """
 from __future__ import annotations
 
+import argparse
 import json
 
 import pandas as pd
@@ -66,7 +67,8 @@ def long_leg_net(res: pd.DataFrame, fac: str) -> float:
 
     两处口径修正(review 第三批 P1):①多头腿成本必须用**对应腿**的 τ——低腿换手 10%/
     高腿 90% 时用两腿平均 50% 扣会错估纯多头可拿收益;②该值升格为准入第五门
-    (MOM 教训:过四门但多头腿 -0.28%,'腿分解为准入必查'写了要执行)。
+    (MOM 教训:spread 显著 ≠ 纯多头拿得到,多头腿成本后为负的因子必须在门口就被拦下,
+    '腿分解为准入必查'写了要执行;MOM 当期读数见 docs/methodology.md §5,不复制到此处)。
     旧明细无逐腿 τ 列时回退 TO_(均值,标注保守偏差方向不定)。
     """
     ic_mean = res["IC_" + fac].dropna().mean()
@@ -101,8 +103,13 @@ def admission_verdict(full_t: float, real_net: float, loyo: dict[str, float],
     return not reasons, reasons
 
 
-def main() -> None:
-    res = pd.DataFrame(json.load(open(DETAIL, encoding="utf-8")))
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--detail", default=DETAIL,
+                    help="factor_backtest 明细 JSON(默认权威读数;DP 实验用 "
+                         "data/holdscore/factor_ic_backtest_dp.json)")
+    a = ap.parse_args(argv)
+    res = pd.DataFrame(json.load(open(a.detail, encoding="utf-8")))
     if "mkt_fwd" not in res.columns:
         raise SystemExit("明细缺 mkt_fwd 列——先用新版 factor_backtest 重跑产出")
     facs = sorted(c[3:] for c in res.columns if c.startswith("IC_"))

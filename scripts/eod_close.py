@@ -1,4 +1,9 @@
-"""收盘一条命令:EOD 管线 → 人工签字确认日期 → 刷新估值 → 每日一屏。
+"""收盘一条命令:刷新行情 → 人工签字确认日期 → 决策管线 → 刷新估值 → 每日一屏。
+
+**顺序不是随意排的**(实测踩过死锁):`holdings_confirm` 要求目标日是本地缓存已知
+交易日 → 刷新必须在签字前;而 `buy_list` 要求账户 as_of == 行情日 → 决策必须在签字后。
+把整条 eod_ops 放在签字之前,buy_list 必然卡在账户日期门禁,管线 break 后连签字都
+走不到。第 ③ 步的 eod_ops 会再跑一次 refresh(幂等、缓存命中即返回),不重复取数。
 
 把散在四条命令里的收盘动作串成一条,但**人工签字环节不被自动化掉**:
 `holdings_confirm` 的语义是"运行本脚本 = 人工确认该期间无未落账成交",这个确认
@@ -11,7 +16,7 @@
 失败即停(fail-loud):任一步非零退出都不继续,避免在残缺数据上产出"看起来正常"的
 一屏。退出码沿用 daily_brief 语义:0=平静,2=有需人工处理事项,1=数据/管线失败。
 
-Usage:
+Usage(收盘后、当日 EOD 数据已发布时跑):
     E:\\zwyq\\.venv\\Scripts\\python.exe -m scripts.eod_close 20260819
     E:\\zwyq\\.venv\\Scripts\\python.exe -m scripts.eod_close 20260819 --skip-eod
     (或 .\\scripts\\q.ps1 close 20260819)
@@ -103,11 +108,15 @@ def main(argv: "list[str] | None" = None) -> None:
     a = ap.parse_args(argv)
     target = _date8(a.as_of)
 
-    # ① EOD 管线:退出码 2=有状态变化(正常),非 0/2 才算失败
+    # ① 先刷行情:holdings_confirm 要求目标日是**本地缓存已知交易日**,所以刷新必须
+    #    在签字之前;但 buy_list 又要求账户 as_of == 行情日(require_account_as_of),
+    #    所以决策不能和刷新绑在一起跑——顺序必须是 刷新 → 签字 → 决策。
+    #    (实测踩坑:把整条 eod_ops 放在签字前,buy_list 必然卡在账户日期门禁,
+    #     管线 break 后连签字都走不到,形成死锁。)
     if not a.skip_eod:
-        code = _run("scripts.eod_ops")
-        if code not in (0, 2):
-            raise SystemExit(f"eod_ops 失败(退出码 {code})——先修数据/管线,不在残缺数据上继续")
+        code = _run("scripts.refresh")
+        if code != 0:
+            raise SystemExit(f"refresh 失败(退出码 {code})——行情未更新,不在残缺数据上继续")
 
     # ② 人工签字 + 推进账户日期(as_of 已对齐则跳过,无需签字)
     previous = current_as_of()
@@ -120,7 +129,13 @@ def main(argv: "list[str] | None" = None) -> None:
         if code != 0:
             raise SystemExit(f"holdings_confirm 失败(退出码 {code})")
 
-    # ③ EOD 估值快照(时间止损/持仓风险数字的前置)
+    # ③ 账户日期对齐后再跑决策管线(退出码 2=有状态变化,属正常)
+    if not a.skip_eod:
+        code = _run("scripts.eod_ops")
+        if code not in (0, 2):
+            raise SystemExit(f"eod_ops 失败(退出码 {code})——先修数据/管线,不在残缺数据上继续")
+
+    # ④ EOD 估值快照(时间止损/持仓风险数字的前置)
     code = _run("scripts.holdings_watch", [target])
     if code != 0:
         raise SystemExit(f"holdings_watch 失败(退出码 {code})")

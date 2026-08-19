@@ -63,17 +63,17 @@ def test_aligned_as_of_skips_signature(monkeypatch, capsys):
     assert calls == ["scripts.holdings_watch", "scripts.daily_brief"]
 
 
-def test_eod_failure_stops_before_touching_ledger(monkeypatch):
-    """eod_ops 失败必须在碰账本前停——不在残缺数据上继续。"""
+def test_refresh_failure_stops_before_touching_ledger(monkeypatch):
+    """refresh 失败必须在碰账本前停——不在残缺行情上继续。"""
     def fake_run(module, args=None):
-        return 1 if module == "scripts.eod_ops" else 0
+        return 1 if module == "scripts.refresh" else 0
 
     monkeypatch.setattr(ec, "_run", fake_run)
     monkeypatch.setattr(ec, "confirm_prompt",
                         lambda *a, **k: pytest.fail("失败后不该走到签字"))
     with pytest.raises(SystemExit) as exc:
         ec.main(["20260819"])
-    assert "eod_ops 失败" in str(exc.value.code)
+    assert "refresh 失败" in str(exc.value.code)
 
 
 def test_eod_exit_code_2_is_not_a_failure(monkeypatch):
@@ -129,3 +129,23 @@ def test_piped_date_cannot_sign_without_tty(capsys):
     assert ec.confirm_prompt("20260819", "20260818",
                              stream=io.StringIO("20260819\n"), is_tty=False) is False
     assert "不得代人签字" in capsys.readouterr().err
+
+
+def test_step_order_refresh_then_sign_then_decide(monkeypatch):
+    """★顺序回归锁(实测死锁):holdings_confirm 要求目标日是已知交易日 → 刷新必须
+    在签字前;buy_list 要求账户 as_of == 行情日 → 决策必须在签字后。把整条 eod_ops
+    放在签字前会让 buy_list 卡在账户门禁、管线 break、连签字都走不到。
+    """
+    monkeypatch.setattr(ec, "current_as_of", lambda *a, **k: "20260818")
+    seq = []
+    monkeypatch.setattr(ec, "_run", lambda m, args=None: seq.append(m) or 0)
+    monkeypatch.setattr(ec, "confirm_prompt",
+                        lambda *a, **k: seq.append("<签字>") or True)
+    with pytest.raises(SystemExit):
+        ec.main(["20260819"])
+    assert seq == ["scripts.refresh", "<签字>", "scripts.holdings_confirm",
+                   "scripts.eod_ops", "scripts.holdings_watch", "scripts.daily_brief"]
+    # 决策管线必须在签字之后(否则撞 buy_list 的账户日期门禁)
+    assert seq.index("scripts.eod_ops") > seq.index("<签字>")
+    # 刷新必须在签字之前(否则 holdings_confirm 认不出目标交易日)
+    assert seq.index("scripts.refresh") < seq.index("<签字>")

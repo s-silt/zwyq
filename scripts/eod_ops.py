@@ -6,8 +6,11 @@
 - buy_list 的账户日期门禁(require_account_as_of)是有意的人工环节:账户 as_of
   未经 holdings_confirm 推进时,快照生成失败属于**正常提醒**,不是管线故障。
 - 状态对比只读 data/decisions 冻结快照;alert 判据(定义性,零参数):
-  ①出现 BUY;②出现 EXIT 或 C2 审视(EXIT_RULE_C2_MONTHLY);③"仅差 fact-check"
-  绿灯候选集合有新增;④任一管线步骤失败。
+  ①出现 BUY;②出现 EXIT;③C2 观察集合(EXIT_RULE_C2_MONTHLY)有新增;
+  ④"仅差 fact-check"绿灯候选集合有新增;⑤任一管线步骤失败。
+- C2 只报集合新增、不逐日重报:它是"连续 2 个有效月度审视仍在档外才退出"的规则
+  (methodology §10 M3),日频快照既不累计 streak 也不标审视日;逐日催"待退出"
+  等于把 C2 退化成立即退出变体,而 C2 的收益优势正来自换手 41%→22%。
 
 Usage: E:\\zwyq\\.venv\\Scripts\\python.exe -m scripts.eod_ops [--skip-probe]
 """
@@ -19,8 +22,13 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+from ashare_gauntlet.candidates import HARD_VETO_CODES
 
 DECISION_DIR = "data/decisions"
+ALERT_DIR = "data/alerts"
 
 STEPS: tuple[tuple[str, list[str]], ...] = (
     ("refresh", ["-m", "scripts.refresh"]),
@@ -51,15 +59,28 @@ def snapshot_paths(decision_dir: str = DECISION_DIR) -> list[str]:
 
 
 def pending_factcheck_set(snapshot: dict) -> set[str]:
-    """"仅差 fact-check"的绿灯 WAIT 集合(与 factcheck_probe.select_candidates 同判据)。"""
+    """"唯一未决项=fact-check"的 WAIT 集合(判据单一来源=candidates.HARD_VETO_CODES)。
+
+    此前手写三码排除表,漏了 SPEC_CROWD/SPIKE_LIMIT——那两码写 clear 也解不开,
+    把🎰/⚡票当候选会白跑 probe 并误导用户(跨层审计)。
+    """
     out: set[str] = set()
     for d in snapshot.get("decisions", []):
         codes = set(d.get("reason_codes", []))
         if (d.get("state") == "WAIT" and "FACTCHECK_REQUIRED" in codes
-                and not codes & {"TIER_NOT_GREEN", "GOVERNANCE_RED",
-                                 "POLLUTION_PENDING_FACTCHECK"}):
+                and not codes & HARD_VETO_CODES):
             out.add(str(d["ts_code"]))
     return out
+
+
+def c2_watch_set(snapshot: "dict | None") -> set[str]:
+    """C2 观察集合:跌出 D10 但按规则不当日退出的持仓(EXIT_RULE_C2_MONTHLY)。
+
+    只做集合,不做"该不该退"的判断——退出要连续 2 个**有效月度审视**仍在档外,
+    而日频快照既不含 streak 也不知道今天算不算审视日(methodology §10 M3)。
+    """
+    return {str(d["ts_code"]) for d in (snapshot or {}).get("decisions", [])
+            if "EXIT_RULE_C2_MONTHLY" in d.get("reason_codes", [])}
 
 
 def diff_alerts(prev: "dict | None", cur: dict) -> list[str]:
@@ -74,13 +95,54 @@ def diff_alerts(prev: "dict | None", cur: dict) -> list[str]:
         if d.get("state") == "EXIT":
             alerts.append(f"EXIT 信号: {name} {code} "
                           f"{'/'.join(d.get('reason_codes', []))}")
-        if "EXIT_RULE_C2_MONTHLY" in d.get("reason_codes", []):
-            alerts.append(f"C2 月度审视: {name} {code}(掉出 D10,按规则待退出)")
+    new_c2 = c2_watch_set(cur) - c2_watch_set(prev)
+    if new_c2:
+        names = {str(d["ts_code"]): str(d.get("name", d["ts_code"]))
+                 for d in cur.get("decisions", [])}
+        alerts.append(f"C2 观察新增 {len(new_c2)} 只: "
+                      + ",".join(f"{names.get(c, c)} {c}" for c in sorted(new_c2))
+                      + "(跌出 D10;退出需连续 2 个有效月度审视仍在档外,非今日待办)")
     new_pending = pending_factcheck_set(cur) - (pending_factcheck_set(prev) if prev else set())
     if new_pending:
         alerts.append(f"新增待 fact-check 绿灯候选 {len(new_pending)} 只: "
                       + ",".join(sorted(new_pending)))
     return alerts
+
+
+def write_alerts(as_of: "str | None", alerts: list[str], *,
+                 alert_dir: str = ALERT_DIR, now: "datetime | None" = None) -> "str | None":
+    """把本次运行状态落 data/alerts/<as_of>_alerts.json(持久化:防 17:30 会话丢失 alert)。
+
+    原子替换(tmp+fsync+os.replace),失败向上抛由调用方决定;as_of 缺失则不写(无锚点)。
+    这是新增可观测性产物,不参与任何门禁,也不改变退出码语义。
+    """
+    if not as_of:
+        return None
+    now = now or datetime.now(timezone(timedelta(hours=8)))
+    payload = {
+        "as_of": as_of,
+        "generated_at": now.isoformat(),
+        "status": "action_required" if alerts else "calm",
+        "alert_count": len(alerts),
+        "alerts": list(alerts),
+    }
+    os.makedirs(alert_dir, exist_ok=True)
+    path = os.path.join(alert_dir, f"{as_of}_alerts.json")
+    text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+    fd, tmp = tempfile.mkstemp(suffix=".json", prefix=".tmp_alerts_", dir=alert_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def main(argv: "list[str] | None" = None) -> None:
@@ -122,9 +184,29 @@ def main(argv: "list[str] | None" = None) -> None:
     elif not alerts:
         print("无新快照(数据未更新或今日非交易日)")
 
+    # C2 观察名单按状态行打印(不进 alerts、不改退出码):集合没变就不该催人行动,
+    # 但也不能让它彻底隐身——把它推进到"退出"的资格只属于月度审视例行 + 人工终判
+    watching = c2_watch_set(new_snapshot)
+    if watching:
+        print(f"[C2 观察] {len(watching)} 只跌出 D10 待月度审视: {','.join(sorted(watching))}")
+
     print("\n=== ALERT ===" if alerts else "\n=== 无状态变化 ===")
     for line in alerts:
         print(f"! {line}")
+
+    # 持久化本次状态到 data/alerts/<as_of>_alerts.json(新增可观测性;不改退出码语义)
+    as_of = None
+    for snap in (new_snapshot, prev_snapshot):
+        if isinstance(snap, dict) and snap.get("as_of"):
+            as_of = str(snap["as_of"])
+            break
+    try:
+        alert_path = write_alerts(as_of, alerts)
+        if alert_path:
+            print(f"[alerts] 已落盘 {alert_path}")
+    except OSError as exc:
+        print(f"[alerts] 落盘失败(不影响本次判定): {exc}", file=sys.stderr)
+
     # 退出码语义:2=有需人工处理的状态变化(供调度器/通知层判断),0=平静
     raise SystemExit(2 if alerts else 0)
 

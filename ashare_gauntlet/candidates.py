@@ -21,6 +21,13 @@ _CHECKS = ("NOT_MAIN_BOARD", "ST_NAME", "NOT_D10", "TIER_NOT_GREEN",
            "FACTCHECK_AFTER_AS_OF", "GOVERNANCE_RED", "FACTCHECK_EXPIRED",
            "FACTCHECK_REQUIRED")
 
+# **硬否决码**(权威单一来源):写人工 verdict=clear 也解不开的否决项。
+# "唯一未决项=fact-check"的候选 = state==WAIT ∧ FACTCHECK_REQUIRED ∧ 无任何硬否决码。
+# 此前 eod_ops / factcheck_probe / daily_brief 各自手写一份只含三码的排除表,
+# 漏掉 SPEC_CROWD(🎰投机拥挤)与 SPIKE_LIMIT(⚡近5日触涨停),把这类票呈现成
+# "只差一步就能买",诱导用户白跑 fact-check、甚至绕开机器状态手动买入(跨层审计)。
+HARD_VETO_CODES = frozenset(c for c in _CHECKS if not c.startswith("FACTCHECK_"))
+
 
 def _date8(value: object, field: str) -> str:
     if not isinstance(value, str):

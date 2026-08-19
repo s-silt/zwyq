@@ -42,7 +42,10 @@ def test_diff_alerts_buy_exit_c2_and_new_pending():
     alerts = diff_alerts(prev, cur)
     joined = "\n".join(alerts)
     assert "BUY 出现: 甲 1.SZ 700股" in joined
-    assert "C2 月度审视: 乙 4.SH" in joined
+    # C2 是"连续 2 个有效月度审视仍在档外才退出"的跨期规则,日频快照既无 streak 也
+    # 不知今天算不算审视日 → 只报**集合新增**,不逐日催"待退出"(跨层审计整改)
+    assert "C2 观察新增 1 只: 乙 4.SH" in joined
+    assert "非今日待办" in joined
     assert "EXIT 信号: 丙 5.SH" in joined
     assert "新增待 fact-check 绿灯候选 1 只: 6.SZ" in joined
     assert "1.SZ" not in joined.split("新增待 fact-check")[1]   # 已 BUY 的不算新增待核
@@ -82,3 +85,22 @@ def test_diff_alerts_quiet_when_unchanged():
         {"ts_code": "2.SZ", "name": "乙", "state": "HOLD", "reason_codes": ["HELD"]},
     ])
     assert diff_alerts(snap, snap) == []
+
+
+def test_write_alerts_persists_action_state(tmp_path):
+    alert_dir = str(tmp_path / "data" / "alerts")
+    path = eod_ops.write_alerts("20260817", ["BUY 出现: 甲 1.SZ"], alert_dir=alert_dir)
+    assert path is not None
+    payload = json.loads(open(path, encoding="utf-8").read())
+    assert payload["as_of"] == "20260817"
+    assert payload["status"] == "action_required"
+    assert payload["alert_count"] == 1
+    assert payload["alerts"] == ["BUY 出现: 甲 1.SZ"]
+
+
+def test_write_alerts_calm_and_skips_without_as_of(tmp_path):
+    alert_dir = str(tmp_path / "data" / "alerts")
+    path = eod_ops.write_alerts("20260817", [], alert_dir=alert_dir)
+    assert json.loads(open(path, encoding="utf-8").read())["status"] == "calm"
+    # 无 as_of 锚点 → 不落盘(返回 None,不伪造文件名)
+    assert eod_ops.write_alerts(None, ["x"], alert_dir=alert_dir) is None

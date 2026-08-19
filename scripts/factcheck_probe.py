@@ -18,6 +18,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from ashare_gauntlet.candidates import HARD_VETO_CODES
 from ashare_gauntlet.data.env import load_env_local
 
 DECISION_DIR = "data/decisions"
@@ -281,7 +282,9 @@ def select_candidates(snapshot: dict[str, Any], limit: int) -> list[dict[str, st
         codes = set(d.get("reason_codes", []))
         if d.get("state") != "WAIT" or "FACTCHECK_REQUIRED" not in codes:
             continue
-        if codes & {"TIER_NOT_GREEN", "GOVERNANCE_RED", "POLLUTION_PENDING_FACTCHECK"}:
+        # 判据单一来源=candidates.HARD_VETO_CODES:含 SPEC_CROWD/SPIKE_LIMIT 等
+        # 写 clear 也解不开的码,避免对🎰/⚡票白跑巨潮+DeepSeek(跨层审计)
+        if codes & HARD_VETO_CODES:
             continue
         ev = d.get("evidence", {})
         picked.append({"ts_code": str(d["ts_code"]), "name": str(d.get("name", d["ts_code"])),

@@ -104,3 +104,30 @@ def test_missing_fields_fail_loud():
     del row["decile"]
     with pytest.raises(KeyError):
         candidate_assessment(row, _ov(), AS_OF)
+
+
+def test_hard_veto_codes_covers_all_non_factcheck_checks():
+    """HARD_VETO_CODES 必须=全部"写 clear 也解不开"的码,漏一个就会把🎰/⚡票
+    呈现成"只差一步就能买"(跨层审计;突变验证发现此修复原先无测试守住)。"""
+    from ashare_gauntlet.candidates import HARD_VETO_CODES, _CHECKS
+
+    # 与检查序逐条对齐:非 FACTCHECK_ 前缀的码全部是硬否决
+    assert HARD_VETO_CODES == {c for c in _CHECKS if not c.startswith("FACTCHECK_")}
+    # 这两个是最容易被漏掉的(它们与 FACTCHECK_REQUIRED 共现,且 clear 解不开)
+    assert "SPEC_CROWD" in HARD_VETO_CODES
+    assert "SPIKE_LIMIT" in HARD_VETO_CODES
+    assert "NOT_D10" in HARD_VETO_CODES and "TIER_NOT_GREEN" in HARD_VETO_CODES
+    # fact-check 相关码不是硬否决(它们正是"写 verdict 能解开"的那些)
+    assert not any(c.startswith("FACTCHECK_") for c in HARD_VETO_CODES)
+
+
+def test_spec_crowd_stock_not_listed_as_only_pending_factcheck():
+    """🎰投机拥挤 + ⚡涨停的票即便只差 fact-check,也不得进"唯一未决项"候选集。"""
+    from scripts.eod_ops import pending_factcheck_set
+
+    snap = {"decisions": [
+        {"ts_code": "1.SZ", "state": "WAIT",
+         "reason_codes": ["SPEC_CROWD", "SPIKE_LIMIT", "FACTCHECK_REQUIRED"]},
+        {"ts_code": "2.SZ", "state": "WAIT", "reason_codes": ["FACTCHECK_REQUIRED"]},
+    ]}
+    assert pending_factcheck_set(snap) == {"2.SZ"}

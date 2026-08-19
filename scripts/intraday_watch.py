@@ -22,6 +22,7 @@ from ashare_gauntlet.config import (
     INTRADAY_STATE_PATH as STATE,  # 定时模式的上次警报态(去重用,非研究数据)
     TRIGGER_BANDS_PATH as WATCHLIST,
 )
+from ashare_gauntlet.account_state import normalize_bucket
 from ashare_gauntlet.intraday import alert_level, fetch_quotes, sentinel_delta
 
 TP_MULT = 1.25   # 长线止盈提示线=成本×1.25(双仓制"+25%减半锁利"既有约定,非新常数)
@@ -73,8 +74,22 @@ def main(argv: list[str] | None = None) -> None:
             levels[k] = "NEAR"; fps[k] = "pos"; names[k] = p["name"]
             rows.append((2, k, f"⚠ {p['name']} 无行情返回(符号/停牌/退市?)"))
             continue
-        tp = p["cost"] * TP_MULT if p.get("bucket") == "长线" else None
-        lvl = alert_level(r["last"], p.get("stop"), a.warn_dist, tp=tp)
+        # 无止损价=该仓完全没有 BREACH/NEAR 保护(alert_level 会跳过止损分支并返回 OK),
+        # 若不合成警报键,哨兵会对一只裸仓打印"全部安静"/在 --dedupe 下整行过滤 ——
+        # 把"没有止损"当成"没有风险",违反"缺失不得解释为安全"(跨层审计 P1)
+        stop_px = p.get("stop")
+        if not (isinstance(stop_px, (int, float)) and not isinstance(stop_px, bool)
+                and stop_px > 0):
+            k = f"nostop:{p['ts_code']}"
+            levels[k] = "NEAR"; fps[k] = f"{p['shares']}@{p['cost']}@nostop"; names[k] = p["name"]
+            rows.append((2, k, f"⚠ {p['name']} 未设止损价——本仓无 BREACH/NEAR 保护,补 stop"))
+        # 归一为 None 再传:stop=0/负/字符串会让 alert_level 除零或类型错,一只脏值
+        # 就炸掉整轮哨兵(对抗复核 P2)。脏值与未填同义=无保护,走无止损分支。
+        stop_arg = stop_px if (isinstance(stop_px, (int, float))
+                               and not isinstance(stop_px, bool) and stop_px > 0) else None
+        # 经权威归一再比较:英文 "long" 仓过去拿不到 +25% 止盈提示(跨层审计 P1)
+        tp = p["cost"] * TP_MULT if normalize_bucket(p.get("bucket")) == "long" else None
+        lvl = alert_level(r["last"], stop_arg, a.warn_dist, tp=tp)
         key = f"pos:{p['ts_code']}"            # 命名空间键:与观察名单同代码不互相覆盖
         levels[key] = lvl
         fps[key] = f"{p['shares']}@{p['cost']}@{p.get('stop')}"   # 持仓指纹:变化即重置 latch

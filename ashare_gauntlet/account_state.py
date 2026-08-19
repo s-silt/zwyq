@@ -16,6 +16,24 @@ _DATE8 = re.compile(r"^\d{8}$")
 _TS_CODE = re.compile(r"^\d{6}\.(?:SH|SZ)$", re.IGNORECASE)
 _VALID_ORDER_STATUSES = frozenset({"active", "paused", "cancelled", "expired"})
 
+# 双仓制 bucket 的**唯一权威归一**:holdings/journal 历史上并存中文与英文两种写法
+# (journal 契约=中文三档;trade_record --buy 曾把 CLI 的英文值直接写进 holdings)。
+# 全部消费方(短线席位、盘中止盈线、止损政策带、时间止损)必须经此归一后再比较,
+# 否则同一条纪律对一半仓静默失效(跨层审计 P1)。未知写法归一为 None,由调用方
+# fail-loud 或显式标注,不得默认按某一档处理(未知不解释为安全)。
+_BUCKET_ALIASES = {
+    "short": "short", "短线": "short",
+    "long": "long", "长线": "long",
+    "制度前": "legacy",           # 双仓制生效前的历史仓,只作复盘基线,不套新规
+}
+
+
+def normalize_bucket(value: Any) -> "str | None":
+    """把仓别归一为 {short, long, legacy};无法识别 → None(不猜)。"""
+    if value is None:
+        return None
+    return _BUCKET_ALIASES.get(str(value).strip())
+
 
 # ── exception hierarchy ──
 
@@ -214,9 +232,12 @@ def normalize_account_state(
     )
 
     # ── short_slot ──
+    # bucket 归一后比较:holdings 历史上存在中文("短线")与英文("short")两种写法
+    # (trade_record --buy 曾直接写 CLI 的英文值)。只认中文会让英文仓不占席位,
+    # 单席位风控在官方落账入口整条失效(跨层审计 P1)。
     shorts = [
         p for p in positions
-        if isinstance(p, dict) and p.get("bucket") == "短线"
+        if isinstance(p, dict) and normalize_bucket(p.get("bucket")) == "short"
     ]
     short_slot: dict[str, Any] = {
         "limit": 1,

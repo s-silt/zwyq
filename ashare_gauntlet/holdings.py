@@ -73,6 +73,15 @@ def held_trading_days(entry_date: str, as_of: str, trade_days: Sequence[str]) ->
     """entry→as_of 的交易日数(含两端;短线 10 交易日时间止损用)。
 
     trade_days 为 YYYYMMDD 字符串(可直接字典序比较);entry 当天算第 1 日。
+    与 trade_record._trading_hold_days 的 journal 口径(T+1,不含 entry 当日)差 1:
+    本函数 = journal hold_days + 1。风控侧只用本口径、复盘侧只用 journal 口径,两边
+    都不做隐式换算——否则"10 交易日"在不同页面会指向不同的那一天。
+
+    **该恒等式仅在 trade_days 覆盖整个持有期时成立**(对抗复核 P2):生产唯一调用方
+    holdings_watch 只传最近 21 个交易日分区,故持有超过 21 个交易日的仓在那里会被**封顶
+    21**;窗口内若有缓存缺段还会少算(本函数无 trade_record 那样的 >15 天缺口 fail-loud)。
+    少算的方向是"看起来还没到期",短线时间止损可能因此静默不触发——消费方要么传足够长
+    的日历,要么在 entry_date 早于窗口起点时把 held_days 标 None 而非给一个封顶数字。
     """
     return sum(1 for d in trade_days if entry_date <= d <= as_of)
 
@@ -130,6 +139,7 @@ def build_position_record(
     null_fields = {
         "close": None, "pct_chg": None, "pnl_pct": None, "dist_stop_pct": None,
         "ma20": None, "dist_ma20_pct": None, "dist_low20_pct": None, "held_days": None,
+        "stop_warn": None,
     }
 
     if close is None:
@@ -138,6 +148,12 @@ def build_position_record(
     cost = pos["cost"]
     stop = pos["stop"]
     entry_date = pos.get("entry_date")
+    # stop 缺失/非正是**合法状态**(trade_record --buy 新建仓恒写 None,待人工补):
+    # 按本模块分层(单只/单字段坏数据→降级标注继续,盯盘不因一只瘫痪),这里只让
+    # dist_stop_pct=None 并标 warn,**不得**让整轮 EOD 估值 TypeError 崩掉——否则
+    # 一只新建仓就会连累全部持仓的估值/held_days/account_state 快照产不出来
+    # (对抗复核 P1;裸窗口本身由 stop_policy/intraday_watch 的 MISSING_STOP 报)
+    stop_usable = isinstance(stop, (int, float)) and not isinstance(stop, bool) and stop > 0
 
     ma20 = moving_average(qfq_closes, window)
     low20 = min_low(qfq_lows, window)
@@ -151,7 +167,8 @@ def build_position_record(
         "close": close,
         "pct_chg": pct_chg,
         "pnl_pct": round(pct_change(close, cost), 2),
-        "dist_stop_pct": round(downside_to_stop(close, stop), 2),
+        "dist_stop_pct": round(downside_to_stop(close, stop), 2) if stop_usable else None,
+        "stop_warn": None if stop_usable else "stop 未填/非正——该仓无止损警报保护,人工补",
         "ma20": round(ma20, 2) if ma20 is not None else None,
         "dist_ma20_pct": dist_ma20,
         "dist_low20_pct": dist_low20,

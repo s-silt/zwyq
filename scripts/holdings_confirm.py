@@ -18,6 +18,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+from ashare_gauntlet.account_lock import account_lock
 from ashare_gauntlet.config import CACHE_DIR, HOLDINGS_PATH
 
 
@@ -46,40 +47,42 @@ def confirm_as_of(target: str, *, holdings_path: str = HOLDINGS_PATH,
         raise SystemExit(f"{target} 不是本地缓存已知的交易日(daily 分区缺失)"
                          "——先刷新 EOD 或检查日期是否敲错")
     path = Path(holdings_path)
-    try:
-        holdings = json.load(path.open(encoding="utf-8"))
-    except FileNotFoundError:
-        raise SystemExit(f"{holdings_path} 不存在")
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"{holdings_path} 不是合法 JSON: {exc}")
-    if not isinstance(holdings, dict) or not isinstance(holdings.get("positions"), list):
-        raise SystemExit("holdings 结构非法(需 dict 且含 positions 列表)——不修改")
-    current = holdings.get("as_of")
-    if current is not None:
-        _date8(str(current))
-        if str(current) > target:
-            raise SystemExit(f"as_of 不允许倒退:当前 {current} > 目标 {target}")
-        if str(current) == target:
-            return {"changed": False, "as_of": target,
-                    "positions": len(holdings["positions"])}
-
-    holdings["as_of"] = target
-    payload = json.dumps(holdings, ensure_ascii=False, indent=2, allow_nan=False)
-    # 同目录临时文件 + 原子替换:失败不损坏原文件(holdings 是真实账户状态)
-    fd, tmp_name = tempfile.mkstemp(suffix=".json", prefix=".tmp_holdings_",
-                                    dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
+    # 账本排他锁:与 trade_record / trade_journal --add 共用,防并发互相覆盖(codex P0)
+    with account_lock(holdings_path):
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+            holdings = json.load(path.open(encoding="utf-8"))
+        except FileNotFoundError:
+            raise SystemExit(f"{holdings_path} 不存在")
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"{holdings_path} 不是合法 JSON: {exc}")
+        if not isinstance(holdings, dict) or not isinstance(holdings.get("positions"), list):
+            raise SystemExit("holdings 结构非法(需 dict 且含 positions 列表)——不修改")
+        current = holdings.get("as_of")
+        if current is not None:
+            _date8(str(current))
+            if str(current) > target:
+                raise SystemExit(f"as_of 不允许倒退:当前 {current} > 目标 {target}")
+            if str(current) == target:
+                return {"changed": False, "as_of": target,
+                        "positions": len(holdings["positions"])}
+
+        holdings["as_of"] = target
+        payload = json.dumps(holdings, ensure_ascii=False, indent=2, allow_nan=False)
+        # 同目录临时文件 + 原子替换:失败不损坏原文件(holdings 是真实账户状态)
+        fd, tmp_name = tempfile.mkstemp(suffix=".json", prefix=".tmp_holdings_",
+                                        dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     return {"changed": True, "as_of": target, "previous_as_of": current,
             "positions": len(holdings["positions"])}
 

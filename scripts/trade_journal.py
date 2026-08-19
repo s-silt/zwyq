@@ -13,8 +13,10 @@
 - 只统计 exit_date 非空且 pnl_pct 非空的已平仓笔;有效样本 n<1 返回 {};
 - 无定义的量(无亏损笔时的 payoff、全缺 hold_days 时的均值)返回 NaN 不填 0;
 - 0% 平出不算赢(保守口径:名义 0 扣掉摩擦成本实为小亏);
-- hold_days 为交易日口径(T+1:不含 entry 当日、含 exit 当日),与短线仓
-  "时间止损 10 交易日"同一单位;
+- hold_days 为交易日口径(T+1:不含 entry 当日、含 exit 当日);它与短线仓
+  "时间止损 10 交易日"(stop_policy.SHORT_TIME_STOP_DAYS_INCLUSIVE,含 entry 当日计数)
+  **恒差 1 日、不是同一单位**——时间止损触发那天本账本记 9,故短线 avg_hold_days≈9
+  是口径差,不能读成"提前砍仓/纪律过紧";跨口径比较前先 +1;
 - approx=true 标记历史回忆口径的种子笔(价格/日期为约数),新增笔默认 false。
 
 Usage:
@@ -29,14 +31,16 @@ import math
 import re
 from pathlib import Path
 
+from ashare_gauntlet.account_lock import account_lock
 from ashare_gauntlet.config import TRADE_JOURNAL_PATH as JOURNAL_PATH
 
 # 双仓制三档:短线(≤1万,右侧入场,硬止损-7%)/ 长线(四关+财报季持有)/
 # 制度前(双仓制 2026-07-03 生效之前的历史仓,只作复盘基线,不套新规)
 BUCKETS = ("短线", "长线", "制度前")
 
-# 「最近 N 笔」展示窗口 = 短线仓时间止损窗口(10 交易日)—— 一屏正好覆盖
-# 一个完整短线持有周期内可能发生的全部进出,复用制度常数不另造数
+# 「最近 N 笔」展示窗口:单位是**笔**不是交易日,纯展示参数,改大改小不影响
+# 任何风控判定。取 10 只因为一屏够看,与 stop_policy.SHORT_TIME_STOP_DAYS_INCLUSIVE 数值
+# 巧合、无派生关系——不要把这里当"制度常数副本"跟着改(反向也一样)
 RECENT_N = 10
 
 # 一笔交易的完整 schema:字段名 → 类型转换器(CLI 字符串 → 存储类型)
@@ -77,6 +81,11 @@ def stats(trades: list[dict], bucket: str | None = None) -> dict:
     - expectancy = win_rate*avg_win + (1-win_rate)*avg_loss ≡ 全部 pnl 的均值
       (空类概率权重为 0,恒等式对无赢/无亏样本同样成立,按均值算免 NaN 传染);
     - avg_hold_days 只对 hold_days 非空的笔取均值,全缺 → NaN。
+    - **expectancy_w / win_rate_w = 按 shares 加权**(codex P1-3):部分减仓
+      (trade_record --trim)会让"一行=一个完整仓位"不再成立——先减 100 股 +30%、
+      再清 1100 股 −10%,按笔等权得 win_rate 50%/expectancy +10%,而实际加权 ≈ −6.7%。
+      既有按笔字段语义保持不变(历史可比),加权字段是新增读数;shares 缺失的笔不
+      计入加权(w_n 另报),全缺 → NaN,不用 1 顶替(不伪造权重)。
     """
     if bucket is not None:
         trades = [t for t in trades if t.get("bucket") == bucket]
@@ -92,6 +101,11 @@ def stats(trades: list[dict], bucket: str | None = None) -> dict:
     avg_loss = sum(losses) / len(losses) if losses else math.nan
     payoff = avg_win / abs(avg_loss) if wins and losses and avg_loss != 0 else math.nan
     hold = [t["hold_days"] for t in closed if t.get("hold_days") is not None]
+    # shares 加权(部分减仓后"一行=一个完整仓位"不再成立;shares 缺失的笔不参与)
+    weighted = [(float(t["pnl_pct"]), float(t["shares"])) for t in closed
+                if isinstance(t.get("shares"), int) and not isinstance(t.get("shares"), bool)
+                and t["shares"] > 0]
+    w_sum = sum(w for _, w in weighted)
     return {
         "n": n,
         "win_rate": len(wins) / n,
@@ -100,6 +114,9 @@ def stats(trades: list[dict], bucket: str | None = None) -> dict:
         "payoff": payoff,
         "avg_hold_days": sum(hold) / len(hold) if hold else math.nan,
         "expectancy": sum(pnl) / n,
+        "n_w": len(weighted),
+        "expectancy_w": (sum(p * w for p, w in weighted) / w_sum) if w_sum else math.nan,
+        "win_rate_w": (sum(w for p, w in weighted if p > 0) / w_sum) if w_sum else math.nan,
     }
 
 
@@ -186,13 +203,18 @@ def main(argv: list[str] | None = None, path: str | Path = JOURNAL_PATH) -> None
                     help=f"追加一笔并落盘;必填 {','.join(_REQUIRED)};值内勿用半角逗号")
     args = ap.parse_args(argv)
 
-    trades = load_journal(path)
     if args.add:
-        t = parse_add(args.add)
-        trades.append(t)
-        save_journal(trades, path)
+        # 账本排他锁(与 trade_record / holdings_confirm 共用,锁文件=同目录
+        # holdings.lock):锁覆盖"读→改→写"全程,防并发写互相覆盖(codex P0)
+        with account_lock(Path(path).parent / "holdings.json"):
+            trades = load_journal(path)
+            t = parse_add(args.add)
+            trades.append(t)
+            save_journal(trades, path)
         print(f"已追加:[{t['bucket']}] {t['code']} {t['entry_date']}@{t['entry_px']} "
               f"×{t['shares']}(共 {len(trades)} 笔)\n")
+    else:
+        trades = load_journal(path)
 
     _print_stats_table(trades, args.bucket)
     _print_recent(trades, args.bucket)

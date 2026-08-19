@@ -30,7 +30,7 @@ from ashare_gauntlet.dividends import (
     dividend_yields,
     indicative_ttm_cash,
 )
-from ashare_gauntlet.account_state import normalize_bucket
+from ashare_gauntlet.account_state import normalize_account_state, normalize_bucket
 from ashare_gauntlet.candidates import HARD_VETO_CODES
 from ashare_gauntlet.freshness import classify_cache_freshness
 from ashare_gauntlet.stop_policy import (
@@ -293,7 +293,17 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
     cache_fresh = classify_cache_freshness(eod_comp.get("as_of"), now.strftime("%Y%m%d"))
     # 破线保护覆盖:盘中哨兵已停用(2026-08-19 拍板),条件单是唯一防线且系统无法
     # 验证券商端——必须如实显示"未确认/未覆盖",不能沉默着看起来安全
-    protection = conditional_order_coverage(account or {})
+    # 覆盖判定需要订单明细,而 account_snapshot 按 MCP 约定隐藏 raw orders(codex P1);
+    # 这里就地用 include_raw_orders=True 重新归一一次(纯读、不改文件)。取不到就如实
+    # 走 NO_DETAIL,绝不因拿不到明细而谎称已覆盖。
+    account_with_orders = account
+    try:
+        raw_holdings = svc.read_json("data/holdings.json", root)
+        if isinstance(raw_holdings, dict):
+            account_with_orders = normalize_account_state(raw_holdings, include_raw_orders=True)
+    except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    protection = conditional_order_coverage(account_with_orders or {})
     # 门禁证据年龄:准入证据(五门/组合 t)是一次性复跑的结论,不在 eod_ops 里,
     # 会静默变旧。这里只读基线的冻结时间,提醒按季复核(gate_check),不重算。
     gate_age = _gate_baseline_age(root, now)
@@ -345,13 +355,19 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         actions.append("⑦ 持仓风险数字缺/陈旧——跑 holdings_watch 生成 EOD 估值")
     if cache_fresh["status"] in ("STALE", "MISSING"):
         actions.append(f"⓪ EOD 缓存新鲜度 {cache_fresh['status']}——{cache_fresh['detail']}")
-    if time_stops:
-        names = ",".join(f"{r['ts_code']}({r['held_days']}日)" for r in time_stops)
-        actions.append(f"⑩ 短线仓达时间止损窗口 {len(time_stops)} 只({names})"
+    due = [r for r in time_stops if r.get("status") == "TIME_STOP"]
+    unknown_age = [r for r in time_stops if r.get("status") == "TIME_STOP_UNKNOWN"]
+    if due:
+        names = ",".join(f"{r['ts_code']}({r['held_days']}日)" for r in due)
+        actions.append(f"⑩ 短线仓达时间止损窗口 {len(due)} 只({names})"
                        "——按双仓制审视是否了结(人工终判)")
+    if unknown_age:
+        names = ",".join(r["ts_code"] for r in unknown_age)
+        actions.append(f"⑩b 短线仓持有日龄未知 {len(unknown_age)} 只({names})"
+                       "——时间止损无法判定(多半缺 entry_date),补齐后再看")
     if gate_age["status"] in ("STALE", "MISSING"):
         actions.append(f"⑫ 门禁证据{gate_age['status']}——{gate_age['detail']}")
-    if protection["status"] in ("UNVERIFIED", "INVALID") or protection["uncovered"]:
+    if protection["status"] in ("UNVERIFIED", "INVALID", "NO_DETAIL") or protection["uncovered"]:
         actions.append(f"⑪ 破线保护未确认({protection['status']})——{protection['note']}")
     missing_stop = [r for r in stop_alerts if r["status"] == "MISSING_STOP"]
     if missing_stop:
@@ -495,6 +511,9 @@ def render_text(brief: dict) -> str:
         lines.append(f"[短线时间止损] {len(tstops)} 只达 10 交易日窗口"
                      "(含买入当日计数;同一笔在复盘账本记 9 日;提示,不替你卖)")
         for r in tstops:
+            if r.get("status") == "TIME_STOP_UNKNOWN":
+                lines.append(f"  {_fmt(r.get('ts_code'))} 日龄未知——{r.get('detail')}")
+                continue
             # 显式标注计数口径:避免与复盘账本的 T+1 口径(恒少 1)对不上时被误读成
             # "提前催我卖"(sol 政策评审建议)
             lines.append(f"  {_fmt(r.get('ts_code'))} 日龄 {r.get('held_days')}/{r.get('limit')}"

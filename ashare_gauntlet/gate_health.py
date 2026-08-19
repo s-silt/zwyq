@@ -139,11 +139,21 @@ def compare_to_baseline(current: dict[str, Any], baseline: dict[str, Any],
                                   f"(当初入分的证据不再成立——人工复审,勿自动改 composite)"})
             continue
         if base and base.get("nw_t") is not None:
-            drop = float(base["nw_t"]) - float(cur["nw_t"])
-            if abs(drop) >= t_drop_alert and drop > 0:
-                out.append({"level": "DRIFT", "target": name, "issue": "T_DROP",
-                            "detail": f"NW t {base['nw_t']} → {cur['nw_t']}(降 {drop:.2f});"
-                                      f"仍过 T_ADMIT={T_ADMIT},属观察项"})
+            # **按 |t| 比较**:IVOL 等负向因子的 t 为负,直接做差会把 -17→-10 这种
+            # 显著性大幅退化算成"上升"而漏报(codex P1)。门本身就是 |t|>T_ADMIT,
+            # 漂移也必须同口径看绝对显著性。
+            # 变号优先于强度下降判定:方向翻转比 |t| 变小严重得多(因子语义已变),
+            # 若先命中 DRIFT 分支就会把它降级成观察项
+            if float(base["nw_t"]) * float(cur["nw_t"]) < 0:
+                out.append({"level": "DEGRADED", "target": name, "issue": "T_SIGN_FLIP",
+                            "detail": f"NW t 由 {base['nw_t']} 变号为 {cur['nw_t']}"
+                                      "——方向翻转,因子语义已变,必须人工复审"})
+            else:
+                drop = abs(float(base["nw_t"])) - abs(float(cur["nw_t"]))
+                if drop >= t_drop_alert:
+                    out.append({"level": "DRIFT", "target": name, "issue": "T_DROP",
+                                "detail": f"NW t {base['nw_t']} → {cur['nw_t']}"
+                                          f"(|t| 降 {drop:.2f});仍过 T_ADMIT={T_ADMIT},属观察项"})
 
     cur_c = current.get("composite") or {}
     base_c = baseline.get("composite") or {}
@@ -152,15 +162,17 @@ def compare_to_baseline(current: dict[str, Any], baseline: dict[str, Any],
                     "detail": cur_c.get("note", "组合读数缺失")})
     elif cur_c.get("nw_t") is not None:
         t = float(cur_c["nw_t"])
+        # 组合超额的**方向有经济含义**(负超额=跑输基准),故这里不取绝对值:
+        # t 本身低于 T_FOLD(含变负)都要报——与因子腿按 |t| 比较是两种口径,勿混
         if t < T_FOLD:
             out.append({"level": "DEGRADED", "target": "composite", "issue": "T_BELOW_FOLD",
-                        "detail": f"组合净超额 NW t={t} < {T_FOLD}——人工复审(是风格逆风、"
+                        "detail": f"组合毛超额 NW t={t} < {T_FOLD}——人工复审(是风格逆风、"
                                   f"成本口径、还是失效?复审前不得自动改因子)"})
         elif base_c.get("nw_t") is not None:
             drop = float(base_c["nw_t"]) - t
             if drop >= t_drop_alert:
                 out.append({"level": "DRIFT", "target": "composite", "issue": "T_DROP",
-                            "detail": f"组合 NW t {base_c['nw_t']} → {t}(降 {drop:.2f})"})
+                            "detail": f"组合毛超额 NW t {base_c['nw_t']} → {t}(降 {drop:.2f})"})
     return out
 
 

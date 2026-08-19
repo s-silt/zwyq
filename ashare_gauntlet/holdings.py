@@ -15,6 +15,7 @@ fail-loud 分层(见 memory analysis-priorities):单只/单字段坏数据→降
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 
@@ -153,7 +154,10 @@ def build_position_record(
     # dist_stop_pct=None 并标 warn,**不得**让整轮 EOD 估值 TypeError 崩掉——否则
     # 一只新建仓就会连累全部持仓的估值/held_days/account_state 快照产不出来
     # (对抗复核 P1;裸窗口本身由 stop_policy/intraday_watch 的 MISSING_STOP 报)
-    stop_usable = isinstance(stop, (int, float)) and not isinstance(stop, bool) and stop > 0
+    # 须同时要求**有限**:1e309 会解析成 inf,算出的 dist_stop_pct 让整份 EOD 快照
+    # json.dump(allow_nan=False) 失败(codex P2)
+    stop_usable = (isinstance(stop, (int, float)) and not isinstance(stop, bool)
+                   and math.isfinite(float(stop)) and stop > 0)
 
     ma20 = moving_average(qfq_closes, window)
     low20 = min_low(qfq_lows, window)

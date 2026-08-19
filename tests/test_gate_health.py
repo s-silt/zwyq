@@ -89,3 +89,24 @@ def test_build_report_shape():
     # EP 有数据、BP/IVOL 无 → all_gates_pass 必须 False(缺数据不算通过)
     assert rep["all_gates_pass"] is False
     assert not math.isnan(rep["factors"][0]["nw_t"])
+
+
+def test_negative_factor_degradation_is_detected():
+    """codex P1:IVOL 等负向因子 t 为负,直接做差会把 -17→-10 的退化算成"上升"而漏报。"""
+    base = {"factors": [{"factor": "IVOL", "status": "PASS", "nw_t": -17.0}], "composite": {}}
+    worse = {"factors": [{"factor": "IVOL", "status": "PASS", "nw_t": -10.0}], "composite": {}}
+    found = gh.compare_to_baseline(worse, base)
+    assert any(f["issue"] == "T_DROP" and f["target"] == "IVOL" for f in found)
+    # |t| 上升(更显著)不该报
+    assert gh.compare_to_baseline(
+        {"factors": [{"factor": "IVOL", "status": "PASS", "nw_t": -20.0}], "composite": {}},
+        base) == []
+
+
+def test_sign_flip_outranks_drift():
+    """方向翻转=因子语义变了,必须 DEGRADED,不能被降级成 DRIFT 观察项。"""
+    base = {"factors": [{"factor": "IVOL", "status": "PASS", "nw_t": -17.0}], "composite": {}}
+    flip = {"factors": [{"factor": "IVOL", "status": "PASS", "nw_t": 5.0}], "composite": {}}
+    found = gh.compare_to_baseline(flip, base)
+    assert [f["issue"] for f in found] == ["T_SIGN_FLIP"]
+    assert found[0]["level"] == "DEGRADED"

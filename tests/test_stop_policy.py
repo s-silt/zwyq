@@ -87,11 +87,15 @@ def test_time_stop_short_bucket_only():
     hit = sp.check_time_stop({"ts_code": "1.SH", "bucket": "short", "held_days": 10})
     assert hit and hit["status"] == "TIME_STOP" and hit["held_days"] == 10
     assert sp.check_time_stop({"ts_code": "1.SH", "bucket": "短线", "held_days": 12})
-    # 未到窗口 / 非短线 / held_days 缺失 → 不报(不伪造判定)
+    # 未到窗口 / 非短线 → 不报(不伪造判定)
     assert sp.check_time_stop({"ts_code": "1.SH", "bucket": "short", "held_days": 9}) is None
     assert sp.check_time_stop({"ts_code": "1.SH", "bucket": "long", "held_days": 99}) is None
-    assert sp.check_time_stop({"ts_code": "1.SH", "bucket": "short", "held_days": None}) is None
-    assert sp.check_time_stop({"ts_code": "1.SH", "bucket": "short"}) is None
+    # held_days 未知 ≠ 未到期(codex P1):必须显式 UNKNOWN,不能与"已查无命中"同形
+    for rec in ({"ts_code": "1.SH", "bucket": "short", "held_days": None},
+                {"ts_code": "1.SH", "bucket": "short"}):
+        r = sp.check_time_stop(rec)
+        assert r is not None and r["status"] == "TIME_STOP_UNKNOWN"
+        assert r["held_days"] is None
 
 
 def test_check_time_stops_returns_only_hits():
@@ -120,15 +124,38 @@ def test_conditional_order_coverage_never_assumes_safe():
     assert r["status"] == "UNVERIFIED" and r["verified"] is False
     assert set(r["uncovered"]) == {"600001.SH", "000002.SZ"} and r["covered"] == []
 
-    # 结构化 v2 且 verified:逐仓判定,只认 active 的 SELL 单
-    acct2 = {"positions": [{"ts_code": "600001.SH"}, {"ts_code": "000002.SZ"}],
+    # verified 但视图不含明细(account_snapshot 按 MCP 约定隐藏 raw orders)→ NO_DETAIL,
+    # 不得谎称已覆盖(codex P1:此前该链路让 verified 账户也永远报 uncovered)
+    nodetail = cov({"positions": [{"ts_code": "600001.SH", "shares": 100}],
+                    "conditional_orders": {"status": "verified", "format": "structured_v2"}})
+    assert nodetail["status"] == "NO_DETAIL" and nodetail["uncovered"] == ["600001.SH"]
+
+    # 结构化 v2 + 明细:覆盖须 SELL + active + operator<= + 股数足额 + 未过期
+    acct2 = {"as_of": "20260818",
+             "positions": [{"ts_code": "600001.SH", "shares": 100},
+                           {"ts_code": "000002.SZ", "shares": 200}],
              "conditional_orders": {"status": "verified", "format": "structured_v2",
                                     "orders": [
-                                        {"ts_code": "600001.SH", "side": "SELL", "status": "active"},
-                                        {"ts_code": "000002.SZ", "side": "SELL", "status": "cancelled"},
-                                        {"ts_code": "000002.SZ", "side": "BUY", "status": "active"}]}}
+                                        {"ts_code": "600001.SH", "side": "SELL", "status": "active",
+                                         "condition": {"operator": "<=", "price": 9.0},
+                                         "shares": 100, "valid_until": "20261231"},
+                                        {"ts_code": "000002.SZ", "side": "SELL", "status": "cancelled",
+                                         "condition": {"operator": "<="}, "shares": 200}]}}
     r2 = cov(acct2)
     assert r2["status"] == "VERIFIED"
     assert r2["covered"] == ["600001.SH"] and r2["uncovered"] == ["000002.SZ"]
+
+    # 覆盖定义收紧(codex P1):止盈单(operator>=)、股数不足、已过期都不算保护
+    def _one(order):
+        return cov({"as_of": "20260818",
+                    "positions": [{"ts_code": "600001.SH", "shares": 100}],
+                    "conditional_orders": {"status": "verified", "format": "structured_v2",
+                                           "orders": [order]}})["covered"]
+    base = {"ts_code": "600001.SH", "side": "SELL", "status": "active",
+            "condition": {"operator": "<="}, "shares": 100, "valid_until": "20261231"}
+    assert _one(base) == ["600001.SH"]
+    assert _one({**base, "condition": {"operator": ">="}}) == []      # 止盈单不是破线保护
+    assert _one({**base, "shares": 1}) == []                          # 1 股单不算覆盖
+    assert _one({**base, "valid_until": "20260101"}) == []            # 已过期(status 未改)
 
     assert cov({"positions": []})["status"] == "NO_POSITIONS"

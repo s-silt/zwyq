@@ -564,7 +564,10 @@ def main(argv: list[str] | None = None) -> None:
     # PROD 成员逐期落盘(M2 入场实验的 common-support 基础:入场规则只在已审计的
     # 生产 D10 成员上评测,不得另造候选口径——spec §6.2)
     import json as _json
-    with open(f"{HOLDSCORE_DIR}/composite_members.json", "w", encoding="utf-8") as fh:
+    # DP 实验跑另存,不污染权威成员表——它是 entry_backtest 的输入,被带 --dp/--start/
+    # --fwd 的实验跑覆盖会让后续入场实验建在非权威口径上(codex P2)
+    members_out = "composite_members_dp.json" if a.dp else "composite_members.json"
+    with open(f"{HOLDSCORE_DIR}/{members_out}", "w", encoding="utf-8") as fh:
         _json.dump(members_log, fh, ensure_ascii=False)
     y = res["date"].str[:4]
 

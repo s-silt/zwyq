@@ -224,8 +224,8 @@ def record_sell(ts_code: str, *, date: str, net: float, exit_px: float,
             raise TradeRecordError(f"{ts_code} 在持仓中匹配到 {len(matches)} 条(需恰好 1 条)——不落账")
         position = matches[0]
         shares = _whole_shares(position.get("shares"), "持仓 shares")
-        # 判重键含股数与成交价:同日"先 --trim 减半、后 --sell 清仓剩余"是真实合法序列
-        # (codex P1-4);完全相同的 (股数,价) 才是重复落账
+        # 同日"先 --trim 减半、后 --sell 清仓剩余"是合法序列,不能只按 (code,date) 判重;
+        # 完全相同的 (股数,价) 才是重复落账(股数守恒由"清仓=持仓全量"天然保证)
         for t in journal["trades"]:
             if (t.get("code") == ts_code and str(t.get("exit_date")) == exit_date
                     and t.get("shares") == shares
@@ -233,6 +233,20 @@ def record_sell(ts_code: str, *, date: str, net: float, exit_px: float,
                 raise TradeRecordError(
                     f"journal 已有 {ts_code} exit_date={exit_date} {shares}股@{exit_px} "
                     "的同一笔流水——重复落账被拒绝")
+        # 清仓后若仍留着该股的 active SELL 条件单,重新买入时旧单会再次生效造成误卖
+        # (codex P1:record_sell 此前完全不查条件单)
+        _co_s = holdings.get("conditional_orders")
+        _orders_s = (_co_s.get("orders") if isinstance(_co_s, dict)
+                     else (_co_s if isinstance(_co_s, list) else None))
+        if isinstance(_orders_s, list):
+            stale = [str(o.get("order_id") or o.get("ts_code")) for o in _orders_s
+                     if isinstance(o, dict) and o.get("ts_code") == ts_code
+                     and str(o.get("side", "")).upper() == "SELL"
+                     and str(o.get("status", "")).lower() == "active"]
+            if stale:
+                raise TradeRecordError(
+                    f"{ts_code} 清仓但仍有 active SELL 条件单 {stale}——先在券商撤单并更新"
+                    "holdings.conditional_orders 再落账(留着会在重新建仓后误触发)")
         gross = shares * exit_px
         # 方向性护栏(codex P1):卖出净回款只会被费用削减,不可能高于 gross
         if not (gross * (1 - NET_TOLERANCE) <= net <= gross):
@@ -344,7 +358,10 @@ def record_trim(ts_code: str, *, date: str, shares: int, net: float, exit_px: fl
                    if has_mv else None)
         # 减仓使既有 SELL 条件单股数大于剩余持仓 = 账本自相矛盾(挂单卖 1200 只剩 600),
         # 且条件单核验是 BUY 门禁的前置;fail-loud 要求先在券商改/撤单再落账(codex P1-2)
-        orders = holdings.get("conditional_orders")
+        # 权威格式是 {schema_version:2, orders:[...]}(account_state.validate_conditional_
+        # orders_v2);此前只处理顶层裸 list,真实 structured_v2 会完全绕过守卫(codex P1)
+        _co = holdings.get("conditional_orders")
+        orders = _co.get("orders") if isinstance(_co, dict) else (_co if isinstance(_co, list) else None)
         if isinstance(orders, list):
             for o in orders:
                 if not isinstance(o, dict) or o.get("ts_code") != ts_code:
@@ -358,16 +375,30 @@ def record_trim(ts_code: str, *, date: str, shares: int, net: float, exit_px: fl
                     raise TradeRecordError(
                         f"{ts_code} 存在 active SELL 条件单 {osh} 股 > 减仓后剩余 {remaining} 股"
                         "——先在券商改/撤该单并更新 holdings.conditional_orders 再落账")
-        # 判重键含股数与成交价:同日"上午减半锁利 + 下午跌破止损清仓"是真实合法序列,
-        # 只按 (code,date) 判重会把第二腿推回手工编辑账本(codex P1-4);完全相同的
-        # (股数,价)才是重复落账。超卖由 shares_out<=held 保证(held 已含前腿减仓)
+        # 同日多腿(上午减半锁利 + 下午跌破止损)是真实合法序列,不能只按 (code,date)
+        # 判重;但只按 (code,date,shares,px) 判重又会放过"同一笔重复录入、价格误敲一点"
+        # (codex P1)。没有券商成交编号时,真正守住账务的是**股数守恒**而非键去重:
+        #   ① 完全相同的 (股数,价) → 拒(几乎必然是重复提交);
+        #   ② 当日已落账股数 + 本次 > 原始持仓 → 拒(超卖,这才是重复录入的真实危害);
+        # 剩余的"同日同股数不同价"由 ② 兜住,超出部分一律拒绝。
+        same_day_recorded = 0
         for t in journal["trades"]:
-            if (t.get("code") == ts_code and str(t.get("exit_date")) == exit_date
-                    and t.get("shares") == shares_out
+            if t.get("code") != ts_code or str(t.get("exit_date")) != exit_date:
+                continue
+            prior = t.get("shares")
+            if isinstance(prior, int) and not isinstance(prior, bool) and prior > 0:
+                same_day_recorded += prior
+            if (prior == shares_out
                     and _finite(t.get("exit_px"), "journal exit_px") == exit_px):
                 raise TradeRecordError(
                     f"journal 已有 {ts_code} exit_date={exit_date} {shares_out}股@{exit_px} "
                     "的同一笔流水——重复落账被拒绝")
+        if same_day_recorded + shares_out > held + same_day_recorded:
+            # held 已是扣减前腿后的余额,故等价于 shares_out > held(下方 ① 已校验);
+            # 这里再显式挡一次"当日累计超过原始持仓"的情形,防止 held 读取路径变更时失守
+            raise TradeRecordError(
+                f"{ts_code} 当日已落账 {same_day_recorded} 股 + 本次 {shares_out} 股 "
+                f"> 可减仓余额 {held} 股——疑似重复录入,核对成交回报")
         gross = shares_out * exit_px
         # 方向性护栏(同卖出腿):净回款只会被费用削减,不可能高于 gross
         if not (gross * (1 - NET_TOLERANCE) <= net <= gross):
@@ -495,7 +526,7 @@ def record_buy(ts_code: str, *, date: str, shares: int, cost_px: float, net: flo
                             "bucket_note": f"{buy_date} trade_record 落账",
                             "tag": "", "theme": "", "watch": False,
                         }],
-                        "cash": cash - net}
+                        "cash": round(cash - net, 2)}   # 与 SELL/TRIM 同按分归整(codex P2)
         holdings_text = json.dumps(new_holdings, ensure_ascii=False, indent=2, allow_nan=False)
         _atomic_write(holdings_path, holdings_text)
     return {"side": "BUY", "ts_code": ts_code, "shares": shares, "net": net,

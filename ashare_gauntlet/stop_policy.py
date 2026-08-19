@@ -158,7 +158,15 @@ def check_time_stop(record: dict[str, Any],
         return None
     held = record.get("held_days")
     if isinstance(held, bool) or not isinstance(held, int) or held < 0:
-        return None
+        # **未知 ≠ 未到期**(codex P1):缺 entry_date 的短线仓 held_days 为 None,此前
+        # 返回 None 会与"已查、未命中"同形,让调用方把整次检查标成 CHECKED——典型的
+        # "未知当安全"。这里显式返回 UNKNOWN 行,由调用方计入待人工处理。
+        return {
+            "ts_code": str(record.get("ts_code") or ""),
+            "status": "TIME_STOP_UNKNOWN", "held_days": None, "limit": limit,
+            "detail": "短线仓持有日龄未知(多半缺 entry_date)——时间止损无法判定,"
+                      "补 entry_date 后再看(不得当作'还没到期')",
+        }
     if held < limit:
         return None
     return {
@@ -203,9 +211,13 @@ def conditional_order_coverage(account: dict[str, Any]) -> dict[str, Any]:
         return {"status": "NO_POSITIONS", "verified": True, "orders_format": co.get("format"),
                 "covered": [], "uncovered": [], "note": "无持仓"}
 
-    # 只有 structured v2 且 verified 时,才可能逐仓判定覆盖;自由文本条件单无法机读
+    # 订单明细的两条来源(codex P1):normalize_account_state(include_raw_orders=False)
+    # 会**删掉** orders 键(mcp_service.account_snapshot 即走这条),只留 status/format/
+    # verified_count;此时即便条件单合法也拿不到明细。故:
+    #   ① 归一结果带 orders(include_raw_orders=True)→ 逐仓判定;
+    #   ② 只有摘要 → 不谎称覆盖,标 NO_DETAIL 让调用方去取带明细的账户视图。
     raw_orders = co.get("orders") if isinstance(co.get("orders"), list) else None
-    if co_status != "verified" or raw_orders is None:
+    if co_status != "verified":
         return {
             "status": "INVALID" if co_status == "invalid" else "UNVERIFIED",
             "verified": False, "orders_format": co.get("format"),
@@ -213,18 +225,52 @@ def conditional_order_coverage(account: dict[str, Any]) -> dict[str, Any]:
             "note": f"条件单状态={co_status}——系统无法确认任何持仓有破线保护;"
                     "盘中无自动监控,请自行到券商核对条件单是否仍有效",
         }
-    protected = {
-        str(o.get("ts_code")) for o in raw_orders
-        if isinstance(o, dict) and str(o.get("side", "")).upper() == "SELL"
-        and str(o.get("status", "")).lower() == "active"
-    }
+    if raw_orders is None:
+        return {
+            "status": "NO_DETAIL", "verified": False, "orders_format": co.get("format"),
+            "covered": [], "uncovered": held,
+            "note": "条件单已 verified 但当前视图不含明细(账户快照按 MCP 约定隐藏 raw "
+                    "orders)——无法逐仓核对覆盖;需用带明细的账户视图重跑",
+        }
+
+    # 覆盖判定收紧(codex P1:只看 active+SELL 会把 1 股止盈单、已过期未改 status 的单
+    # 当成"已保护"):要求 **SELL + active + 向下触发(operator<=)+ 股数≥持仓 + 未过期**。
+    # 任一项无法确认即不算覆盖——保护状态宁可少报,不可虚报。
+    shares_by_code = {}
+    for p in positions:
+        code = str(p.get("ts_code") or "")
+        sh = p.get("shares")
+        if code and isinstance(sh, int) and not isinstance(sh, bool) and sh > 0:
+            shares_by_code[code] = sh
+    as_of = str(account.get("as_of") or "")
+    protected: set[str] = set()
+    for o in raw_orders:
+        if not isinstance(o, dict):
+            continue
+        code = str(o.get("ts_code") or "")
+        if str(o.get("side", "")).upper() != "SELL":
+            continue
+        if str(o.get("status", "")).lower() != "active":
+            continue
+        cond = o.get("condition") if isinstance(o.get("condition"), dict) else {}
+        if str(cond.get("operator") or "") != "<=":
+            continue          # 向上触发=止盈单,不是破线保护
+        until = str(o.get("valid_until") or "")
+        if as_of and until and until < as_of:
+            continue          # 已过期(status 未及时改的常见情形)
+        need = shares_by_code.get(code)
+        osh = o.get("shares")
+        if need is None or not isinstance(osh, int) or isinstance(osh, bool) or osh < need:
+            continue          # 股数不足=只保护了一部分,不算覆盖
+        protected.add(code)
     covered = [c for c in held if c in protected]
     uncovered = [c for c in held if c not in protected]
     return {
         "status": "VERIFIED", "verified": True, "orders_format": co.get("format"),
         "covered": covered, "uncovered": uncovered,
-        "note": ("全部持仓有 active SELL 条件单(仍需你核对券商端价格/有效期)"
+        "note": ("全部持仓有足额向下触发的 active SELL 条件单"
+                 "(仍需你核对券商端真实状态——系统无法查询券商)"
                  if not uncovered else
-                 f"{len(uncovered)} 只持仓无 active SELL 条件单——盘中无自动监控,这些仓"
+                 f"{len(uncovered)} 只持仓无足额有效 SELL 条件单——盘中无自动监控,这些仓"
                  "破线时不会有任何提醒或自动保护"),
     }

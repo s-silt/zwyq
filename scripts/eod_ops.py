@@ -23,6 +23,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from ashare_gauntlet.candidates import HARD_VETO_CODES
@@ -37,19 +39,44 @@ STEPS: tuple[tuple[str, list[str]], ...] = (
 )
 
 
-def run_step(args: list[str]) -> tuple[bool, str]:
-    """跑一步管线;返回 (成功, 输出尾部)。不吞错——失败/超时原文进 ALERT(codex P1)。"""
+STEP_TIMEOUT = 1800
+TAIL_LINES = 6      # 进 ALERT 的输出尾行数(失败定位够用,不灌爆提醒)
+
+
+def run_step(args: list[str], *, timeout: int = STEP_TIMEOUT,
+             echo: bool = True) -> tuple[bool, str]:
+    """跑一步管线;返回 (成功, 输出尾部)。不吞错——失败/超时原文进 ALERT(codex P1)。
+
+    **边跑边回显**(echo=True):此前用 capture_output 把子进程输出全吞了,factor_rank
+    这种要算几分钟的步骤在屏幕上毫无动静,实测被当成死机而中断——中断会留下半成品
+    产物。这里改 Popen 逐行读:既实时打印,又把尾部留给 ALERT 判定。
+    stderr 合并进 stdout,保持两者的真实先后顺序(分开取再拼接会错乱因果)。
+    超时用独立读取线程 + wait(timeout) 守:子进程长时间不输出时,阻塞读不会耽误计时。
+    """
+    proc = subprocess.Popen(
+        [sys.executable, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1)
+    tail: deque[str] = deque(maxlen=TAIL_LINES)
+
+    def _pump() -> None:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            text = line.rstrip("\n")
+            tail.append(text)
+            if echo:
+                print(f"  | {text}", flush=True)
+
+    reader = threading.Thread(target=_pump, daemon=True)
+    reader.start()
     try:
-        proc = subprocess.run([sys.executable, *args], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=1800)
-    except subprocess.TimeoutExpired as exc:
-        out = ((exc.stdout or b"").decode("utf-8", "replace")
-               if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-        tail = "\n".join(out.strip().splitlines()[-3:])
-        return False, f"超时(>{exc.timeout:.0f}s): {tail}"
-    tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
-                     .splitlines()[-6:])
-    return proc.returncode == 0, tail
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader.join(timeout=5)
+        return False, f"超时(>{timeout}s): " + "\n".join(list(tail)[-3:])
+    reader.join(timeout=5)
+    return code == 0, "\n".join(tail)
 
 
 def snapshot_paths(decision_dir: str = DECISION_DIR) -> list[str]:

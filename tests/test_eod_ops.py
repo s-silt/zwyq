@@ -6,7 +6,7 @@ import json
 import pytest
 
 from scripts import eod_ops
-from scripts.eod_ops import diff_alerts, pending_factcheck_set
+from scripts.eod_ops import diff_alerts, pending_factcheck_set, run_step
 
 
 def _snap(decisions):
@@ -104,3 +104,42 @@ def test_write_alerts_calm_and_skips_without_as_of(tmp_path):
     assert json.loads(open(path, encoding="utf-8").read())["status"] == "calm"
     # 无 as_of 锚点 → 不落盘(返回 None,不伪造文件名)
     assert eod_ops.write_alerts(None, ["x"], alert_dir=alert_dir) is None
+
+
+def test_run_step_echoes_live_and_keeps_tail(capsys):
+    """★进度必须实时回显:此前 capture_output 全吞,factor_rank 算几分钟屏幕无动静,
+    被当成死机而中断(中断会留半成品产物)。同时尾部仍要留给 ALERT 判定。"""
+    ok, tail = run_step(["-c", "print('A'); print('B')"])
+    assert ok is True
+    assert "A" in tail and "B" in tail
+    out = capsys.readouterr().out
+    assert "| A" in out and "| B" in out          # 逐行直通到终端
+
+
+def test_run_step_can_silence_echo(capsys):
+    ok, tail = run_step(["-c", "print('QUIET')"], echo=False)
+    assert ok is True and "QUIET" in tail
+    assert "QUIET" not in capsys.readouterr().out
+
+
+def test_run_step_failure_keeps_stderr_in_tail():
+    """stderr 合并进 stdout:失败原因必须进 ALERT,不能只剩退出码。"""
+    ok, tail = run_step(
+        ["-c", "import sys; sys.stderr.write('BOOM\n'); sys.exit(3)"])
+    assert ok is False and "BOOM" in tail
+
+
+def test_run_step_timeout_kills_and_labels():
+    """子进程长时间不输出时,阻塞读不得耽误计时(独立读取线程 + wait 守超时)。"""
+    ok, tail = run_step(
+        ["-c", "import time; print('start', flush=True); time.sleep(30)"], timeout=1)
+    assert ok is False and tail.startswith("超时(>1s)")
+    assert "start" in tail
+
+
+def test_run_step_tail_is_bounded():
+    """尾部有上限,单步刷屏不会灌爆 ALERT。"""
+    ok, tail = run_step(["-c", "\n".join(f"print({i})" for i in range(50))])
+    assert ok is True
+    assert len(tail.splitlines()) == eod_ops.TAIL_LINES
+    assert tail.splitlines()[-1] == "49"          # 留的是最后几行

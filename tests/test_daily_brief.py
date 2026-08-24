@@ -1,5 +1,6 @@
 """daily_brief 每日一屏测试:只读聚合、机器状态逐字读、股息叠加、退出码 0/1/2。"""
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,8 @@ import pytest
 from scripts import daily_brief as db
 
 AS_OF = "20260818"
+# 挂钟注入:fixture 全部锚在 AS_OF 当日,若用真实时钟,freshness/gate 判定会随日期腐化
+NOW = datetime(2026, 8, 18, 18, 0, tzinfo=timezone(timedelta(hours=8)))
 
 
 def _dump(path: Path, value: object) -> None:
@@ -70,7 +73,7 @@ def test_machine_states_read_verbatim_and_dividend_overlay(tmp_path: Path) -> No
         {"ts_code": "600000.SH", "dv_ttm": 4.2, "dv_ratio": 3.9},
         {"ts_code": "000001.SZ", "dv_ttm": 1.8, "dv_ratio": 1.5},
     ])
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
 
     # 状态计数逐字来自快照
     assert brief["decision_snapshot"]["state_counts"] == {"BUY": 1, "WAIT": 1, "HOLD": 0, "EXIT": 1}
@@ -96,7 +99,7 @@ def test_buy_missing_entry_price_forced_wait(tmp_path: Path) -> None:
                   reason_codes=["D10", "TIER_GREEN", "FACTCHECK_CLEAR"]),
     ]
     root = _setup_root(tmp_path, decisions=decisions)
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     buy = brief["machine"]["buys"][0]
     # 缺核验入场价 → _actionable_view 强制 WAIT,不可执行(不用现价补造)
     assert buy["actionable"] is False
@@ -110,7 +113,7 @@ def test_core_eod_missing_forces_exit_1(tmp_path: Path) -> None:
     # 缺 stk_limit 核心端点 → readiness CORE_EOD_MISSING_OR_MISALIGNED → 退出码 1
     root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)],
                        core_endpoints=("daily", "adj_factor"))
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert "CORE_EOD_MISSING_OR_MISALIGNED" in brief["readiness"]["blockers"]
     assert brief["exit_code"] == 1
 
@@ -121,7 +124,7 @@ def test_dividend_unavailable_when_partition_degraded(tmp_path: Path) -> None:
                            reason_codes=["D10", "TIER_GREEN", "FACTCHECK_CLEAR"])]
     root = _setup_root(tmp_path, decisions=decisions,
                        dv_rows=[{"ts_code": "600000.SH", "pe": 10.0}])
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert brief["dividends"]["status"] == "UNAVAILABLE"
     assert brief["machine"]["buys"][0]["dv_ttm"] is None
 
@@ -132,7 +135,7 @@ def test_invalid_snapshot_exit_1(tmp_path: Path) -> None:
     _dump(root / f"data/decisions/{AS_OF}_buy_decisions.json", {
         "as_of": AS_OF, "data_status": "complete", "generated_at": "x",
         "decisions": [_decision("600000.SH", "BUY", decile=3, max_entry=1.0, shares=100)]})
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert brief["decision_snapshot"]["status"] == "invalid"
     assert brief["exit_code"] == 1
 
@@ -156,7 +159,7 @@ def test_calm_day_exit_0(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     # 门禁基线存在且新鲜,否则 ⑫ 会正确地报"证据未复核"(缺基线不当健康)
     _dump(root / "data/holdscore/gate_baseline.json",
           {"frozen_at": "2026-08-18T17:00:00+08:00", "factors": [], "composite": {}})
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert brief["gate_evidence"]["status"] == "FRESH"
     assert brief["next_actions"] == []
     assert brief["exit_code"] == 0
@@ -165,13 +168,13 @@ def test_calm_day_exit_0(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 def test_missing_gate_baseline_is_surfaced(tmp_path: Path) -> None:
     """门禁证据基线缺失/过期必须进待办——准入证据静默变旧是深读 R1 的头号缺口。"""
     root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert brief["gate_evidence"]["status"] == "MISSING"
     assert any(a.startswith("⑫") for a in brief["next_actions"])
 
     _dump(root / "data/holdscore/gate_baseline.json",
           {"frozen_at": "2025-01-01T17:00:00+08:00", "factors": [], "composite": {}})
-    stale = db.build_brief(root)
+    stale = db.build_brief(root, now=NOW)
     assert stale["gate_evidence"]["status"] == "STALE"
     assert stale["gate_evidence"]["days"] > 100
 
@@ -205,7 +208,7 @@ def test_time_stop_checked_branch_with_fresh_snapshot(tmp_path: Path) -> None:
                        "cost": 10.0, "stop": 9.3, "close": 10.2, "pnl_pct": 2.0,
                        "dist_stop_pct": 9.7, "ma20": 10.0, "held_days": 12,
                        "stop_warn": None, "error": None}]})
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert brief["time_stop_check"]["status"] == "CHECKED"
     assert [h["ts_code"] for h in brief["time_stops"]] == ["600000.SH"]
     assert brief["holdings_risk_source"] == "account_state_snapshot"
@@ -219,5 +222,5 @@ def test_stale_snapshot_marks_not_checked(tmp_path: Path) -> None:
     root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
     _dump(root / f"data/account_state/{AS_OF}_account_state.json",
           {"as_of": AS_OF, "positions": []})      # 无 data_status
-    brief = db.build_brief(root)
+    brief = db.build_brief(root, now=NOW)
     assert brief["time_stop_check"]["status"] == "NOT_CHECKED"

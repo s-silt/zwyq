@@ -60,8 +60,8 @@ def dividend_yields(
     """返回 {ts_code: {"dv_ttm": float|None, "dv_ratio": float|None}}(展示用)。
 
     - 分区缺失 → 抛 DividendDataUnavailable(fail-loud;调用方标 UNAVAILABLE,不当无分红)。
-    - 分区存在但股息列全市场整列 NULL → 抛 DividendDataDegraded(fail-loud;上游字段退化,
-      调用方标 DEGRADED,不当无分红)。
+    - 分区存在但 dv_ttm 缺列 / 全市场整列 NULL → 抛 DividendDataDegraded(fail-loud;
+      上游字段退化,调用方标 DEGRADED,不当无分红)。dv_ratio 单独退化不算(不被消费)。
     - 某 code 无行 / 值为 NaN / 缺列 → 该字段 None(MISSING),不填 0。
     - codes 去重且保持首次出现顺序;只查所给 code,不改动任何机器状态。
     """
@@ -86,11 +86,14 @@ def dividend_yields(
         # 退化分区连一列股息都没有:显式不可用,不静默返回全 0/全 None 冒充有数据
         raise DividendDataUnavailable(
             f"daily_basic 分区不含股息列 {DIVIDEND_COLUMNS}(退化 schema): {path}")
-    # 退化判据取全市场范围(而非本次查询的少数 code):个别 code 无分红是正常 None,
-    # 存在列全体整列 NULL(或分区空表)才是上游字段退化
-    if all(frame[col].isna().all() for col in present_cols):
+    # 退化判据盯 dv_ttm(展示层唯一消费字段;dv_ratio 单独退化不影响叠加可用),
+    # 且取全市场范围而非本次查询的少数 code:个别 code 无分红是正常 None,
+    # 整列 NULL(或分区空表)才是上游字段退化
+    ttm_missing = "dv_ttm" not in frame.columns
+    if ttm_missing or bool(frame["dv_ttm"].isna().all()):
+        detail = "缺列" if ttm_missing else "整列 NULL"
         raise DividendDataDegraded(
-            f"daily_basic/{as_of} 的 {'/'.join(present_cols)} 整列 NULL"
+            f"daily_basic/{as_of} 的 dv_ttm {detail}"
             f"——上游字段退化,股息叠加不可用(勿解释为无分红): {path}")
 
     indexed = frame.set_index("ts_code")

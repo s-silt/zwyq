@@ -127,6 +127,8 @@ def test_dividend_unavailable_when_partition_degraded(tmp_path: Path) -> None:
     brief = db.build_brief(root, now=NOW)
     assert brief["dividends"]["status"] == "UNAVAILABLE"
     assert brief["machine"]["buys"][0]["dv_ttm"] is None
+    # 渲染须带原因,不只给一个光秃秃的状态词
+    assert "股息叠加=UNAVAILABLE(" in db.render_text(brief)
 
 
 def test_dividend_degraded_when_columns_all_null(tmp_path: Path) -> None:
@@ -143,9 +145,10 @@ def test_dividend_degraded_when_columns_all_null(tmp_path: Path) -> None:
     assert brief["dividends"]["status"] == "DEGRADED"
     assert "整列 NULL" in brief["dividends"]["reason"]
     assert brief["machine"]["buys"][0]["dv_ttm"] is None
-    # 展示层辅助数据退化不阻塞荐股 readiness,渲染如实显示状态且不崩
+    # 展示层辅助数据退化不阻塞荐股 readiness,渲染如实显示状态**并带原因**且不崩
     rendered = db.render_text(brief)
-    assert "股息叠加=DEGRADED" in rendered
+    assert "股息叠加=DEGRADED(" in rendered
+    assert "整列 NULL" in rendered
 
 
 def test_invalid_snapshot_exit_1(tmp_path: Path) -> None:

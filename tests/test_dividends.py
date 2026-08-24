@@ -55,6 +55,32 @@ def test_all_null_dividend_columns_fail_loud(tmp_path: Path) -> None:
         dv.dividend_yields(["600000.SH"], "20260824", cache_dir=_cache(tmp_path))
 
 
+def test_dv_ttm_all_null_degraded_even_if_dv_ratio_has_values(tmp_path: Path) -> None:
+    # 简报只消费 dv_ttm:它整列 NULL 就是不可用,不因 dv_ratio 尚有值而报 OK
+    _write_daily_basic(tmp_path, "20260824", [
+        {"ts_code": "600000.SH", "dv_ttm": None, "dv_ratio": 3.9},
+        {"ts_code": "000001.SZ", "dv_ttm": None, "dv_ratio": 1.5},
+    ])
+    with pytest.raises(dv.DividendDataDegraded):
+        dv.dividend_yields(["600000.SH"], "20260824", cache_dir=_cache(tmp_path))
+
+
+def test_dv_ttm_column_absent_is_degraded(tmp_path: Path) -> None:
+    # 只有 dv_ratio 列:消费字段 dv_ttm 整列缺失 → 退化,不静默返回全 None
+    _write_daily_basic(tmp_path, "20260824", [{"ts_code": "600000.SH", "dv_ratio": 3.9}])
+    with pytest.raises(dv.DividendDataDegraded):
+        dv.dividend_yields(["600000.SH"], "20260824", cache_dir=_cache(tmp_path))
+
+
+def test_dv_ratio_alone_degraded_does_not_block(tmp_path: Path) -> None:
+    # 反向:dv_ratio 整列 NULL 但 dv_ttm 有值 → 叠加仍可用(不过度告警)
+    _write_daily_basic(tmp_path, "20260824", [
+        {"ts_code": "600000.SH", "dv_ttm": 4.2, "dv_ratio": None},
+    ])
+    out = dv.dividend_yields(["600000.SH"], "20260824", cache_dir=_cache(tmp_path))
+    assert out["600000.SH"] == {"dv_ttm": 4.2, "dv_ratio": None}
+
+
 def test_partial_null_market_is_ok(tmp_path: Path) -> None:
     # 部分股票无分红是正常 None(20260821 分区约 1800 只如此),不得误报退化——
     # 即使**本次查询的 code 恰好全是 None**,只要全市场存在非空值就是 OK

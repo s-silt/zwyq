@@ -25,12 +25,24 @@ import pandas as pd
 import tushare as ts
 
 
-class TushareTransportError(RuntimeError):
-    """HTTP 层失败被 SDK 吞成空表时抛出。
+class TushareDataUnavailable(RuntimeError):
+    """SDK 返回**零列** DataFrame——响应不可用,不得当作"今日无数据"。
 
-    区分依据是 SDK 自身的两条返回路径:成功走 ``pd.DataFrame(items, columns=fields)``
-    —— 即便 0 行也**带列名**;HTTP 失败走裸 ``pd.DataFrame()`` —— **零列**。
-    因此"零列 DataFrame"是传输失败的确定签名,不会把真实的空结果误判成故障。
+    命名刻意不叫 TransportError:零列有两个来源,单看 DataFrame 分不出——
+    ①HTTP 失败(403/401/500)走 SDK 的 ``else: return pd.DataFrame()``;
+    ②服务端返回合法但无 schema 的 ``{"code":0,"data":{"fields":[],"items":[]}}``。
+    两者都意味着这次调用**没拿到可用数据**,都该 fail-loud;但断言"一定是 403"
+    会超出证据(codex 复审 P2)。故这里只陈述"零列/响应不可用",不编造状态码。
+
+    对四个核心 EOD 接口(daily/adj_factor/daily_basic/stk_limit)而言,零列本就
+    违反 schema 契约,抛错是唯一正确行为(CLAUDE.md:退化 schema 必须 fail-loud)。
+    """
+
+
+class TushareSDKIncompatible(RuntimeError):
+    """装配口拿到的 client 没有可调用的 query——保护装不上,拒绝返回裸 client。
+
+    静默放行等于**悄悄关掉安全保护**,正是本次要修的那类错误(codex 复审)。
     """
 
 _PROXY_ENV_VARS = (
@@ -43,20 +55,6 @@ _PROXY_ENV_VARS = (
 )
 
 
-def _probe_status(http_url: str, timeout: int = 10) -> str:
-    """尽力探一次 HTTP 状态码,只为把错误消息变得可行动(403=授权/500=服务端)。
-
-    探测本身失败不改变结论——调用方无论如何都会抛 TushareTransportError,
-    这里只把"探不到"如实写进消息,不吞掉、也不升级为新的异常。
-    """
-    try:
-        import requests
-        resp = requests.post(http_url, json={"api_name": "__probe__"}, timeout=timeout)
-        return f"HTTP {resp.status_code}"
-    except Exception as exc:            # noqa: BLE001 —— 诊断增强,结论不依赖它
-        return f"状态码探测失败({type(exc).__name__})"
-
-
 def _install_fail_loud_query(pro):
     """把 SDK 吞 HTTP 错误的 query 换成 fail-loud 版本。
 
@@ -66,18 +64,19 @@ def _install_fail_loud_query(pro):
     """
     original = getattr(pro, "query", None)
     if not callable(original):
-        return pro
+        raise TushareSDKIncompatible(
+            f"tushare client({type(pro).__name__})没有可调用的 query——"
+            "fail-loud 包装装不上;静默放行等于关掉保护,拒绝返回裸 client")
 
     def query(api_name, fields="", **kwargs):
         result = original(api_name, fields=fields, **kwargs)
         if isinstance(result, pd.DataFrame) and len(result.columns) == 0:
             url = getattr(pro, "_DataApi__http_url", "") or "<SDK 默认端点>"
             host = urlparse(url).hostname or url
-            raise TushareTransportError(
-                f"tushare 接口 {api_name!r} 请求失败被 SDK 吞成空表"
-                f"(零列 DataFrame=传输失败签名,非真实空结果);"
-                f"端点 {host} {_probe_status(url)}。"
-                "拒绝把请求失败当作'今日无数据'——请检查镜像订阅/IP 授权/token 有效期"
+            raise TushareDataUnavailable(
+                f"tushare 接口 {api_name!r} 返回零列 DataFrame(端点 {host})——"
+                "响应不可用:HTTP 错误被 SDK 吞成空表,或服务端返回了无 schema 的空结果。"
+                "拒绝当作'今日无数据'——请检查镜像订阅/IP 授权/token 有效期"
             )
         return result
 

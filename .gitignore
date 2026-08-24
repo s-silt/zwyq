@@ -7,11 +7,12 @@ __pycache__/
 .coverage
 
 # Secrets — never commit the Tushare token / endpoint
-.env.local
+# 密钥文件及其任何派生形态(.local/.bak/.old 等)——只写 .env.local 挡不住备份文件,
+# 实测 .env.local.bak 曾带着 API key 裸奔在未跟踪区。模板文件显式放行(codex 复审)
 .env
-# 密钥文件的任何派生形态(.bak/.old/.orig 等)一并排除——
-# 只写 .env.local 挡不住备份文件,实测 .env.local.bak 曾裸奔在未跟踪区
-.env*
+.env.*
+!.env.example
+!.env.template
 
 # Data cache (raw Tushare pulls, parquet) — large, regenerable, not for git
 # Anchored to repo root so it does NOT swallow the ashare_gauntlet/data/ source package.

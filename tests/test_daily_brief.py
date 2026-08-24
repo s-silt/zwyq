@@ -129,6 +129,25 @@ def test_dividend_unavailable_when_partition_degraded(tmp_path: Path) -> None:
     assert brief["machine"]["buys"][0]["dv_ttm"] is None
 
 
+def test_dividend_degraded_when_columns_all_null(tmp_path: Path) -> None:
+    # 2026-08-24 实测:daily_basic 分区存在但 dv_ttm/dv_ratio 全市场整列 NULL
+    # (上游字段退化)→ 不得打印 OK,须标 DEGRADED 并带可读 reason
+    decisions = [_decision("600000.SH", "BUY", decile=10, max_entry=9.9, shares=100,
+                           reason_codes=["D10", "TIER_GREEN", "FACTCHECK_CLEAR"])]
+    root = _setup_root(tmp_path, decisions=decisions, dv_rows=[
+        {"ts_code": "600000.SH", "dv_ttm": None, "dv_ratio": None, "pe": 10.0},
+        {"ts_code": "000001.SZ", "dv_ttm": None, "dv_ratio": None, "pe": 8.0},
+    ])
+    brief = db.build_brief(root, now=NOW)
+    assert brief["dividends"]["status"] != "OK"
+    assert brief["dividends"]["status"] == "DEGRADED"
+    assert "整列 NULL" in brief["dividends"]["reason"]
+    assert brief["machine"]["buys"][0]["dv_ttm"] is None
+    # 展示层辅助数据退化不阻塞荐股 readiness,渲染如实显示状态且不崩
+    rendered = db.render_text(brief)
+    assert "股息叠加=DEGRADED" in rendered
+
+
 def test_invalid_snapshot_exit_1(tmp_path: Path) -> None:
     root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
     # 破坏快照契约:BUY 缺 D10/FACTCHECK_CLEAR

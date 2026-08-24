@@ -26,6 +26,7 @@ from pathlib import Path
 from ashare_gauntlet import mcp_service as svc
 from ashare_gauntlet.config import ACCOUNT_STATE_DIR, CACHE_DIR
 from ashare_gauntlet.dividends import (
+    DividendDataDegraded,
     DividendDataUnavailable,
     dividend_yields,
     indicative_ttm_cash,
@@ -183,10 +184,12 @@ def _compact_decision(decision: dict) -> dict:
 
 
 def _attach_dividends(codes, as_of, cache_dir):
-    """取股息叠加;分区不可用 → status=UNAVAILABLE(不伪造无分红)。"""
+    """取股息叠加;分区不可用 → UNAVAILABLE,股息列整列 NULL → DEGRADED(不伪造无分红)。"""
     try:
         table = dividend_yields(codes, as_of, cache_dir=cache_dir)
         return {"status": "OK", "yields": table}
+    except DividendDataDegraded as exc:
+        return {"status": "DEGRADED", "reason": str(exc), "yields": {}}
     except DividendDataUnavailable as exc:
         return {"status": "UNAVAILABLE", "reason": str(exc), "yields": {}}
 
@@ -478,8 +481,11 @@ def render_text(brief: dict) -> str:
                  f"freshness={_fmt(acct['freshness'])}")
 
     lines.append("")
-    lines.append(f"[持仓风险] 来源={brief['holdings_risk_source']} "
-                 f"股息叠加={brief['dividends']['status']}")
+    div = brief["dividends"]
+    div_note = f"股息叠加={div['status']}"
+    if div.get("reason"):
+        div_note += f"({div['reason']})"
+    lines.append(f"[持仓风险] 来源={brief['holdings_risk_source']} {div_note}")
     for h in brief["holdings_risk"]:
         base = (f"  {_fmt(h.get('name'))}({_fmt(h.get('ts_code'))}) {_fmt(h.get('bucket'))} "
                 f"×{_fmt(h.get('shares'))} 成本={_fmt(h.get('cost'))} 止损={_fmt(h.get('stop'))}")

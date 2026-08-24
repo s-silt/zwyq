@@ -27,6 +27,13 @@ class DividendDataUnavailable(FileNotFoundError):
     """daily_basic 当日分区缺失——股息叠加不可用(调用方须当'辅助数据不可用',不当无分红)。"""
 
 
+class DividendDataDegraded(DividendDataUnavailable):
+    """分区存在但股息列**全市场整列 NULL**——上游字段退化,不得解释为'全市场无分红'。
+
+    判据放在全市场范围而非本次查询的少数 code:个别 code 无分红是正常 None,
+    整列 NULL 才是退化信号。"""
+
+
 def _partition_path(as_of: str, cache_dir: str = CACHE_DIR) -> Path:
     return Path(cache_dir) / "daily_basic" / f"{as_of}.parquet"
 
@@ -53,6 +60,8 @@ def dividend_yields(
     """返回 {ts_code: {"dv_ttm": float|None, "dv_ratio": float|None}}(展示用)。
 
     - 分区缺失 → 抛 DividendDataUnavailable(fail-loud;调用方标 UNAVAILABLE,不当无分红)。
+    - 分区存在但股息列全市场整列 NULL → 抛 DividendDataDegraded(fail-loud;上游字段退化,
+      调用方标 DEGRADED,不当无分红)。
     - 某 code 无行 / 值为 NaN / 缺列 → 该字段 None(MISSING),不填 0。
     - codes 去重且保持首次出现顺序;只查所给 code,不改动任何机器状态。
     """
@@ -77,6 +86,12 @@ def dividend_yields(
         # 退化分区连一列股息都没有:显式不可用,不静默返回全 0/全 None 冒充有数据
         raise DividendDataUnavailable(
             f"daily_basic 分区不含股息列 {DIVIDEND_COLUMNS}(退化 schema): {path}")
+    # 退化判据取全市场范围(而非本次查询的少数 code):个别 code 无分红是正常 None,
+    # 存在列全体整列 NULL(或分区空表)才是上游字段退化
+    if all(frame[col].isna().all() for col in present_cols):
+        raise DividendDataDegraded(
+            f"daily_basic/{as_of} 的 {'/'.join(present_cols)} 整列 NULL"
+            f"——上游字段退化,股息叠加不可用(勿解释为无分红): {path}")
 
     indexed = frame.set_index("ts_code")
     for code in wanted:

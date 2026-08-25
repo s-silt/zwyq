@@ -1,18 +1,20 @@
-"""Daily incremental refresh of the cache.
+"""Daily incremental refresh of the cache and current-month trade calendar.
 
-Pulls the last few trading days (daily+adj+hk_hold) up to today into the cache.
-Idempotent: already-cached days are skipped, so only genuinely new days hit the
-network — cheap (~1-3 new days x 3 endpoints per run). Needs a live token.
+Caches the authoritative full natural-month trade calendar, then pulls the last
+few trading days (daily+adj+hk_hold) only up to today. Idempotent: cached data is
+reused, so only genuinely new partitions hit the network. Needs a live token.
 
 Usage: python scripts/refresh.py [lookback_days] [cache_dir]
 """
 
+import calendar
 import datetime as dt
 import sys
 from pathlib import Path
 
 from ashare_gauntlet.config import CACHE_DIR, tushare_pro
 from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day, trading_days_from_cal
+from scripts.backfill import fetch_trade_cal
 
 # moneyflow_hsgt is market-level (1 row/day): 北向总成交额(沪/深股通). Post
 # 2024-08-19 its north_money column is TURNOVER, not net flow — see
@@ -20,14 +22,30 @@ from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day, trad
 ENDPOINTS = ("daily", "adj_factor", "hk_hold", "moneyflow_hsgt")
 
 
-def main(lookback_days: int = 10, cache_dir: str = CACHE_DIR) -> None:
-    today = dt.date.today()
-    start = today - dt.timedelta(days=lookback_days)
-    pro = tushare_pro()
-    cal = pro.trade_cal(
-        exchange="SSE", start_date=start.strftime("%Y%m%d"), end_date=today.strftime("%Y%m%d")
+def main(
+    lookback_days: int = 10,
+    cache_dir: str = CACHE_DIR,
+    *,
+    today: dt.date | None = None,
+) -> None:
+    current_day = today or dt.date.today()
+    start = current_day - dt.timedelta(days=lookback_days)
+    month_start = current_day.replace(day=1)
+    month_end = current_day.replace(
+        day=calendar.monthrange(current_day.year, current_day.month)[1]
     )
-    days = trading_days_from_cal(cal)
+    pro = tushare_pro()
+    cal = fetch_trade_cal(
+        pro,
+        month_start.strftime("%Y%m%d"),
+        month_end.strftime("%Y%m%d"),
+        cache_dir,
+        strict=True,
+    )
+    assert cal is not None
+    end = current_day.strftime("%Y%m%d")
+    first = start.strftime("%Y%m%d")
+    days = [day for day in trading_days_from_cal(cal) if first <= day <= end]
     print(f"refresh: 检查 {len(days)} 个交易日 {days[0] if days else '-'}..{days[-1] if days else '-'}", flush=True)
 
     new_files = 0

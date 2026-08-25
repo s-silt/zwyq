@@ -190,6 +190,8 @@ def test_ordinary_trading_day_is_not_due_and_writes_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     decision = write_valid_review_fixture(tmp_path, as_of="20260129")
+    calendar = tmp_path / "data/cache/trade_cal/202601.parquet"
+    calendar.replace(calendar.with_name("20260101_20260131.parquet"))
     state = tmp_path / "data/decisions/c2_review_state.json"
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
     assert not state.exists()

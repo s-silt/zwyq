@@ -17,6 +17,14 @@ def _january_calendar() -> pd.DataFrame:
     })
 
 
+def _cross_month_calendar() -> pd.DataFrame:
+    days = pd.date_range("2025-12-01", "2026-01-31")
+    return pd.DataFrame({
+        "cal_date": [day.strftime("%Y%m%d") for day in days],
+        "is_open": [int(day.weekday() < 5) for day in days],
+    })
+
+
 class _FakePro:
     def __init__(self, calendar: pd.DataFrame) -> None:
         self.calendar = calendar
@@ -24,7 +32,10 @@ class _FakePro:
 
     def trade_cal(self, **kwargs) -> pd.DataFrame:
         self.calendar_calls.append(kwargs)
-        return self.calendar
+        dates = self.calendar["cal_date"].astype(str)
+        return self.calendar.loc[
+            (dates >= kwargs["start_date"]) & (dates <= kwargs["end_date"])
+        ]
 
 
 @pytest.mark.parametrize(("today", "expected_month_end"), [
@@ -61,6 +72,53 @@ def test_refresh_persists_full_month_calendar_without_fetching_future_market_day
     expected_days = [
         day.strftime("%Y%m%d")
         for day in pd.date_range(lookback_start, today.strftime("%Y%m%d"))
+        if day.weekday() < 5
+    ]
+    assert market_calls == [
+        (endpoint, day) for day in expected_days for endpoint in refresh.ENDPOINTS
+    ]
+
+
+def test_early_month_refresh_preserves_cross_month_market_lookback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    today = dt.date(2026, 1, 3)
+    pro = _FakePro(_cross_month_calendar())
+    market_calls: list[tuple[str, str]] = []
+    cache = tmp_path / "data/cache"
+    monkeypatch.setattr(refresh, "tushare_pro", lambda: pro)
+    monkeypatch.setattr(
+        refresh,
+        "fetch_market_day",
+        lambda pro, endpoint, day, cache_dir: market_calls.append((endpoint, day)),
+    )
+
+    refresh.main(10, str(cache), today=today)
+
+    assert (cache / "trade_cal/20251201_20251231.parquet").is_file()
+    assert (cache / "trade_cal/20260101_20260131.parquet").is_file()
+    assert pro.calendar_calls == [
+        {"exchange": "SSE", "start_date": "20251201", "end_date": "20251231"},
+        {"exchange": "SSE", "start_date": "20260101", "end_date": "20260131"},
+    ]
+    assert _is_month_end(tmp_path, "20260102") is False
+    expected_days = [
+        day.strftime("%Y%m%d")
+        for day in pd.date_range("2025-12-24", "2026-01-03")
+        if day.weekday() < 5
+    ]
+    assert market_calls == [
+        (endpoint, day) for day in expected_days for endpoint in refresh.ENDPOINTS
+    ]
+
+    market_calls.clear()
+    refresh.main(10, str(cache), today=dt.date(2026, 1, 4))
+
+    assert len(pro.calendar_calls) == 2
+    expected_days = [
+        day.strftime("%Y%m%d")
+        for day in pd.date_range("2025-12-25", "2026-01-04")
         if day.weekday() < 5
     ]
     assert market_calls == [

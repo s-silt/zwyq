@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from ashare_gauntlet.data.fetch import TokenExpiredError
-from scripts.backfill import days_to_pull, fetch_trade_cal
+from scripts.backfill import TradeCalendarUnavailableError, days_to_pull, fetch_trade_cal
 
 
 def _cal(rows: list[tuple[str, int]]) -> pd.DataFrame:
@@ -102,3 +102,61 @@ def test_fetch_trade_cal_token_expired_propagates(tmp_path):
     pro = _FakePro(error=Exception("您的token已过期"))
     with pytest.raises(TokenExpiredError):
         fetch_trade_cal(pro, "20260628", "20260629", str(tmp_path))
+
+
+def test_strict_invalid_fresh_calendar_is_not_cached_and_can_recover(tmp_path):
+    days = pd.date_range("2026-01-01", "2026-01-31")
+    complete = _cal([
+        (day.strftime("%Y%m%d"), int(day.weekday() < 5)) for day in days
+    ])
+
+    class RecoveringPro:
+        def __init__(self):
+            self.calls = 0
+
+        def trade_cal(self, **kwargs):
+            self.calls += 1
+            return complete.iloc[:-1] if self.calls == 1 else complete
+
+    pro = RecoveringPro()
+    target = tmp_path / "trade_cal/20260101_20260131.parquet"
+
+    with pytest.raises(TradeCalendarUnavailableError, match="未覆盖区间内全部自然日"):
+        fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert not target.exists()
+    recovered = fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+    assert recovered is not None
+    assert pro.calls == 2
+    assert target.is_file()
+
+
+def test_strict_invalid_cached_calendar_recovers_without_losing_failed_evidence(tmp_path):
+    days = pd.date_range("2026-01-01", "2026-01-31")
+    complete = _cal([
+        (day.strftime("%Y%m%d"), int(day.weekday() < 5)) for day in days
+    ])
+    target = tmp_path / "trade_cal/20260101_20260131.parquet"
+    target.parent.mkdir(parents=True)
+    complete.iloc[:-1].to_parquet(target, index=False)
+    invalid_bytes = target.read_bytes()
+
+    class RecoveringPro:
+        def __init__(self):
+            self.calls = 0
+
+        def trade_cal(self, **kwargs):
+            self.calls += 1
+            return complete.iloc[:-1] if self.calls == 1 else complete
+
+    pro = RecoveringPro()
+
+    with pytest.raises(TradeCalendarUnavailableError, match="未覆盖区间内全部自然日"):
+        fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert pro.calls == 1
+    assert target.read_bytes() == invalid_bytes
+    recovered = fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+    assert recovered is not None
+    assert pro.calls == 2
+    assert len(pd.read_parquet(target)) == 31

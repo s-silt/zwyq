@@ -12,6 +12,8 @@ import datetime as dt
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 from ashare_gauntlet.config import CACHE_DIR, tushare_pro
 from ashare_gauntlet.data.fetch import TokenExpiredError, fetch_market_day, trading_days_from_cal
 from scripts.backfill import fetch_trade_cal
@@ -31,21 +33,29 @@ def main(
     current_day = today or dt.date.today()
     start = current_day - dt.timedelta(days=lookback_days)
     month_start = current_day.replace(day=1)
-    month_end = current_day.replace(
-        day=calendar.monthrange(current_day.year, current_day.month)[1]
-    )
     pro = tushare_pro()
-    cal = fetch_trade_cal(
-        pro,
-        month_start.strftime("%Y%m%d"),
-        month_end.strftime("%Y%m%d"),
-        cache_dir,
-        strict=True,
-    )
-    assert cal is not None
+    calendars: list[pd.DataFrame] = []
+    calendar_month = start.replace(day=1)
+    while calendar_month <= month_start:
+        calendar_end = calendar_month.replace(
+            day=calendar.monthrange(calendar_month.year, calendar_month.month)[1]
+        )
+        cal = fetch_trade_cal(
+            pro,
+            calendar_month.strftime("%Y%m%d"),
+            calendar_end.strftime("%Y%m%d"),
+            cache_dir,
+            strict=True,
+        )
+        assert cal is not None
+        calendars.append(cal)
+        calendar_month = calendar_end + dt.timedelta(days=1)
+    combined_calendar = pd.concat(calendars, ignore_index=True)
     end = current_day.strftime("%Y%m%d")
     first = start.strftime("%Y%m%d")
-    days = [day for day in trading_days_from_cal(cal) if first <= day <= end]
+    days = [
+        day for day in trading_days_from_cal(combined_calendar) if first <= day <= end
+    ]
     print(f"refresh: 检查 {len(days)} 个交易日 {days[0] if days else '-'}..{days[-1] if days else '-'}", flush=True)
 
     new_files = 0

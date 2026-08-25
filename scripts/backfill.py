@@ -13,7 +13,9 @@ import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Sequence
 
 import pandas as pd
@@ -114,7 +116,7 @@ def fetch_trade_cal(
         )
         if df.empty:
             raise RuntimeError(f"trade_cal returned 0 rows for {start}..{end}")
-        return df
+        return _validate_trade_cal(df, start, end)
 
     try:
         cal = read_or_fetch(path, _pull)
@@ -137,7 +139,27 @@ def fetch_trade_cal(
     except TradeCalendarUnavailableError as exc:
         message = f"{exc}(在 {path})"
         if strict:
-            raise TradeCalendarUnavailableError(message) from exc
+            try:
+                recovered = _pull()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handle, temporary_name = tempfile.mkstemp(
+                    prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+                )
+                os.close(handle)
+                temporary = Path(temporary_name)
+                try:
+                    recovered.to_parquet(temporary, index=False)
+                    os.replace(temporary, path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                return recovered
+            except TokenExpiredError:
+                raise
+            except Exception as recovery_exc:  # noqa: BLE001 - preserve invalid cache.
+                raise TradeCalendarUnavailableError(
+                    f"{message}; recovery unavailable: "
+                    f"{type(recovery_exc).__name__}: {recovery_exc}"
+                ) from recovery_exc
         print(f"warning: {message}—— 回退区间内全自然日逐日试错", flush=True)
         return None
 

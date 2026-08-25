@@ -358,6 +358,49 @@ def test_run_step_code_timeout_reaps_process_before_joining_reader(monkeypatch):
     assert tail.splitlines() == ["超时(>3s): line 7", "line 8", "line 9"]
 
 
+def test_run_step_code_timeout_does_not_wait_forever_for_inherited_pipe(monkeypatch):
+    join_calls = []
+
+    class ReapedProcess:
+        def __init__(self):
+            self.stdout = []
+            self.wait_calls = []
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise eod_ops.subprocess.TimeoutExpired("fake", timeout)
+            return -9
+
+        def kill(self):
+            pass
+
+    process = ReapedProcess()
+
+    class PipeHeldOpenReader:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            join_calls.append(timeout)
+            if timeout is None:
+                raise AssertionError("unbounded reader join would wait forever for pipe EOF")
+
+    monkeypatch.setattr(eod_ops.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(eod_ops.threading, "Thread", PipeHeldOpenReader)
+
+    code, tail = eod_ops.run_step_code(["fake"], timeout=3, echo=False)
+
+    assert code == 1
+    assert tail.startswith("超时(>3s):")
+    assert process.wait_calls == [3, None]
+    assert join_calls == [5]
+
+
 def test_c2_runs_before_factcheck_probe_with_each_step_once(
     tmp_path, monkeypatch,
 ):

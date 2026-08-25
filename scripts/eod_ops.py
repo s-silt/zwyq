@@ -74,7 +74,7 @@ def run_step_code(args: list[str], *, timeout: int = STEP_TIMEOUT,
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        reader.join()
+        reader.join(timeout=5)
         return 1, f"超时(>{timeout}s): " + "\n".join(list(tail)[-3:])
     reader.join(timeout=5)
     return code, "\n".join(tail)

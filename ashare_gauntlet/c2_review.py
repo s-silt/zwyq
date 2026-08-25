@@ -45,6 +45,14 @@ class C2ReviewError(ValueError):
     """The C2 state or review evidence violates the persisted contract."""
 
 
+def next_outside_streak(previous: int, *, inside: bool) -> int:
+    if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
+        raise C2ReviewError("previous streak must be a non-negative integer")
+    if not isinstance(inside, bool):
+        raise C2ReviewError("inside must be a boolean")
+    return 0 if inside else min(CONFIRMATIONS_REQUIRED, previous + 1)
+
+
 def initial_state() -> dict[str, object]:
     return {
         "schema": SCHEMA,
@@ -470,7 +478,10 @@ def advance_review(state: dict, evidence: dict) -> tuple[dict, dict]:
         prior = prior_positions.get(code)
         if observation_status == "OUTSIDE":
             prior_status = prior["status"] if prior else "CLEAR"
-            streak = min((prior["out_streak"] if prior else 0) + 1, CONFIRMATIONS_REQUIRED)
+            streak = next_outside_streak(
+                prior["out_streak"] if prior else 0,
+                inside=False,
+            )
             next_status = "EXIT_ELIGIBLE" if streak == CONFIRMATIONS_REQUIRED else "WATCH"
             first_out = prior["first_out_as_of"] if prior else evidence["as_of"]
             eligible_as_of = prior["exit_eligible_as_of"] if prior else None

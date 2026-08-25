@@ -27,6 +27,23 @@ def outside(code: str = "A", name: str = "甲") -> dict:
     return {"ts_code": code, "name": name, "status": "OUTSIDE"}
 
 
+def test_next_outside_streak_caps_at_confirmation_and_clears() -> None:
+    from ashare_gauntlet.c2_review import next_outside_streak
+
+    assert next_outside_streak(0, inside=False) == 1
+    assert next_outside_streak(1, inside=False) == 2
+    assert next_outside_streak(2, inside=False) == 2
+    assert next_outside_streak(1, inside=True) == 0
+
+
+@pytest.mark.parametrize("previous", [True, -1, 1.0, "1"])
+def test_next_outside_streak_rejects_invalid_previous(previous: object) -> None:
+    from ashare_gauntlet.c2_review import next_outside_streak
+
+    with pytest.raises(C2ReviewError, match="non-negative integer"):
+        next_outside_streak(previous, inside=False)  # type: ignore[arg-type]
+
+
 def test_two_valid_outside_reviews_make_exit_eligible() -> None:
     first, first_events = advance_review(initial_state(), evidence(
         "202601", "20260130", [{"ts_code": "A", "name": "甲", "status": "OUTSIDE"}]))

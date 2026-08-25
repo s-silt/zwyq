@@ -1,4 +1,4 @@
-# fxapk / A-share decision tools
+# ashare-gauntlet
 
 ## Daily brief and C2 review
 

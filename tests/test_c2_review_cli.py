@@ -275,6 +275,38 @@ def test_state_output_cannot_equal_source_path(tmp_path: Path) -> None:
     assert decision.read_bytes() == before
 
 
+@pytest.mark.parametrize("protected_relative", [
+    "data/holdings.json",
+    "data/profile.json",
+    "data/trading_policy.json",
+    "data/cache/daily/20260130.parquet",
+    "data/holdscore/20260130_factor.json",
+    "data/decisions/20261231_buy_decisions.json",
+])
+def test_state_output_rejects_protected_runtime_targets_before_reading_them(
+    tmp_path: Path,
+    protected_relative: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    protected = tmp_path / protected_relative
+    protected.parent.mkdir(parents=True, exist_ok=True)
+    if not protected.exists():
+        protected.write_bytes(b"synthetic protected runtime bytes")
+    before = protected.read_bytes()
+
+    assert _run([
+        "--root", str(tmp_path),
+        "--decision", str(decision),
+        "--state", protected_relative,
+    ]) == 1
+
+    assert protected.read_bytes() == before
+    summary = _last_summary(capsys)
+    assert summary["status"] == "ERROR"
+    assert "protected state output target" in summary["error"]
+
+
 def test_corrupt_existing_state_is_preserved_byte_for_byte(tmp_path: Path) -> None:
     decision = write_valid_review_fixture(tmp_path)
     state = tmp_path / "data/decisions/c2_review_state.json"
@@ -340,6 +372,24 @@ def test_same_period_identical_hashes_are_idempotent_without_calendar(tmp_path: 
     (tmp_path / "data/cache/trade_cal/202601.parquet").unlink()
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
     assert state.read_bytes() == before
+
+
+def test_second_review_replay_does_not_repeat_newly_exit_eligible(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = write_valid_review_fixture(tmp_path, as_of="20260130", outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(first)]) == 0
+    second = write_valid_review_fixture(tmp_path, as_of="20260227", outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(second)]) == 2
+    state = tmp_path / "data/decisions/c2_review_state.json"
+    before = state.read_bytes()
+
+    assert _run(["--root", str(tmp_path), "--decision", str(second)]) == 0
+
+    assert state.read_bytes() == before
+    summary = _last_summary(capsys)
+    assert summary["status"] == "IDEMPOTENT"
+    assert summary["newly_exit_eligible"] == []
 
 
 @pytest.mark.parametrize("changed_source", ["decision", "factor"])
@@ -417,6 +467,28 @@ def test_immediate_exit_reasons_bypass_factor_and_clear_watch(
     state = json.loads((tmp_path / "data/decisions/c2_review_state.json").read_text("utf-8"))
     assert "A" not in state["positions"]
     assert state["reviews"][-1]["transitions"][0]["action"] == "BYPASS"
+
+
+@pytest.mark.parametrize("reason", [
+    "GOVERNANCE_RED", "RISK_LINE_BREACH", "MANUAL_LOGIC_FAIL",
+])
+def test_hold_rows_with_exit_metadata_remain_factor_derived(
+    tmp_path: Path, reason: str,
+) -> None:
+    first = write_valid_review_fixture(tmp_path, as_of="20260130", outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(first)]) == 0
+    holds = [{
+        "ts_code": "A", "name": "Alpha", "state": "HOLD", "reason_codes": [reason],
+    }]
+    second = write_valid_review_fixture(
+        tmp_path, as_of="20260227", outside={"A"}, decisions=holds,
+    )
+
+    assert _run(["--root", str(tmp_path), "--decision", str(second)]) == 2
+
+    state = json.loads((tmp_path / "data/decisions/c2_review_state.json").read_text("utf-8"))
+    assert state["positions"]["A"]["status"] == "EXIT_ELIGIBLE"
+    assert state["reviews"][-1]["transitions"][0]["action"] == "OUTSIDE_CONFIRMED"
 
 
 @pytest.mark.parametrize(("decile", "expected_code", "expected_status"), [

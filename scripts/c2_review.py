@@ -61,6 +61,21 @@ def _resolve_under_root(root: Path, value: str | Path) -> Path:
     return _inside_root(root, path if path.is_absolute() else root / path)
 
 
+def _validate_state_target(root: Path, state_path: Path) -> None:
+    relative = state_path.relative_to(root.resolve())
+    parts = tuple(part.casefold() for part in relative.parts)
+    fixed = {
+        ("data", "holdings.json"),
+        ("data", "profile.json"),
+        ("data", "trading_policy.json"),
+    }
+    protected_namespace = len(parts) >= 2 and parts[:2] in {
+        ("data", "cache"), ("data", "holdscore"),
+    }
+    if parts in fixed or protected_namespace or _DECISION_RE.fullmatch(state_path.name):
+        raise C2ReviewError(f"protected state output target: {relative.as_posix()}")
+
+
 def _real_date(value: Any, label: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"\d{8}", value):
         raise C2ReviewError(f"{label} must be a real YYYYMMDD date")
@@ -257,7 +272,7 @@ def _observations(decision: dict, factor_rows: list[dict]) -> list[dict]:
     for code in sorted(held):
         row = held[code]
         reasons = set(row["reason_codes"])
-        if reasons & _IMMEDIATE_BYPASS_REASONS:
+        if row["state"] == "EXIT" and reasons & _IMMEDIATE_BYPASS_REASONS:
             status = "BYPASS"
         else:
             status = "INSIDE" if factors.get(code) == 10 else "OUTSIDE"
@@ -378,6 +393,7 @@ def _run(args: argparse.Namespace) -> tuple[dict, int]:
     state_path = _resolve_under_root(
         root, args.state or "data/decisions/c2_review_state.json",
     )
+    _validate_state_target(root, state_path)
     if state_path == decision_path:
         raise C2ReviewError("state output path must differ from source input")
 
@@ -424,15 +440,12 @@ def _run(args: argparse.Namespace) -> tuple[dict, int]:
             ) from exc
         if existing["factor_snapshot"]["sha256"] != factor_hash:
             raise _ReviewConflict(f"valid review conflict for period {period}")
-        newly = sorted(
-            transition["ts_code"] for transition in existing["transitions"]
-            if transition["action"] == "OUTSIDE_CONFIRMED"
-        )
         return {
             "status": "IDEMPOTENT",
             "period": period,
             "as_of": as_of,
-            "newly_exit_eligible": newly,
+            "newly_exit_eligible": [],
+            "eligible_codes": sorted(eligible_codes(state)),
         }, 0
 
     try:

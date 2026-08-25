@@ -236,6 +236,48 @@ def test_unrelated_corrupt_historical_calendar_shard_does_not_block_review(
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
 
 
+def test_unrelated_corrupt_calendar_range_shard_does_not_block_review(
+    tmp_path: Path,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    (tmp_path / "data/cache/trade_cal/20240101_20240131.parquet").write_bytes(
+        b"not parquet"
+    )
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+
+
+def test_covering_calendar_range_shard_alone_proves_review_month(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    monthly = tmp_path / "data/cache/trade_cal/202601.parquet"
+    monthly.replace(tmp_path / "data/cache/trade_cal/20260101_20260131.parquet")
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+
+
+def test_malformed_calendar_range_name_cannot_contribute_coverage(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    monthly = tmp_path / "data/cache/trade_cal/202601.parquet"
+    monthly.replace(tmp_path / "data/cache/trade_cal/20261301_20261331.parquet")
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+@pytest.mark.parametrize(("stem", "expected"), [
+    ("202601", ("20260101", "20260131")),
+    ("20260130", ("20260130", "20260130")),
+    ("20251215_20260115", ("20251215", "20260115")),
+    ("20260131_20260101", None),
+    ("202613", None),
+    ("20260230", None),
+    ("20260101_20260230", None),
+    ("trade_cal", None),
+])
+def test_calendar_shard_span_recognizes_only_real_declared_ranges(
+    stem: str, expected: tuple[str, str] | None,
+) -> None:
+    from scripts.c2_review import _calendar_shard_span
+
+    assert _calendar_shard_span(stem) == expected
+
+
 def test_impossible_decision_date_is_rejected(tmp_path: Path) -> None:
     decision = tmp_path / "data/decisions/20260230_buy_decisions.json"
     _write_json(decision, {"as_of": "20260230", "factor_snapshot": "x", "decisions": []})
@@ -344,6 +386,25 @@ def test_core_trade_date_requires_actual_matching_nonblank_strings(
     frame["trade_date"] = bad_date
     frame.to_parquet(path, index=False)
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+def test_daily_basic_allows_nullable_numeric_valuation_fields(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    path = tmp_path / "data/cache/daily_basic/20260130.parquet"
+    frame = pd.read_parquet(path)
+    frame["pe_ttm"] = float("nan")
+    frame["pb"] = float("nan")
+    frame.to_parquet(path, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+
+
+def test_daily_all_ohlc_null_row_is_valid_suspension_evidence(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    path = tmp_path / "data/cache/daily/20260130.parquet"
+    frame = pd.read_parquet(path)
+    frame[["open", "high", "low", "close"]] = float("nan")
+    frame.to_parquet(path, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
 
 
 @pytest.mark.parametrize("rows", [

@@ -115,6 +115,26 @@ def _relative_path(root: Path, path: Path) -> str:
     return path.relative_to(root.resolve()).as_posix()
 
 
+def _calendar_shard_span(stem: str) -> tuple[str, str] | None:
+    try:
+        if re.fullmatch(r"\d{6}", stem):
+            parsed = datetime.strptime(stem, "%Y%m")
+            last = calendar.monthrange(parsed.year, parsed.month)[1]
+            return f"{stem}01", f"{stem}{last:02d}"
+        if re.fullmatch(r"\d{8}", stem):
+            datetime.strptime(stem, "%Y%m%d")
+            return stem, stem
+        match = re.fullmatch(r"(\d{8})_(\d{8})", stem)
+        if match is not None:
+            start, end = match.groups()
+            datetime.strptime(start, "%Y%m%d")
+            datetime.strptime(end, "%Y%m%d")
+            return (start, end) if start <= end else None
+    except ValueError:
+        return None
+    return None
+
+
 def _is_month_end(root: Path, as_of: str) -> bool:
     """Require cached calendar through calendar month end, then compare last open day."""
     checked = _real_date(as_of, "as_of")
@@ -125,10 +145,8 @@ def _is_month_end(root: Path, as_of: str) -> bool:
     directory = _inside_root(root, root / "data/cache/trade_cal")
     paths: list[Path] = []
     for path in sorted(directory.glob("*.parquet")) if directory.exists() else []:
-        stem = path.stem
-        if re.fullmatch(r"\d{6}", stem) and stem != checked[:6]:
-            continue
-        if re.fullmatch(r"\d{8}", stem) and stem[:6] != checked[:6]:
+        span = _calendar_shard_span(path.stem)
+        if span is None or span[1] < first or span[0] > final:
             continue
         paths.append(path)
     if not paths:
@@ -223,7 +241,7 @@ def _validate_core(cache: Path, as_of: str) -> None:
                     f"{column}: {endpoint}/{as_of}"
                 )
             values = pd.to_numeric(source, errors="raise")
-            if not all(math.isfinite(float(value)) for value in values):
+            if not all(math.isfinite(float(value)) for value in values.dropna()):
                 raise C2ReviewError(
                     f"core endpoint numeric field must be finite: {column}: {endpoint}/{as_of}"
                 )

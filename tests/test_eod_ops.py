@@ -240,6 +240,61 @@ def test_core_failure_does_not_invoke_c2_and_returns_one(tmp_path, monkeypatch):
     assert all("scripts.c2_review" not in args for args in calls)
 
 
+def test_buy_list_failure_after_writing_snapshot_stops_all_downstream(
+    tmp_path, monkeypatch, capsys,
+):
+    """失败步骤留下的降级快照不得触发 C2、diff 或 fact-check。"""
+    monkeypatch.chdir(tmp_path)
+    decision_dir = tmp_path / "data" / "decisions"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "20260826_buy_decisions.json"
+    calls: list[list[str]] = []
+
+    def fail_buy_list_after_write(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["-m", "scripts.buy_list"]:
+            decision_path.write_text(json.dumps({
+                "as_of": "20260826",
+                "decisions": [
+                    {
+                        "ts_code": "1.SZ",
+                        "name": "甲",
+                        "state": "BUY",
+                        "reason_codes": ["D10", "TIER_GREEN", "FACTCHECK_CLEAR"],
+                        "execution": {"shares": 100, "max_entry_price": 10.0},
+                    },
+                    {
+                        "ts_code": "2.SZ",
+                        "name": "乙",
+                        "state": "WAIT",
+                        "reason_codes": [
+                            "FACTCHECK_REQUIRED",
+                            "EXIT_RULE_C2_MONTHLY",
+                        ],
+                    },
+                ],
+            }), encoding="utf-8")
+            return 1, "degraded snapshot written"
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", fail_buy_list_after_write)
+
+    with pytest.raises(SystemExit) as exc:
+        eod_ops.main([])
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 1
+    assert calls == [
+        ["-m", "scripts.refresh"],
+        ["-m", "scripts.factor_rank"],
+        ["-m", "scripts.buy_list"],
+    ]
+    assert "buy_list 失败: degraded snapshot written" in out
+    assert "BUY 出现" not in out
+    assert "新增待 fact-check" not in out
+    assert "[C2 观察]" not in out
+
+
 def test_refresh_token_expiry_stops_eod_before_downstream(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data" / "decisions").mkdir(parents=True)

@@ -240,7 +240,7 @@ def main(argv: "list[str] | None" = None) -> None:
             alerts.append(f"C2 月度审视数据失败(退出码 {code}): {tail}")
             c2_failed = True
 
-    if snapshot_changed:
+    if not pipeline_failed and snapshot_changed:
         alerts.extend(diff_alerts(prev_snapshot, new_snapshot))
         pending_new = (pending_factcheck_set(new_snapshot)
                        - (pending_factcheck_set(prev_snapshot) if prev_snapshot else set()))
@@ -255,7 +255,7 @@ def main(argv: "list[str] | None" = None) -> None:
 
     # C2 观察名单按状态行打印(不进 alerts、不改退出码):集合没变就不该催人行动,
     # 但也不能让它彻底隐身——把它推进到"退出"的资格只属于月度审视例行 + 人工终判
-    watching = c2_watch_set(new_snapshot)
+    watching = c2_watch_set(new_snapshot) if not pipeline_failed else set()
     if watching:
         print(f"[C2 观察] {len(watching)} 只跌出 D10 待月度审视: {','.join(sorted(watching))}")
 

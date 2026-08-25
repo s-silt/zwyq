@@ -56,10 +56,97 @@ def _setup_root(tmp_path: Path, *, decisions, as_of=AS_OF, holdings=None,
     _dump(tmp_path / f"data/holdscore/{as_of}_factor.json", [])
     _dump(tmp_path / f"data/decisions/{as_of}_buy_decisions.json", {
         "as_of": as_of, "data_status": "complete",
-        "generated_at": "2026-08-18T17:40:00+08:00", "decisions": decisions})
+        "generated_at": "2026-08-18T17:40:00+08:00",
+        "c2_state": {
+            "status": "NOT_INITIALIZED",
+            "last_valid_review_as_of": None,
+            "watch": [], "exit_eligible": [], "error": None,
+        },
+        "decisions": decisions})
     if account_state is not None:
         _dump(tmp_path / f"data/account_state/{as_of}_account_state.json", account_state)
     return tmp_path
+
+
+def test_brief_consumes_c2_watch_blocked_and_confirmed_exit(tmp_path: Path) -> None:
+    decisions = [_decision("000001.SZ", "EXIT",
+                           reason_codes=["EXIT_RULE_C2_CONFIRMED"])]
+    root = _setup_root(tmp_path, decisions=decisions)
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["c2_state"] = {
+        "status": "REVIEW_BLOCKED_DATA",
+        "last_valid_review_as_of": "20260130",
+        "watch": ["600000.SH"],
+        "exit_eligible": ["000001.SZ"],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "REVIEW_BLOCKED_DATA"
+    assert [row["ts_code"] for row in c2["members"]] == ["600000.SH"]
+    assert c2["error"] == "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING"
+    assert c2["last_valid_review_as_of"] == "20260130"
+    assert "streak" in c2["reason"]
+    assert [row["ts_code"] for row in brief["machine"]["exits"]] == ["000001.SZ"]
+    assert any("EXIT 信号" in item and "000001.SZ" in item for item in brief["next_actions"])
+
+
+def test_brief_keeps_watch_informational_and_surfaces_unavailable(tmp_path: Path) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["data_status"] = "degraded"
+    snapshot["c2_state"] = {
+        "status": "UNAVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_INVALID_SCHEMA",
+    }
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "UNAVAILABLE"
+    assert "数据不可用" in c2["reason"]
+    assert brief["machine"]["exits"] == []
+    assert not any("C2" in item for item in brief["next_actions"])
+
+
+def test_brief_missing_c2_state_is_not_initialized(tmp_path: Path) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot.pop("c2_state")
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["machine"]["c2_watch"]["status"] == "NOT_INITIALIZED"
+    assert "尚未初始化" in brief["machine"]["c2_watch"]["reason"]
+
+
+def test_brief_available_watch_is_informational_only(tmp_path: Path) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["c2_state"] = {
+        "status": "AVAILABLE",
+        "last_valid_review_as_of": "20260130",
+        "watch": ["600000.SH"], "exit_eligible": [], "error": None,
+    }
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "AVAILABLE"
+    assert c2["watch"] == ["600000.SH"]
+    assert brief["machine"]["exits"] == []
+    assert not any("600000.SH" in item and "EXIT" in item for item in brief["next_actions"])
 
 
 def test_machine_states_read_verbatim_and_dividend_overlay(tmp_path: Path) -> None:

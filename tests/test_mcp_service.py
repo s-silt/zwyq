@@ -159,6 +159,35 @@ def _decision_snapshot(state: str = "WAIT", max_entry_price=None) -> dict:
     }
 
 
+def _write_ready_service_fixture(
+    root: Path, *, c2_state: dict, data_status: str = "complete",
+) -> None:
+    for endpoint in ("daily", "adj_factor", "daily_basic", "stk_limit"):
+        path = root / "data/cache" / endpoint / "20260807.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    dump(root / "data/holdscore/20260807_factor.json", [])
+    snapshot = _decision_snapshot()
+    snapshot["data_status"] = data_status
+    snapshot["c2_state"] = c2_state
+    dump(root / "data/decisions/20260807_buy_decisions.json", snapshot)
+    dump(root / "data/holdings.json", {
+        "as_of": "20260807", "cash": 1000, "positions": [],
+        "conditional_orders": {
+            "schema_version": 2,
+            "orders": [{
+                "order_id": "ord-001", "ts_code": "000001.SZ", "side": "BUY",
+                "condition": {"field": "close", "operator": "<="},
+                "price": 10.5, "shares": 100, "valid_from": "20260801",
+                "valid_until": "20260831", "status": "active",
+            }],
+        },
+    })
+    dump(root / "data/trading_policy.json", {})
+    dump(root / "data/profile.json", {})
+    dump(root / "data/factcheck_overrides.json", {"overrides": []})
+
+
 def test_latest_decisions_validates_snapshot_contract(tmp_path: Path) -> None:
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", _decision_snapshot())
     assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
@@ -307,6 +336,22 @@ def test_latest_decisions_accepts_consumable_c2_projection(
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
 
     assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
+
+
+def test_latest_decisions_projects_c2_state_and_status(tmp_path: Path) -> None:
+    c2_state = {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260731",
+        "watch": ["001218.SZ"], "exit_eligible": [],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    result = svc.latest_decisions(tmp_path, summary_only=True)
+
+    assert result["c2_status"] == "REVIEW_BLOCKED_DATA"
+    assert result["c2_state"] == c2_state
 
 
 def test_latest_decisions_accepts_opaque_code_from_real_c2_state(tmp_path: Path) -> None:
@@ -588,6 +633,39 @@ def test_healthcheck_separates_operational_from_recommendation_readiness(tmp_pat
     assert readiness["ready"] is False
     assert "ACCOUNT_AS_OF_STALE" in readiness["blockers"]
     assert "CONDITIONAL_ORDERS_UNVERIFIED" in readiness["blockers"]
+
+
+def test_healthcheck_blocks_review_blocked_c2_snapshot(tmp_path: Path) -> None:
+    c2_state = {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260731",
+        "watch": ["001218.SZ"], "exit_eligible": [],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }
+    _write_ready_service_fixture(tmp_path, c2_state=c2_state)
+
+    readiness = svc.healthcheck(tmp_path)["recommendation_readiness"]
+
+    assert readiness["ready"] is False
+    assert "C2_REVIEW_BLOCKED_DATA" in readiness["blockers"]
+    assert readiness["components"]["decision"]["c2_status"] == "REVIEW_BLOCKED_DATA"
+
+
+def test_readiness_names_unavailable_and_degraded_decision_blockers(
+    tmp_path: Path,
+) -> None:
+    c2_state = {
+        "status": "UNAVAILABLE", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_UNREADABLE",
+    }
+    _write_ready_service_fixture(
+        tmp_path, c2_state=c2_state, data_status="degraded",
+    )
+
+    readiness = svc._recommendation_readiness(tmp_path)
+
+    assert readiness["ready"] is False
+    assert "C2_REVIEW_UNAVAILABLE" in readiness["blockers"]
+    assert "DECISION_SNAPSHOT_DEGRADED" in readiness["blockers"]
 
 
 def test_maintenance_stages_run_exactly_one_allowlisted_module(

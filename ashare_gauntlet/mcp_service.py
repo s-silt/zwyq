@@ -149,6 +149,8 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
 
     factor_as_of: str | None = None
     decision_as_of: str | None = None
+    decision_data_status: str | None = None
+    c2_status: str | None = None
     factor_status = "missing"
     decision_status = "missing"
     try:
@@ -159,6 +161,15 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
     if factor_status != "ready":
         blockers.append("FACTOR_NOT_ALIGNED")
     try:
+        decision_path = latest_decision_path(root)
+        decision_snapshot = read_json(str(decision_path.relative_to(root)), root)
+        if isinstance(decision_snapshot, dict):
+            raw_data_status = decision_snapshot.get("data_status")
+            if isinstance(raw_data_status, str):
+                decision_data_status = raw_data_status
+            c2_state = decision_snapshot.get("c2_state")
+            if isinstance(c2_state, dict) and isinstance(c2_state.get("status"), str):
+                c2_status = c2_state["status"]
         decision = latest_decisions(root)
         decision_as_of = decision["as_of"]
         decision_status = "ready" if decision_as_of == factor_as_of == eod_as_of else "stale"
@@ -166,6 +177,12 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
         decision_status = "invalid"
     if decision_status != "ready":
         blockers.append("DECISION_NOT_ALIGNED")
+    if decision_data_status == "degraded":
+        blockers.append("DECISION_SNAPSHOT_DEGRADED")
+    if c2_status == "REVIEW_BLOCKED_DATA":
+        blockers.append("C2_REVIEW_BLOCKED_DATA")
+    elif c2_status == "UNAVAILABLE":
+        blockers.append("C2_REVIEW_UNAVAILABLE")
 
     account_status = "missing"
     holdings_as_of = None
@@ -219,7 +236,12 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
             "eod": {"status": eod_status, "as_of": eod_as_of,
                     "endpoint_dates": endpoint_dates},
             "factor": {"status": factor_status, "as_of": factor_as_of},
-            "decision": {"status": decision_status, "as_of": decision_as_of},
+            "decision": {
+                "status": decision_status,
+                "as_of": decision_as_of,
+                "data_status": decision_data_status,
+                "c2_status": c2_status,
+            },
             "holdings": {"status": account_status, "as_of": holdings_as_of,
                          "freshness": holdings_freshness},
             "short_slot": short_slot,
@@ -443,6 +465,8 @@ def latest_decisions(
         "as_of": snapshot["as_of"],
         "generated_at": snapshot.get("generated_at"),
         "data_status": snapshot["data_status"],
+        "c2_state": dict(snapshot["c2_state"]),
+        "c2_status": snapshot["c2_state"]["status"],
         "source_file": str(path.relative_to(root)),
         "summary": {"total": len(all_items), "state_counts": counts},
         "page": {

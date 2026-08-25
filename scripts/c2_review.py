@@ -113,8 +113,17 @@ def _sha256(raw: bytes) -> str:
 
 
 def _decision_evidence_hash(decision: dict[str, Any]) -> str:
-    """Hash canonical decision evidence, excluding the consumed C2 projection."""
-    evidence = {key: value for key, value in decision.items() if key != "c2_state"}
+    """Hash decision evidence, excluding regenerated/consumed snapshot metadata.
+
+    Raw bytes are still hashed before parsing for blocked-review audit evidence.
+    This canonical hash identifies a valid review, so an EOD rerun must not
+    conflict merely because buy_list refreshed its timestamp or C2 projection.
+    """
+    metadata_fields = {"c2_state", "generated_at"}
+    evidence = {
+        key: value for key, value in decision.items()
+        if key not in metadata_fields
+    }
     canonical = json.dumps(
         evidence,
         ensure_ascii=True,

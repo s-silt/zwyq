@@ -464,7 +464,14 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         actions.append(f"⑨ 止损与双仓制政策不符 {len(other_stop)} 只({names})"
                        "——人工核对是否抄错/写反(工具只提示不改)")
     # readiness 其余 blocker(数据/条件单等)如实列出
-    _surfaced = {"ACCOUNT_STATE_INCOMPLETE", "DECISION_NOT_ALIGNED"}
+    _surfaced = {
+        "ACCOUNT_STATE_INCOMPLETE",
+        "DECISION_NOT_ALIGNED",
+        # The dedicated C2 view already explains these states; do not turn a
+        # monthly review problem into a duplicate daily action.
+        "C2_REVIEW_BLOCKED_DATA",
+        "C2_REVIEW_UNAVAILABLE",
+    }
     for b in blockers:
         if b not in _surfaced and b != "CORE_EOD_MISSING_OR_MISALIGNED":
             actions.append(f"• readiness blocker: {b}(须人工处理后方可正式荐股)")

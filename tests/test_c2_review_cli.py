@@ -45,7 +45,10 @@ def _write_json(path: Path, payload: object) -> None:
 
 
 def _canonical_decision_hash(payload: dict) -> str:
-    evidence = {key: value for key, value in payload.items() if key != "c2_state"}
+    evidence = {
+        key: value for key, value in payload.items()
+        if key not in {"c2_state", "generated_at"}
+    }
     canonical = json.dumps(
         evidence,
         ensure_ascii=True,
@@ -668,15 +671,25 @@ def test_same_period_replay_is_idempotent_and_does_not_rewrite(
     assert _last_summary(capsys)["status"] == "IDEMPOTENT"
 
 
-def test_same_period_replay_ignores_c2_projection_only_change(
+def test_same_period_replay_ignores_regenerated_snapshot_metadata(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     decision = write_valid_review_fixture(tmp_path, outside={"A"})
+    payload = json.loads(decision.read_text("utf-8"))
+    payload.update({
+        "account_as_of": "20260130",
+        "account_source_schema": "account_state.v1",
+        "generated_at": "2026-01-30T18:00:00+08:00",
+        "policy_version": "1",
+        "entry_model_version": "entry.v1",
+    })
+    _write_json(decision, payload)
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
     state = tmp_path / "data/decisions/c2_review_state.json"
     before = state.read_bytes()
 
     payload = json.loads(decision.read_text("utf-8"))
+    payload["generated_at"] = "2026-01-30T18:05:00+08:00"
     payload["c2_state"] = {
         "status": "AVAILABLE",
         "last_valid_review_as_of": "20260130",
@@ -738,6 +751,15 @@ def test_complete_snapshot_accepts_consumable_c2_status(
 
 def test_same_period_replay_rejects_real_decision_change(tmp_path: Path) -> None:
     decision = write_valid_review_fixture(tmp_path, outside={"A"})
+    payload = json.loads(decision.read_text("utf-8"))
+    payload.update({
+        "account_as_of": "20260130",
+        "account_source_schema": "account_state.v1",
+        "generated_at": "2026-01-30T18:00:00+08:00",
+        "policy_version": "1",
+        "entry_model_version": "entry.v1",
+    })
+    _write_json(decision, payload)
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
     state = tmp_path / "data/decisions/c2_review_state.json"
     before = state.read_bytes()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -254,7 +255,143 @@ def test_no_new_snapshot_does_not_invoke_c2(tmp_path, monkeypatch):
         eod_ops.main(["--skip-probe"])
 
     assert exc.value.code == 0
-    assert all("scripts.c2_review" not in args for args in calls)
+    assert calls == [
+        ["-m", "scripts.refresh"],
+        ["-m", "scripts.factor_rank"],
+        ["-m", "scripts.buy_list"],
+    ]
+
+
+def test_same_content_atomic_snapshot_replacement_retries_c2_after_failure(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    decision_dir = tmp_path / "data" / "decisions"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "20260826_buy_decisions.json"
+    payload = json.dumps({"as_of": "20260826", "decisions": []})
+    calls: list[list[str]] = []
+    replacements = 0
+
+    def replace_snapshot() -> None:
+        nonlocal replacements
+        replacements += 1
+        temporary = decision_dir / f".tmp_buy_decisions_{replacements}.json"
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, decision_path)
+
+    def fail_c2(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["-m", "scripts.buy_list"]:
+            replace_snapshot()
+        if args[:2] == ["-m", "scripts.c2_review"]:
+            return 1, '{"status":"REVIEW_BLOCKED_DATA"}'
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", fail_c2)
+    exit_codes = []
+    for _ in range(2):
+        with pytest.raises(SystemExit) as exc:
+            eod_ops.main(["--skip-probe"])
+        exit_codes.append(exc.value.code)
+
+    c2_calls = [args for args in calls if args[:2] == ["-m", "scripts.c2_review"]]
+    assert exit_codes == [1, 1]
+    assert len(c2_calls) == 2
+    assert all(args[-1] == eod_ops.snapshot_paths()[-1] for args in c2_calls)
+
+
+def test_run_step_code_timeout_reaps_process_before_joining_reader(monkeypatch):
+    fake_threads = []
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = [f"line {i}\n" for i in range(10)]
+            self.killed = False
+            self.reaped = False
+            self.returncode = None
+            self.wait_calls = []
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise eod_ops.subprocess.TimeoutExpired("fake", timeout)
+            self.reaped = True
+            self.returncode = -9
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    process = FakeProcess()
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
+            self.completed = False
+            self.joined_after_reap = False
+            fake_threads.append(self)
+
+        def start(self):
+            pass
+
+        def join(self, timeout=None):
+            self.joined_after_reap = process.reaped
+            if process.reaped:
+                self.target()
+                self.completed = True
+
+    monkeypatch.setattr(eod_ops.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(eod_ops.threading, "Thread", FakeThread)
+
+    code, tail = eod_ops.run_step_code(["fake"], timeout=3, echo=False)
+
+    assert code == 1
+    assert process.killed is True
+    assert process.reaped is True
+    assert process.returncode == -9
+    assert process.wait_calls == [3, None]
+    assert len(fake_threads) == 1
+    assert fake_threads[0].joined_after_reap is True
+    assert fake_threads[0].completed is True
+    assert tail.splitlines() == ["超时(>3s): line 7", "line 8", "line 9"]
+
+
+def test_c2_runs_before_factcheck_probe_with_each_step_once(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    decision_dir = tmp_path / "data" / "decisions"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "20260826_buy_decisions.json"
+    calls: list[list[str]] = []
+
+    def succeed(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["-m", "scripts.buy_list"]:
+            decision_path.write_text(json.dumps({
+                "as_of": "20260826",
+                "decisions": [{
+                    "ts_code": "1.SZ",
+                    "state": "WAIT",
+                    "reason_codes": ["FACTCHECK_REQUIRED"],
+                }],
+            }), encoding="utf-8")
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", succeed)
+    with pytest.raises(SystemExit) as exc:
+        eod_ops.main([])
+
+    assert exc.value.code == 2
+    assert calls == [
+        ["-m", "scripts.refresh"],
+        ["-m", "scripts.factor_rank"],
+        ["-m", "scripts.buy_list"],
+        ["-m", "scripts.c2_review", "--decision", eod_ops.snapshot_paths()[-1]],
+        ["-m", "scripts.factcheck_probe", "--codes", "1.SZ"],
+    ]
 
 
 def test_c2_uses_new_snapshot_after_core_once_without_rerunning_buy_list(

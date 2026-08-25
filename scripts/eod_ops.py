@@ -73,7 +73,8 @@ def run_step_code(args: list[str], *, timeout: int = STEP_TIMEOUT,
         code = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        reader.join(timeout=5)
+        proc.wait()
+        reader.join()
         return 1, f"超时(>{timeout}s): " + "\n".join(list(tail)[-3:])
     reader.join(timeout=5)
     return code, "\n".join(tail)
@@ -90,6 +91,17 @@ def snapshot_paths(decision_dir: str = DECISION_DIR) -> list[str]:
     files = sorted(f for f in os.listdir(decision_dir)
                    if re.fullmatch(r"\d{8}_buy_decisions\.json", f))
     return [os.path.join(decision_dir, f) for f in files]
+
+
+def _snapshot_artifact(
+    path: "str | None",
+) -> "tuple[str, int, int, int, int, int] | None":
+    """标识一次决策产物；原子替换即使内容相同也必须可见。"""
+    if path is None:
+        return None
+    stat = os.stat(path)
+    return (path, stat.st_dev, stat.st_ino, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 def pending_factcheck_set(snapshot: dict) -> set[str]:
@@ -186,6 +198,7 @@ def main(argv: "list[str] | None" = None) -> None:
     a = ap.parse_args(argv)
 
     before = snapshot_paths()
+    before_artifact = _snapshot_artifact(before[-1] if before else None)
     prev_snapshot = None
     if before:
         prev_snapshot = json.load(open(before[-1], encoding="utf-8"))
@@ -206,10 +219,14 @@ def main(argv: "list[str] | None" = None) -> None:
     # 按内容而非文件名判断快照更新:同一交易日重跑 buy_list 会覆盖同名文件,
     # 比较路径会漏报当次新产生的 BUY/EXIT/候选变化(codex P1)
     after = snapshot_paths()
+    after_artifact = _snapshot_artifact(after[-1] if after else None)
     new_snapshot = json.load(open(after[-1], encoding="utf-8")) if after else None
+    # 单调度器/单写者假设:只在核心链前后采样。buy_list 用 os.replace,因此同内容重写
+    # 也会改变文件身份；JSON 内容比较仍只负责去重状态 alert/probe。
+    snapshot_generated = after_artifact is not None and after_artifact != before_artifact
     snapshot_changed = new_snapshot is not None and new_snapshot != prev_snapshot
     c2_failed = False
-    if core_succeeded and snapshot_changed:
+    if core_succeeded and snapshot_generated:
         code, tail = run_step_code([
             "-m", "scripts.c2_review", "--decision", after[-1],
         ])

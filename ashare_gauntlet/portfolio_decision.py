@@ -54,11 +54,13 @@ def _mk(ts: str, name: str, state: str, codes: list[str], a: "dict | None",
 def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
                   account_value: "float | None", cash: "float | None",
                   risk_breach: "set[str] | None" = None,
-                  manual_exit: "set[str] | None" = None) -> list[dict]:
+                  manual_exit: "set[str] | None" = None,
+                  c2_exit_eligible: "set[str] | None" = None) -> list[dict]:
     """候选评估 + 当前持仓 → 每只恰好一个状态的决策列表(确定性排序输出)。"""
     validate_policy(policy)
     risk_breach = risk_breach or set()
     manual_exit = manual_exit or set()
+    c2_exit_eligible = c2_exit_eligible or set()
     if len({a["ts_code"] for a in assessments}) != len(assessments):
         raise ValueError("assessments 含重复 ts_code——上游 snapshot 未去重")
     by_code = {a["ts_code"]: a for a in assessments}
@@ -76,6 +78,10 @@ def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
             codes.append("MANUAL_LOGIC_FAIL")
         if codes:
             decisions.append(_mk(ts, pos.get("name", ts), "EXIT", codes, a, _exec(0, None)))
+            continue
+        if ts in c2_exit_eligible:
+            decisions.append(_mk(ts, pos.get("name", ts), "EXIT",
+                                 ["EXIT_RULE_C2_CONFIRMED"], a, _exec(0, None)))
             continue
         hold_codes = ["HELD"]
         if a is None or not a.get("eligible_buy"):

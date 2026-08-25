@@ -1,6 +1,8 @@
 """portfolio_decision:四态生成与组合约束(spec §7/§8;确定性分配)。"""
 from __future__ import annotations
 
+from ashare_gauntlet.portfolio_decision import decide_states
+
 POLICY = {"policy_version": "1", "target_positions": 10, "target_weight": 0.10,
           "industry_cap": 0.20, "lot_size": 100, "min_cash": 0}
 
@@ -72,6 +74,49 @@ def test_held_stays_hold_without_new_buy_and_after_decile_drop():
     d = ds[0]
     assert d["state"] == "HOLD"
     assert "EXIT_RULE_C2_MONTHLY" in d["reason_codes"]
+
+
+def test_confirmed_c2_becomes_advisory_exit() -> None:
+    code = "600003.SH"
+    decisions = decide_states([_a(code, eligible=False, codes=["NOT_D10"])],
+                              {code: _held(code)}, POLICY,
+                              account_value=100_000, cash=0,
+                              c2_exit_eligible={code})
+    row = next(d for d in decisions if d["ts_code"] == code)
+    assert row["state"] == "EXIT"
+    assert row["reason_codes"] == ["EXIT_RULE_C2_CONFIRMED"]
+
+
+def test_governance_exit_precedes_confirmed_c2() -> None:
+    code = "600003.SH"
+    assessment = _a(code, eligible=False, codes=["GOVERNANCE_RED"])
+    assessment["governance_red"] = True
+    decisions = decide_states([assessment], {code: _held(code)}, POLICY,
+                              account_value=100_000, cash=0,
+                              c2_exit_eligible={code})
+    row = next(d for d in decisions if d["ts_code"] == code)
+    assert row["reason_codes"] == ["GOVERNANCE_RED"]
+
+
+def test_risk_and_manual_exit_precede_confirmed_c2() -> None:
+    code = "600003.SH"
+    assessment = _a(code, eligible=False, codes=["NOT_D10"])
+    decisions = decide_states([assessment], {code: _held(code)}, POLICY,
+                              account_value=100_000, cash=0,
+                              risk_breach={code}, manual_exit={code},
+                              c2_exit_eligible={code})
+    row = next(d for d in decisions if d["ts_code"] == code)
+    assert row["reason_codes"] == ["RISK_LINE_BREACH", "MANUAL_LOGIC_FAIL"]
+
+
+def test_confirmed_c2_applies_to_eligible_daily_assessment() -> None:
+    code = "600003.SH"
+    decisions = decide_states([_a(code, eligible=True)], {code: _held(code)}, POLICY,
+                              account_value=100_000, cash=0,
+                              c2_exit_eligible={code})
+    row = next(d for d in decisions if d["ts_code"] == code)
+    assert row["state"] == "EXIT"
+    assert row["reason_codes"] == ["EXIT_RULE_C2_CONFIRMED"]
 
 
 def test_exit_only_from_predefined_reasons():

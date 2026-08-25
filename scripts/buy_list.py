@@ -22,6 +22,7 @@ from ashare_gauntlet.account_state import (
 )
 from ashare_gauntlet.candidates import candidate_assessment, override_status
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH
+from ashare_gauntlet.c2_review import C2ReviewError, eligible_codes, validate_state
 from ashare_gauntlet.data.partition import date_partition_files
 from ashare_gauntlet.portfolio_decision import decide_states, validate_policy
 from scripts.illiq_capacity import BUCKETS, mv_terciles
@@ -35,6 +36,63 @@ REQUIRED_ROW_FIELDS = ("ts_code", "name", "industry", "decile", "tier",
                        "f_EP", "f_BP", "f_IVOL")   # 生产因子字段在场=snapshot 出自现役口径
 ENTRY_MODEL_VERSION = "research-only"   # M2 过门前不得宣称择时(spec §13)
 SIZE_BUCKET_RANK = {b: i for i, b in enumerate(BUCKETS)}   # 小0/中1/大2(X-08 接线)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant {value}")
+
+
+def _c2_projection(status: str, *, last_valid_review_as_of: str | None = None,
+                   watch: list[str] | None = None, exit_eligible: list[str] | None = None,
+                   error: str | None = None) -> dict:
+    return {
+        "status": status,
+        "last_valid_review_as_of": last_valid_review_as_of,
+        "watch": sorted(str(code) for code in (watch or [])),
+        "exit_eligible": sorted(str(code) for code in (exit_eligible or [])),
+        "error": error,
+    }
+
+
+def load_c2_projection(path: str | os.PathLike[str]) -> dict:
+    """Load and project validated C2 state without mutating the sidecar."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh, parse_constant=_reject_json_constant)
+    except FileNotFoundError:
+        return _c2_projection("NOT_INITIALIZED")
+    except (OSError, UnicodeError):
+        return _c2_projection("UNAVAILABLE", error="C2_STATE_UNREADABLE")
+    except (json.JSONDecodeError, ValueError):
+        return _c2_projection("UNAVAILABLE", error="C2_STATE_INVALID_JSON")
+
+    try:
+        validate_state(state)
+        eligible = eligible_codes(state)
+    except (C2ReviewError, TypeError, AttributeError, KeyError):
+        return _c2_projection("UNAVAILABLE", error="C2_STATE_INVALID_SCHEMA")
+
+    positions = state["positions"]
+    watch = [code for code, row in positions.items() if row["status"] == "WATCH"]
+    last_valid = state["last_valid_review_as_of"]
+    reviews = state["reviews"]
+    latest = max(enumerate(reviews), key=lambda item: (item[1]["period"], item[1]["as_of"], item[0]),
+                 default=None)
+    if latest is not None and latest[1]["status"] == "REVIEW_BLOCKED_DATA":
+        issues = sorted(str(issue) for issue in latest[1]["issues"])
+        return _c2_projection(
+            "REVIEW_BLOCKED_DATA",
+            last_valid_review_as_of=last_valid,
+            watch=watch,
+            exit_eligible=eligible,
+            error="REVIEW_BLOCKED_DATA:" + ",".join(issues),
+        )
+    return _c2_projection(
+        "AVAILABLE",
+        last_valid_review_as_of=last_valid,
+        watch=watch,
+        exit_eligible=eligible,
+    )
 
 
 def size_tercile_ranks(rows: list[dict]) -> "dict[str, tuple[int, str]]":
@@ -200,10 +258,18 @@ def main(argv: list[str] | None = None) -> None:
         rk = ranks.get(str(a_["ts_code"]))
         if rk is not None:
             a_["size_rank"], a_["size_bucket"] = rk
+    c2_path = os.path.join(DECISION_DIR, "c2_review_state.json")
+    c2_state = load_c2_projection(c2_path)
+    c2_exit_eligible = (
+        set(c2_state["exit_eligible"])
+        if c2_state["status"] in {"AVAILABLE", "REVIEW_BLOCKED_DATA"}
+        else set()
+    )
     decisions = decide_states(assessments, held, policy,
                               account_value=account_value,
                               cash=float(cash) if cash is not None else None,
-                              risk_breach=risk_breach, manual_exit=manual_exit)
+                              risk_breach=risk_breach, manual_exit=manual_exit,
+                              c2_exit_eligible=c2_exit_eligible)
 
     out = {"as_of": as_of,
            "account_as_of": account["as_of"],
@@ -213,6 +279,7 @@ def main(argv: list[str] | None = None) -> None:
            "policy_version": str(policy["policy_version"]),
            "entry_model_version": ENTRY_MODEL_VERSION,
            "data_status": "complete",
+           "c2_state": c2_state,
            "decisions": decisions}
     os.makedirs(DECISION_DIR, exist_ok=True)
     out_path = f"{DECISION_DIR}/{as_of}_buy_decisions.json"
@@ -238,6 +305,9 @@ def main(argv: list[str] | None = None) -> None:
         if extra:
             print(f"  …另 {extra} 只 WAIT(完整名单见 JSON)")
     print(f"→ {out_path}(机器唯一真相源;非荐股,执行须人工确认)")
+    if c2_state["status"] == "UNAVAILABLE":
+        print(f"! C2 月度审视状态不可用({c2_state['error']});已保留独立硬退出并写入快照")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

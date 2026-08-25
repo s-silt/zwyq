@@ -145,7 +145,9 @@ def test_c2_blocked_is_system_failure_but_not_initialized_is_calm(
 
 @pytest.mark.parametrize("blocker", [
     "ACCOUNT_STATE_INCOMPLETE",
+    "ACCOUNT_STATE_UNAVAILABLE",
     "DECISION_NOT_ALIGNED",
+    "FUTURE_READINESS_BLOCKER",
 ])
 def test_readiness_alignment_blockers_are_system_failures(
     tmp_path: Path,
@@ -257,7 +259,9 @@ def test_brief_available_watch_is_informational_only(tmp_path: Path) -> None:
     assert not any("600000.SH" in item and "EXIT" in item for item in brief["next_actions"])
 
 
-def test_machine_states_read_verbatim_and_dividend_overlay(tmp_path: Path) -> None:
+def test_machine_states_read_verbatim_and_dividend_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     decisions = [
         _decision("600000.SH", "BUY", decile=10, max_entry=12.3, shares=1000,
                   reason_codes=["D10", "TIER_GREEN", "FACTCHECK_CLEAR"]),
@@ -268,6 +272,17 @@ def test_machine_states_read_verbatim_and_dividend_overlay(tmp_path: Path) -> No
         {"ts_code": "600000.SH", "dv_ttm": 4.2, "dv_ratio": 3.9},
         {"ts_code": "000001.SZ", "dv_ttm": 1.8, "dv_ratio": 1.5},
     ])
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": True, "status": "ready", "blockers": [], "warnings": [],
+            "as_of": AS_OF,
+            "components": {
+                "eod": {"status": "ready", "as_of": AS_OF},
+                "holdings": {"freshness": "aligned", "as_of": AS_OF},
+            },
+        },
+    })
     brief = db.build_brief(root, now=NOW)
 
     # 状态计数逐字来自快照

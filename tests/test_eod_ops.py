@@ -293,6 +293,40 @@ def test_buy_list_failure_after_writing_snapshot_stops_all_downstream(
     assert "BUY 出现" not in out
     assert "新增待 fact-check" not in out
     assert "[C2 观察]" not in out
+    assert not (tmp_path / "data/alerts").exists()
+
+
+def test_pipeline_failure_alert_uses_previous_snapshot_date(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    decision_dir = tmp_path / "data" / "decisions"
+    decision_dir.mkdir(parents=True)
+    previous = decision_dir / "20260825_buy_decisions.json"
+    previous.write_text(
+        json.dumps({"as_of": "20260825", "decisions": []}), encoding="utf-8",
+    )
+    failed = decision_dir / "20260826_buy_decisions.json"
+
+    def fail_buy_list_after_write(args, **kwargs):
+        if args[:2] == ["-m", "scripts.buy_list"]:
+            failed.write_text(
+                json.dumps({"as_of": "20260826", "decisions": []}), encoding="utf-8",
+            )
+            return 1, "degraded snapshot written"
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", fail_buy_list_after_write)
+
+    with pytest.raises(SystemExit) as exc:
+        eod_ops.main(["--skip-probe"])
+
+    assert exc.value.code == 1
+    alert_files = list((tmp_path / "data/alerts").glob("*_alerts.json"))
+    assert [path.name for path in alert_files] == ["20260825_alerts.json"]
+    payload = json.loads(alert_files[0].read_text("utf-8"))
+    assert payload["status"] == "action_required"
+    assert any("buy_list 失败" in alert for alert in payload["alerts"])
 
 
 def test_refresh_token_expiry_stops_eod_before_downstream(tmp_path, monkeypatch):

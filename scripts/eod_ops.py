@@ -220,7 +220,12 @@ def main(argv: "list[str] | None" = None) -> None:
     # 比较路径会漏报当次新产生的 BUY/EXIT/候选变化(codex P1)
     after = snapshot_paths()
     after_artifact = _snapshot_artifact(after[-1] if after else None)
-    new_snapshot = json.load(open(after[-1], encoding="utf-8")) if after else None
+    # 失败步骤可能留下半成品或显式降级快照；它既不是 downstream 输入，也不能
+    # 成为 alerts 日期锚点。失败 alert 仅可沿用运行前已加载的可靠快照日期。
+    new_snapshot = (
+        json.load(open(after[-1], encoding="utf-8"))
+        if after and not pipeline_failed else None
+    )
     # 单调度器/单写者假设:只在核心链前后采样。buy_list 用 os.replace,因此同内容重写
     # 也会改变文件身份；JSON 内容比较仍只负责去重状态 alert/probe。
     snapshot_generated = after_artifact is not None and after_artifact != before_artifact

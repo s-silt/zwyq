@@ -26,9 +26,34 @@ CORE_COLUMNS = {
 }
 
 
+def _c2_projection(status: str = "NOT_INITIALIZED") -> dict:
+    return {
+        "status": status,
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": (
+            "REVIEW_BLOCKED_DATA:synthetic blocker"
+            if status == "REVIEW_BLOCKED_DATA" else None
+        ),
+    }
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _canonical_decision_hash(payload: dict) -> str:
+    evidence = {key: value for key, value in payload.items() if key != "c2_state"}
+    canonical = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _write_calendar(root: Path, as_of: str) -> Path:
@@ -89,6 +114,8 @@ def write_valid_review_fixture(
     decision = root / "data/decisions" / f"{as_of}_buy_decisions.json"
     _write_json(decision, {
         "as_of": as_of,
+        "data_status": "complete",
+        "c2_state": _c2_projection(),
         "factor_snapshot": factor.relative_to(root).as_posix(),
         "decisions": decisions,
     })
@@ -167,7 +194,9 @@ def test_month_end_review_hashes_sources_and_advances_state(tmp_path: Path) -> N
     state = json.loads(state_path.read_text(encoding="utf-8"))
     review = state["reviews"][-1]
     assert review["status"] == "VALID"
-    assert review["decision_snapshot"]["sha256"] == hashlib.sha256(decision.read_bytes()).hexdigest()
+    assert review["decision_snapshot"]["sha256"] == _canonical_decision_hash(
+        json.loads(decision.read_text("utf-8"))
+    )
     assert review["decision_snapshot"]["path"] == "data/decisions/20260130_buy_decisions.json"
     assert review["factor_snapshot"]["path"] == "data/holdscore/20260130_factor.json"
     assert state["positions"]["A"]["status"] == "WATCH"
@@ -639,6 +668,89 @@ def test_same_period_replay_is_idempotent_and_does_not_rewrite(
     assert _last_summary(capsys)["status"] == "IDEMPOTENT"
 
 
+def test_same_period_replay_ignores_c2_projection_only_change(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    decision = write_valid_review_fixture(tmp_path, outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+    state = tmp_path / "data/decisions/c2_review_state.json"
+    before = state.read_bytes()
+
+    payload = json.loads(decision.read_text("utf-8"))
+    payload["c2_state"] = {
+        "status": "AVAILABLE",
+        "last_valid_review_as_of": "20260130",
+        "watch": ["A"],
+        "exit_eligible": [],
+        "error": None,
+    }
+    _write_json(decision, payload)
+
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+    assert state.read_bytes() == before
+    assert _last_summary(capsys)["status"] == "IDEMPOTENT"
+
+
+@pytest.mark.parametrize(("data_status", "c2_state"), [
+    ("degraded", _c2_projection()),
+    ("complete", {
+        "status": "UNAVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": "synthetic unavailable",
+    }),
+])
+def test_explicitly_unready_snapshot_is_blocked_without_mutating_sidecar(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    data_status: str,
+    c2_state: dict,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path, outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+    state = tmp_path / "data/decisions/c2_review_state.json"
+    before = state.read_bytes()
+
+    payload = json.loads(decision.read_text("utf-8"))
+    payload["data_status"] = data_status
+    payload["c2_state"] = c2_state
+    _write_json(decision, payload)
+
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+    assert state.read_bytes() == before
+    assert _last_summary(capsys)["status"] == "REVIEW_BLOCKED_DATA"
+
+
+@pytest.mark.parametrize(
+    "status", ["AVAILABLE", "NOT_INITIALIZED", "REVIEW_BLOCKED_DATA"],
+)
+def test_complete_snapshot_accepts_consumable_c2_status(
+    tmp_path: Path, status: str,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    payload = json.loads(decision.read_text("utf-8"))
+    payload["c2_state"] = _c2_projection(status)
+    _write_json(decision, payload)
+
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+
+
+def test_same_period_replay_rejects_real_decision_change(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path, outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+    state = tmp_path / "data/decisions/c2_review_state.json"
+    before = state.read_bytes()
+
+    payload = json.loads(decision.read_text("utf-8"))
+    payload["decisions"][0]["state"] = "EXIT"
+    payload["decisions"][0]["reason_codes"] = ["RISK_LINE_BREACH"]
+    _write_json(decision, payload)
+
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+    assert state.read_bytes() == before
+
+
 def test_same_period_identical_hashes_are_idempotent_without_calendar(tmp_path: Path) -> None:
     decision = write_valid_review_fixture(tmp_path, outside={"A"})
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
@@ -676,7 +788,12 @@ def test_same_period_changed_source_hash_is_rejected(
     state = tmp_path / "data/decisions/c2_review_state.json"
     before = state.read_bytes()
     target = decision if changed_source == "decision" else tmp_path / "data/holdscore/20260130_factor.json"
-    target.write_bytes(target.read_bytes() + b"\n")
+    if changed_source == "decision":
+        payload = json.loads(target.read_text("utf-8"))
+        payload["decisions"][0]["name"] = "Changed evidence"
+        _write_json(target, payload)
+    else:
+        target.write_bytes(target.read_bytes() + b"\n")
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
     assert state.read_bytes() == before
 

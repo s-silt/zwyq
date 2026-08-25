@@ -45,6 +45,7 @@ def verify_buy(open_px: "float | None", locked: bool, suspended: bool) -> str:
 
 
 _DATE8 = re.compile(r"^\d{8}$")
+_DECISION_FILE_RE = re.compile(r"^(\d{8})_buy_decisions\.json$")
 
 
 def next_trade_date(dates: list[str], as_of: str) -> str:
@@ -106,6 +107,11 @@ def main() -> None:
     snap_path = f"{DECISION_DIR}/{prev_files[-1]}"
     snap = json.load(open(snap_path, encoding="utf-8"))
     require_decision_snapshot_ready(snap, source=f"decision snapshot: {snap_path}")
+    match = _DECISION_FILE_RE.fullmatch(prev_files[-1])
+    if match is None or snap.get("as_of") != match.group(1):
+        raise ValueError(
+            f"decision snapshot filename date does not match payload as_of: {snap_path}"
+        )
     decisions = snap["decisions"]
 
     hold = json.load(open(HOLDINGS_PATH, encoding="utf-8"))

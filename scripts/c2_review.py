@@ -26,6 +26,7 @@ from ashare_gauntlet.c2_review import (
     record_blocked_review,
     validate_state,
 )
+from ashare_gauntlet.decision_snapshot import validate_c2_projection
 
 
 CORE_COLUMNS = {
@@ -49,7 +50,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 class _ReviewConflict(C2ReviewError):
-    """A frozen valid period was presented with different raw evidence."""
+    """A frozen valid period was presented with different decision evidence."""
 
 
 def _inside_root(root: Path, path: Path) -> Path:
@@ -109,6 +110,28 @@ def _parse_json(raw: bytes, label: str) -> Any:
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _decision_evidence_hash(decision: dict[str, Any]) -> str:
+    """Hash canonical decision evidence, excluding the consumed C2 projection."""
+    evidence = {key: value for key, value in decision.items() if key != "c2_state"}
+    canonical = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return _sha256(canonical)
+
+
+def _require_decision_readiness(decision: dict[str, Any], source: str) -> None:
+    if decision.get("data_status") != "complete":
+        raise ValueError(f"{source} is not complete")
+    c2_state = decision.get("c2_state")
+    if isinstance(c2_state, dict) and c2_state.get("status") == "UNAVAILABLE":
+        raise ValueError(f"{source} is not complete: c2_state.status is UNAVAILABLE")
+    validate_c2_projection(c2_state)
 
 
 def _relative_path(root: Path, path: Path) -> str:
@@ -502,6 +525,7 @@ def _run(args: argparse.Namespace) -> tuple[dict, int]:
 
     decision: dict | None = None
     decision_error: C2ReviewError | None = None
+    readiness_error: str | None = None
     try:
         parsed_decision = _parse_json(decision_raw, "decision snapshot")
         if not isinstance(parsed_decision, dict):
@@ -510,10 +534,37 @@ def _run(args: argparse.Namespace) -> tuple[dict, int]:
         if as_of != file_as_of:
             raise C2ReviewError("decision as_of must match dated decision filename")
         decision = parsed_decision
+        decision_hash = _decision_evidence_hash(decision)
+        try:
+            _require_decision_readiness(
+                decision, source=f"decision snapshot: {decision_path}",
+            )
+        except ValueError as exc:
+            c2_state = decision.get("c2_state")
+            explicitly_unready = (
+                decision.get("data_status") != "complete"
+                or (
+                    isinstance(c2_state, dict)
+                    and c2_state.get("status") == "UNAVAILABLE"
+                )
+            )
+            if explicitly_unready:
+                readiness_error = str(exc)
+            else:
+                raise C2ReviewError(str(exc)) from exc
     except C2ReviewError as exc:
         as_of = file_as_of
         decision_error = exc
     period = as_of[:6]
+    if readiness_error is not None:
+        return _blocked_result(
+            state=None,
+            state_path=state_path,
+            period=period,
+            as_of=as_of,
+            issue=readiness_error,
+            evidence_hashes={"decision_snapshot": decision_hash},
+        )
     calendar_error: C2ReviewError | None = None
     month_end = False
     try:

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import calendar
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import math
@@ -11,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from typing import Any
 
 import pandas as pd
@@ -62,18 +65,19 @@ def _resolve_under_root(root: Path, value: str | Path) -> Path:
 
 
 def _validate_state_target(root: Path, state_path: Path) -> None:
-    relative = state_path.relative_to(root.resolve())
-    parts = tuple(part.casefold() for part in relative.parts)
-    fixed = {
-        ("data", "holdings.json"),
-        ("data", "profile.json"),
-        ("data", "trading_policy.json"),
-    }
-    protected_namespace = len(parts) >= 2 and parts[:2] in {
-        ("data", "cache"), ("data", "holdscore"),
-    }
-    if parts in fixed or protected_namespace or _DECISION_RE.fullmatch(state_path.name):
-        raise C2ReviewError(f"protected state output target: {relative.as_posix()}")
+    decisions = (root.resolve() / "data/decisions").resolve()
+    allowed = (
+        state_path.parent == decisions
+        and state_path.suffix.casefold() == ".json"
+        and not _DECISION_RE.fullmatch(state_path.name.casefold())
+        and (not state_path.exists() or state_path.is_file())
+    )
+    if not allowed:
+        relative = state_path.relative_to(root.resolve()).as_posix()
+        raise C2ReviewError(
+            "state output must be a JSON file directly under data/decisions; "
+            f"protected state output target: {relative}"
+        )
 
 
 def _real_date(value: Any, label: str) -> str:
@@ -94,8 +98,11 @@ def _read_bytes(path: Path, label: str) -> bytes:
 
 
 def _parse_json(raw: bytes, label: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise C2ReviewError(f"{label} contains non-standard JSON constant {value}")
+
     try:
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise C2ReviewError(f"{label} is not valid UTF-8 JSON") from exc
 
@@ -116,7 +123,14 @@ def _is_month_end(root: Path, as_of: str) -> bool:
     final_day = calendar.monthrange(year, month)[1]
     final = f"{checked[:6]}{final_day:02d}"
     directory = _inside_root(root, root / "data/cache/trade_cal")
-    paths = sorted(directory.glob("*.parquet")) if directory.exists() else []
+    paths: list[Path] = []
+    for path in sorted(directory.glob("*.parquet")) if directory.exists() else []:
+        stem = path.stem
+        if re.fullmatch(r"\d{6}", stem) and stem != checked[:6]:
+            continue
+        if re.fullmatch(r"\d{8}", stem) and stem[:6] != checked[:6]:
+            continue
+        paths.append(path)
     if not paths:
         raise C2ReviewError("trade_cal cache missing")
     frames: list[pd.DataFrame] = []
@@ -132,7 +146,11 @@ def _is_month_end(root: Path, as_of: str) -> bool:
     calendar_rows = pd.concat(frames, ignore_index=True)
     if calendar_rows.empty:
         raise C2ReviewError("trade_cal cache empty")
-    calendar_rows["cal_date"] = calendar_rows["cal_date"].astype(str)
+    if not all(
+        isinstance(value, str) and bool(value.strip())
+        for value in calendar_rows["cal_date"].tolist()
+    ):
+        raise C2ReviewError("trade_cal cache has invalid cal_date values")
     calendar_rows = calendar_rows[
         (calendar_rows["cal_date"] >= first) & (calendar_rows["cal_date"] <= final)
     ]
@@ -149,8 +167,13 @@ def _is_month_end(root: Path, as_of: str) -> bool:
             if len(set(pd.to_numeric(group["is_open"], errors="coerce"))) != 1:
                 raise C2ReviewError("trade_cal cache has contradictory duplicate rows")
         calendar_rows = calendar_rows.drop_duplicates("cal_date", keep="last")
-    open_values = pd.to_numeric(calendar_rows["is_open"], errors="coerce")
-    if open_values.isna().any() or not set(open_values).issubset({0, 1}):
+    open_column = calendar_rows["is_open"]
+    if (pd.api.types.is_bool_dtype(open_column.dtype)
+            or not pd.api.types.is_numeric_dtype(open_column.dtype)):
+        raise C2ReviewError("trade_cal cache is_open must have numeric non-boolean dtype")
+    open_values = pd.to_numeric(open_column, errors="raise")
+    if (not all(math.isfinite(float(value)) for value in open_values)
+            or not set(open_values).issubset({0, 1})):
         raise C2ReviewError("trade_cal cache has invalid is_open values")
     open_days = sorted(calendar_rows.loc[open_values == 1, "cal_date"])
     if not open_days:
@@ -178,23 +201,31 @@ def _validate_core(cache: Path, as_of: str) -> None:
             )
         if frame.empty:
             raise C2ReviewError(f"core endpoint partition empty: {endpoint}/{as_of}")
-        if set(frame["trade_date"].astype(str)) != {as_of}:
+        dates = frame["trade_date"].tolist()
+        if (not all(isinstance(value, str) and bool(value.strip()) for value in dates)
+                or set(dates) != {as_of}):
             raise C2ReviewError(f"core endpoint partition date mismatch: {endpoint}/{as_of}")
         codes = frame["ts_code"]
-        if codes.isna().any() or any(not str(code) for code in codes):
+        if not all(
+            isinstance(code, str) and bool(code.strip()) for code in codes.tolist()
+        ):
             raise C2ReviewError(f"core endpoint has invalid ts_code: {endpoint}/{as_of}")
-        if codes.astype(str).duplicated().any():
+        if codes.duplicated().any():
             raise C2ReviewError(f"core endpoint has duplicate ts_code: {endpoint}/{as_of}")
         numeric_columns = required - {"ts_code", "trade_date"}
         converted: dict[str, pd.Series] = {}
         for column in numeric_columns:
-            values = pd.to_numeric(frame[column], errors="coerce")
-            invalid = frame[column].notna() & (
-                values.isna() | ~values.map(math.isfinite)
-            )
-            if bool(invalid.any()):
+            source = frame[column]
+            if (pd.api.types.is_bool_dtype(source.dtype)
+                    or not pd.api.types.is_numeric_dtype(source.dtype)):
                 raise C2ReviewError(
-                    f"core endpoint has invalid numeric field {column}: {endpoint}/{as_of}"
+                    f"core endpoint numeric field must have numeric non-boolean dtype: "
+                    f"{column}: {endpoint}/{as_of}"
+                )
+            values = pd.to_numeric(source, errors="raise")
+            if not all(math.isfinite(float(value)) for value in values):
+                raise C2ReviewError(
+                    f"core endpoint numeric field must be finite: {column}: {endpoint}/{as_of}"
                 )
             converted[column] = values
         if endpoint == "daily":
@@ -251,7 +282,7 @@ def _observations(decision: dict, factor_rows: list[dict]) -> list[dict]:
         if not isinstance(row, dict):
             raise C2ReviewError(f"decision row {index} must be an object")
         state = row.get("state")
-        if state not in {"BUY", "WAIT", "HOLD", "EXIT"}:
+        if not isinstance(state, str) or state not in {"BUY", "WAIT", "HOLD", "EXIT"}:
             raise C2ReviewError(f"decision row {index} has invalid state")
         code = row.get("ts_code")
         name = row.get("name")
@@ -283,7 +314,7 @@ def _observations(decision: dict, factor_rows: list[dict]) -> list[dict]:
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write allow_nan=False with temporary file, flush, fsync, replace, cleanup."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    text = json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False) + "\n"
     fd, temporary = tempfile.mkstemp(
         prefix=".tmp_c2_review_", suffix=".json", dir=path.parent,
     )
@@ -303,6 +334,51 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         except OSError:
             pass
         raise
+
+
+@contextmanager
+def _state_lock(state_path: Path):
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(f".{state_path.name}.lock")
+    handle = lock_path.open("a+b")
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def _load_state(path: Path) -> tuple[dict | None, bool]:
@@ -405,124 +481,149 @@ def _run(args: argparse.Namespace) -> tuple[dict, int]:
     decision_raw = _read_bytes(decision_path, "decision snapshot")
     decision_hash = _sha256(decision_raw)
 
-    state, _ = _load_state(state_path)
-    existing = next((
-        review for review in (state or {}).get("reviews", [])
-        if review["status"] == "VALID" and review["period"] == period
-    ), None)
-    if (existing is not None
-            and existing["decision_snapshot"]["sha256"] != decision_hash):
-        raise _ReviewConflict(f"valid review conflict for period {period}")
-
+    decision: dict | None = None
+    decision_error: C2ReviewError | None = None
     try:
-        decision = _parse_json(decision_raw, "decision snapshot")
-        if not isinstance(decision, dict):
+        parsed_decision = _parse_json(decision_raw, "decision snapshot")
+        if not isinstance(parsed_decision, dict):
             raise C2ReviewError("decision snapshot must be an object")
-        as_of = _real_date(decision.get("as_of"), "decision as_of")
+        as_of = _real_date(parsed_decision.get("as_of"), "decision as_of")
         if as_of != file_as_of:
             raise C2ReviewError("decision as_of must match dated decision filename")
+        decision = parsed_decision
     except C2ReviewError as exc:
-        return _blocked_result(
-            state=state,
-            state_path=state_path,
-            period=period,
-            as_of=file_as_of,
-            issue=str(exc),
-            evidence_hashes={"decision_snapshot": decision_hash},
-        )
+        as_of = file_as_of
+        decision_error = exc
     period = as_of[:6]
-    if existing is not None:
-        try:
-            _, _, factor_hash = _factor_source(root, state_path, decision, as_of)
-        except C2ReviewError as exc:
-            raise _ReviewConflict(
-                f"valid review evidence unavailable for period {period}: {exc}"
-            ) from exc
-        if existing["factor_snapshot"]["sha256"] != factor_hash:
-            raise _ReviewConflict(f"valid review conflict for period {period}")
-        return {
-            "status": "IDEMPOTENT",
-            "period": period,
-            "as_of": as_of,
-            "newly_exit_eligible": [],
-            "eligible_codes": sorted(eligible_codes(state)),
-        }, 0
-
+    calendar_error: C2ReviewError | None = None
+    month_end = False
     try:
         month_end = _is_month_end(root, as_of)
     except C2ReviewError as exc:
-        return _blocked_result(
-            state=state,
-            state_path=state_path,
-            period=period,
-            as_of=as_of,
-            issue=str(exc),
-            evidence_hashes={"decision_snapshot": decision_hash},
-        )
-    if not month_end:
+        calendar_error = exc
+    if decision_error is None and calendar_error is None and not month_end:
         return {"status": "NOT_DUE", "period": period, "as_of": as_of}, 0
 
-    factor_hash: str | None = None
-    try:
-        factor_path, factor_raw, factor_hash = _factor_source(
-            root, state_path, decision, as_of,
-        )
-        factor_value = _parse_json(factor_raw, "factor snapshot")
-        factor_rows = _validate_factor_rows(factor_value)
-    except C2ReviewError as exc:
-        blocked_hashes = {"decision_snapshot": decision_hash}
-        if factor_hash is not None:
-            blocked_hashes["factor_snapshot"] = factor_hash
+    if decision_error is not None and calendar_error is None and not month_end:
         return _blocked_result(
-            state=state,
+            state=None,
             state_path=state_path,
             period=period,
             as_of=as_of,
-            issue=str(exc),
-            evidence_hashes=blocked_hashes,
+            issue=str(decision_error),
+            evidence_hashes={"decision_snapshot": decision_hash},
         )
 
-    assert factor_hash is not None
-    evidence_hashes = {
-        "decision_snapshot": decision_hash,
-        "factor_snapshot": factor_hash,
-    }
-    try:
-        _validate_core(_inside_root(root, root / "data/cache"), as_of)
-        observations = _observations(decision, factor_rows)
-    except C2ReviewError as exc:
-        return _blocked_result(
-            state=state,
-            state_path=state_path,
-            period=period,
-            as_of=as_of,
-            issue=str(exc),
-            evidence_hashes=evidence_hashes,
-        )
+    with _state_lock(state_path):
+        state, _ = _load_state(state_path)
+        existing = next((
+            review for review in (state or {}).get("reviews", [])
+            if review["status"] == "VALID" and review["period"] == period
+        ), None)
+        if (existing is not None
+                and existing["decision_snapshot"]["sha256"] != decision_hash):
+            raise _ReviewConflict(f"valid review conflict for period {period}")
+        if decision_error is not None:
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(decision_error),
+                evidence_hashes={"decision_snapshot": decision_hash},
+            )
+        assert decision is not None
+        if existing is not None:
+            try:
+                _, _, factor_hash = _factor_source(root, state_path, decision, as_of)
+            except C2ReviewError as exc:
+                raise _ReviewConflict(
+                    f"valid review evidence unavailable for period {period}: {exc}"
+                ) from exc
+            if existing["factor_snapshot"]["sha256"] != factor_hash:
+                raise _ReviewConflict(f"valid review conflict for period {period}")
+            return {
+                "status": "IDEMPOTENT",
+                "period": period,
+                "as_of": as_of,
+                "newly_exit_eligible": [],
+                "eligible_codes": sorted(eligible_codes(state)),
+            }, 0
+        if calendar_error is not None:
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(calendar_error),
+                evidence_hashes={"decision_snapshot": decision_hash},
+            )
 
-    evidence = {
-        "period": period,
-        "as_of": as_of,
-        "decision_snapshot": {
-            "path": _relative_path(root, decision_path), "sha256": decision_hash,
-        },
-        "factor_snapshot": {
-            "path": _relative_path(root, factor_path), "sha256": factor_hash,
-        },
-        "observations": observations,
-    }
-    advanced, events = advance_review(state if state is not None else initial_state(), evidence)
-    stamped = _stamp_for_write(advanced)
-    _atomic_write_json(state_path, stamped)
-    newly = events["newly_exit_eligible"]
-    return {
-        "status": "VALID",
-        "period": period,
-        "as_of": as_of,
-        "observation_count": len(observations),
-        "newly_exit_eligible": newly,
-        "eligible_codes": sorted(eligible_codes(stamped)),
-    }, 2 if newly else 0
+        assert month_end
+
+        factor_hash: str | None = None
+        try:
+            factor_path, factor_raw, factor_hash = _factor_source(
+                root, state_path, decision, as_of,
+            )
+            factor_value = _parse_json(factor_raw, "factor snapshot")
+            factor_rows = _validate_factor_rows(factor_value)
+        except C2ReviewError as exc:
+            blocked_hashes = {"decision_snapshot": decision_hash}
+            if factor_hash is not None:
+                blocked_hashes["factor_snapshot"] = factor_hash
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(exc),
+                evidence_hashes=blocked_hashes,
+            )
+
+        assert factor_hash is not None
+        evidence_hashes = {
+            "decision_snapshot": decision_hash,
+            "factor_snapshot": factor_hash,
+        }
+        try:
+            _validate_core(_inside_root(root, root / "data/cache"), as_of)
+            observations = _observations(decision, factor_rows)
+        except C2ReviewError as exc:
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(exc),
+                evidence_hashes=evidence_hashes,
+            )
+
+        evidence = {
+            "period": period,
+            "as_of": as_of,
+            "decision_snapshot": {
+                "path": _relative_path(root, decision_path), "sha256": decision_hash,
+            },
+            "factor_snapshot": {
+                "path": _relative_path(root, factor_path), "sha256": factor_hash,
+            },
+            "observations": observations,
+        }
+        advanced, events = advance_review(
+            state if state is not None else initial_state(), evidence,
+        )
+        stamped = _stamp_for_write(advanced)
+        _atomic_write_json(state_path, stamped)
+        newly = events["newly_exit_eligible"]
+        return {
+            "status": "VALID",
+            "period": period,
+            "as_of": as_of,
+            "observation_count": len(observations),
+            "newly_exit_eligible": newly,
+            "eligible_codes": sorted(eligible_codes(stamped)),
+        }, 2 if newly else 0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -534,7 +635,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _emit(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False))
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True, allow_nan=False))
 
 
 def main(argv: list[str] | None = None) -> None:

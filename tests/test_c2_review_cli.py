@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
+import multiprocessing
 from pathlib import Path
+import subprocess
+import sys
+import time
 
 import pandas as pd
 import pytest
@@ -101,6 +107,57 @@ def _last_summary(capsys: pytest.CaptureFixture[str]) -> dict:
     return json.loads(lines[-1])
 
 
+def _process_cli_worker(
+    argv: list[str],
+    result_path: Path,
+    started_path: Path,
+    delay_ready: Path | None = None,
+    delay_release: Path | None = None,
+    lock_attempt: Path | None = None,
+) -> None:
+    import scripts.c2_review as cli
+
+    if lock_attempt is not None:
+        real_state_lock = cli._state_lock
+
+        @contextlib.contextmanager
+        def tracked_state_lock(state_path: Path):
+            lock_attempt.write_text("attempt", encoding="ascii")
+            with real_state_lock(state_path):
+                yield
+
+        cli._state_lock = tracked_state_lock
+
+    if delay_ready is not None and delay_release is not None:
+        real_validate_core = cli._validate_core
+
+        def delayed_validate_core(cache: Path, as_of: str) -> None:
+            delay_ready.write_text("ready", encoding="ascii")
+            while not delay_release.exists():
+                time.sleep(0.01)
+            real_validate_core(cache, as_of)
+
+        cli._validate_core = delayed_validate_core
+
+    started_path.write_text("started", encoding="ascii")
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        try:
+            cli.main(argv)
+        except SystemExit as exc:
+            code = int(exc.code)
+    result_path.write_text(
+        json.dumps({"code": code, "stdout": output.getvalue()}), encoding="utf-8"
+    )
+
+
+def _wait_for(path: Path, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert path.exists(), f"timed out waiting for {path.name}"
+
+
 def test_month_end_review_hashes_sources_and_advances_state(tmp_path: Path) -> None:
     decision = write_valid_review_fixture(tmp_path, as_of="20260130", outside={"A"})
     state_path = tmp_path / "data/decisions/c2_review_state.json"
@@ -136,6 +193,7 @@ def test_ordinary_trading_day_is_not_due_and_writes_nothing(
     state = tmp_path / "data/decisions/c2_review_state.json"
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
     assert not state.exists()
+    assert list(state.parent.glob(".*.lock")) == []
     assert _last_summary(capsys)["status"] == "NOT_DUE"
 
 
@@ -159,6 +217,23 @@ def test_calendar_rejects_non_binary_is_open(tmp_path: Path) -> None:
     frame.loc[frame.index[0], "is_open"] = 0.5
     frame.to_parquet(calendar, index=False)
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+def test_calendar_rejects_boolean_is_open_dtype(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    calendar = tmp_path / "data/cache/trade_cal/202601.parquet"
+    frame = pd.read_parquet(calendar)
+    frame["is_open"] = frame["is_open"].astype(bool)
+    frame.to_parquet(calendar, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+def test_unrelated_corrupt_historical_calendar_shard_does_not_block_review(
+    tmp_path: Path,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    (tmp_path / "data/cache/trade_cal/202512.parquet").write_bytes(b"not parquet")
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
 
 
 def test_impossible_decision_date_is_rejected(tmp_path: Path) -> None:
@@ -221,6 +296,56 @@ def test_core_numeric_fields_reject_non_numeric_text(tmp_path: Path) -> None:
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
 
 
+@pytest.mark.parametrize(("endpoint", "column"), [
+    (endpoint, column)
+    for endpoint, columns in CORE_COLUMNS.items()
+    for column in columns
+    if column not in {"ts_code", "trade_date"}
+])
+def test_every_core_numeric_column_rejects_boolean_dtype(
+    tmp_path: Path, endpoint: str, column: str,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    path = tmp_path / "data/cache" / endpoint / "20260130.parquet"
+    frame = pd.read_parquet(path)
+    frame[column] = True
+    frame.to_parquet(path, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+def test_core_numeric_columns_reject_numeric_strings(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    path = tmp_path / "data/cache/daily/20260130.parquet"
+    frame = pd.read_parquet(path)
+    frame["close"] = "10.5"
+    frame.to_parquet(path, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+@pytest.mark.parametrize("bad_code", [123, "   "])
+def test_core_ts_code_requires_actual_nonblank_strings(
+    tmp_path: Path, bad_code: object,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    path = tmp_path / "data/cache/daily/20260130.parquet"
+    frame = pd.read_parquet(path)
+    frame["ts_code"] = bad_code
+    frame.to_parquet(path, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+@pytest.mark.parametrize("bad_date", [20260130, "   "])
+def test_core_trade_date_requires_actual_matching_nonblank_strings(
+    tmp_path: Path, bad_date: object,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    path = tmp_path / "data/cache/daily/20260130.parquet"
+    frame = pd.read_parquet(path)
+    frame["trade_date"] = bad_date
+    frame.to_parquet(path, index=False)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
 @pytest.mark.parametrize("rows", [
     {},
     [],
@@ -232,6 +357,45 @@ def test_core_numeric_fields_reject_non_numeric_text(tmp_path: Path) -> None:
 def test_malformed_factor_rows_are_rejected(tmp_path: Path, rows: object) -> None:
     decision = write_valid_review_fixture(tmp_path, factor_rows=rows)
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+
+
+def test_unhashable_decision_state_records_deduplicated_blocked_review(
+    tmp_path: Path,
+) -> None:
+    first = write_valid_review_fixture(tmp_path, as_of="20260130", outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(first)]) == 0
+    second = write_valid_review_fixture(tmp_path, as_of="20260227", outside={"A"})
+    payload = json.loads(second.read_text("utf-8"))
+    payload["decisions"][0]["state"] = []
+    _write_json(second, payload)
+
+    assert _run(["--root", str(tmp_path), "--decision", str(second)]) == 1
+    state_path = tmp_path / "data/decisions/c2_review_state.json"
+    once = json.loads(state_path.read_text("utf-8"))
+    assert once["reviews"][-1]["status"] == "REVIEW_BLOCKED_DATA"
+    assert once["positions"]["A"]["out_streak"] == 1
+    before = state_path.read_bytes()
+    assert _run(["--root", str(tmp_path), "--decision", str(second)]) == 1
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_nonstandard_json_constants_are_rejected_even_in_ignored_decision_field(
+    tmp_path: Path, constant: str,
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    raw = decision.read_text("utf-8").rstrip()
+    decision.write_text(raw[:-1] + f',\n  "ignored": {constant}\n}}', encoding="utf-8")
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+    assert not (tmp_path / "data/decisions/c2_review_state.json").exists()
+
+
+def test_nonstandard_json_constant_is_rejected_in_ignored_factor_field(tmp_path: Path) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    factor = tmp_path / "data/holdscore/20260130_factor.json"
+    factor.write_text('[{"ts_code":"A","decile":10,"ignored":NaN}]', encoding="utf-8")
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+    assert not (tmp_path / "data/decisions/c2_review_state.json").exists()
 
 
 def test_duplicate_factor_ts_code_is_rejected(tmp_path: Path) -> None:
@@ -307,6 +471,36 @@ def test_state_output_rejects_protected_runtime_targets_before_reading_them(
     assert "protected state output target" in summary["error"]
 
 
+@pytest.mark.parametrize("invalid_target", [
+    ".",
+    "scripts/not_a_sidecar.py",
+    ".git/c2_state.json",
+    "docs/c2_state.json",
+    "data/c2_state.json",
+    "data/decisions/nested/c2_state.json",
+    "data/decisions/c2_state.txt",
+])
+def test_state_output_whitelist_rejects_non_sidecar_locations_without_creation(
+    tmp_path: Path,
+    invalid_target: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    decision = write_valid_review_fixture(tmp_path)
+    target = (tmp_path / invalid_target).resolve()
+    existed_before = target.exists()
+
+    assert _run([
+        "--root", str(tmp_path),
+        "--decision", str(decision),
+        "--state", invalid_target,
+    ]) == 1
+
+    assert target.exists() is existed_before
+    summary = _last_summary(capsys)
+    assert summary["status"] == "ERROR"
+    assert "state output must be a JSON file directly under data/decisions" in summary["error"]
+
+
 def test_corrupt_existing_state_is_preserved_byte_for_byte(tmp_path: Path) -> None:
     decision = write_valid_review_fixture(tmp_path)
     state = tmp_path / "data/decisions/c2_review_state.json"
@@ -350,6 +544,24 @@ def test_atomic_write_cleans_temp_when_fdopen_fails(
     with pytest.raises(OSError, match="synthetic"):
         cli._atomic_write_json(destination, {"ok": True})
     assert list(tmp_path.glob(".tmp_c2_review_*")) == []
+
+
+def test_state_lock_acquisition_failure_preserves_existing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = write_valid_review_fixture(tmp_path, as_of="20260130", outside={"A"})
+    assert _run(["--root", str(tmp_path), "--decision", str(first)]) == 0
+    state = tmp_path / "data/decisions/c2_review_state.json"
+    before = state.read_bytes()
+    second = write_valid_review_fixture(tmp_path, as_of="20260227", outside={"A"})
+    import scripts.c2_review as cli
+
+    def fail_lock(_state_path: Path):
+        raise OSError("synthetic lock acquisition failure")
+
+    monkeypatch.setattr(cli, "_state_lock", fail_lock)
+    assert _run(["--root", str(tmp_path), "--decision", str(second)]) == 1
+    assert state.read_bytes() == before
 
 
 def test_same_period_replay_is_idempotent_and_does_not_rewrite(
@@ -587,6 +799,98 @@ def test_paths_outside_root_are_rejected(tmp_path: Path) -> None:
         "--root", str(tmp_path), "--decision", str(decision), "--state", str(outside),
     ]) == 1
     assert not outside.exists()
+
+
+def test_hostile_unicode_error_emits_one_parseable_json_line_without_traceback(
+    tmp_path: Path,
+) -> None:
+    hostile = "\ud800"
+    decisions = [
+        {"ts_code": hostile, "name": "First", "state": "HOLD", "reason_codes": ["HELD"]},
+        {"ts_code": hostile, "name": "Second", "state": "HOLD", "reason_codes": ["HELD"]},
+    ]
+    decision = write_valid_review_fixture(tmp_path)
+    payload = json.loads(decision.read_text("utf-8"))
+    payload["decisions"] = decisions
+    decision.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "scripts.c2_review",
+            "--root", str(tmp_path), "--decision", str(decision),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        check=False,
+    )
+    stdout = completed.stdout.decode("utf-8")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    lines = stdout.splitlines()
+    assert completed.returncode == 1
+    assert len(lines) == 1
+    assert json.loads(lines[0])["status"] == "REVIEW_BLOCKED_DATA"
+    assert "Traceback" not in stderr
+
+
+def test_concurrent_due_reviews_reload_state_under_exclusive_lock(tmp_path: Path) -> None:
+    first = write_valid_review_fixture(tmp_path, as_of="20260130")
+    assert _run(["--root", str(tmp_path), "--decision", str(first)]) == 0
+    earlier = write_valid_review_fixture(tmp_path, as_of="20260227")
+    later = write_valid_review_fixture(tmp_path, as_of="20260331")
+    state_path = tmp_path / "data/decisions/c2_review_state.json"
+
+    ready = tmp_path / "earlier.ready"
+    release = tmp_path / "earlier.release"
+    earlier_started = tmp_path / "earlier.started"
+    later_started = tmp_path / "later.started"
+    later_attempt = tmp_path / "later.lock_attempt"
+    earlier_result = tmp_path / "earlier.result.json"
+    later_result = tmp_path / "later.result.json"
+    context = multiprocessing.get_context("spawn")
+    earlier_process = context.Process(
+        target=_process_cli_worker,
+        args=(
+            ["--root", str(tmp_path), "--decision", str(earlier)],
+            earlier_result, earlier_started, ready, release,
+        ),
+    )
+    later_process = context.Process(
+        target=_process_cli_worker,
+        args=(
+            ["--root", str(tmp_path), "--decision", str(later)],
+            later_result, later_started, None, None, later_attempt,
+        ),
+    )
+    serialized = False
+    earlier_process.start()
+    try:
+        _wait_for(ready)
+        later_process.start()
+        _wait_for(later_started)
+        _wait_for(later_attempt)
+        time.sleep(0.25)
+        serialized = not later_result.exists()
+    finally:
+        release.write_text("release", encoding="ascii")
+        earlier_process.join(timeout=12)
+        if later_process.pid is not None:
+            later_process.join(timeout=12)
+        for process in (earlier_process, later_process):
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+
+    assert serialized, "later writer completed while earlier writer held the state boundary"
+    assert earlier_process.exitcode == 0
+    assert later_process.exitcode == 0
+    assert json.loads(earlier_result.read_text("utf-8"))["code"] == 0
+    assert json.loads(later_result.read_text("utf-8"))["code"] == 0
+    state = json.loads(state_path.read_text("utf-8"))
+    assert state["last_valid_review_period"] == "202603"
+    assert [
+        review["period"] for review in state["reviews"] if review["status"] == "VALID"
+    ] == ["202601", "202602", "202603"]
 
 
 def test_help_exits_zero() -> None:

@@ -143,6 +143,43 @@ def test_c2_blocked_is_system_failure_but_not_initialized_is_calm(
         assert "streak" in c2["reason"]
 
 
+@pytest.mark.parametrize("blocker", [
+    "ACCOUNT_STATE_INCOMPLETE",
+    "DECISION_NOT_ALIGNED",
+])
+def test_readiness_alignment_blockers_are_system_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocker: str,
+) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    _dump(root / "data/holdscore/gate_baseline.json", {
+        "frozen_at": "2026-08-18T17:00:00+08:00",
+        "factors": [],
+        "composite": {},
+    })
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": False,
+            "status": "blocked",
+            "blockers": [blocker],
+            "warnings": [],
+            "as_of": AS_OF,
+            "components": {
+                "eod": {"status": "ready", "as_of": AS_OF},
+                "holdings": {"freshness": "aligned", "as_of": AS_OF},
+            },
+        },
+    })
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["readiness"]["blockers"] == [blocker]
+    assert brief["machine"]["c2_watch"]["status"] == "NOT_INITIALIZED"
+    assert brief["exit_code"] == 1
+
+
 def test_confirmed_reason_does_not_upgrade_wait_or_hold_to_exit(tmp_path: Path) -> None:
     decisions = [
         _decision("000001.SZ", "WAIT", reason_codes=["EXIT_RULE_C2_CONFIRMED"]),

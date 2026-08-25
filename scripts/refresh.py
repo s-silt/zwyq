@@ -69,6 +69,7 @@ def main(
         print(f"refresh done: 新增 {new_files} 个缓存文件(最新交易日 {days[-1] if days else '-'})", flush=True)
     except TokenExpiredError as exc:
         print(f"!!! token 耗尽: {exc} — 已增量到此,新增 {new_files} 个文件", flush=True)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

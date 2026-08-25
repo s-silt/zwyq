@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from ashare_gauntlet.data.fetch import TokenExpiredError
 from scripts import refresh
 from scripts.backfill import TradeCalendarUnavailableError
 from scripts.c2_review import _is_month_end
@@ -144,3 +145,27 @@ def test_refresh_fails_before_market_fetch_when_full_month_calendar_is_incomplet
         refresh.main(10, str(tmp_path / "data/cache"), today=dt.date(2026, 1, 29))
 
     assert market_calls == []
+
+
+def test_refresh_token_expiry_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pro = _FakePro(_january_calendar())
+    monkeypatch.setattr(refresh, "tushare_pro", lambda: pro)
+    monkeypatch.setattr(
+        refresh,
+        "fetch_market_day",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TokenExpiredError("expired")),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        refresh.main(
+            1,
+            str(tmp_path / "data/cache"),
+            today=dt.date(2026, 1, 5),
+        )
+
+    assert exc.value.code == 1
+    assert "token 耗尽" in capsys.readouterr().out

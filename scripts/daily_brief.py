@@ -473,6 +473,8 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
     system_failed = (
         "CORE_EOD_MISSING_OR_MISALIGNED" in blockers
         or "SERVICE_NOT_OPERATIONAL" in blockers
+        or "ACCOUNT_STATE_INCOMPLETE" in blockers
+        or "DECISION_NOT_ALIGNED" in blockers
         or snap_status == "invalid"
         or c2_state.get("status") in {"UNAVAILABLE", "REVIEW_BLOCKED_DATA"}
     )

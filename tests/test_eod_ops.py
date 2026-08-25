@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date
 
+import pandas as pd
 import pytest
 
-from scripts import eod_ops
+from ashare_gauntlet.data.fetch import TokenExpiredError
+from scripts import eod_ops, refresh
 from scripts.eod_ops import diff_alerts, pending_factcheck_set, run_step
 
 
@@ -235,6 +238,47 @@ def test_core_failure_does_not_invoke_c2_and_returns_one(tmp_path, monkeypatch):
     assert exc.value.code == 1
     assert calls == [["-m", "scripts.refresh"]]
     assert all("scripts.c2_review" not in args for args in calls)
+
+
+def test_refresh_token_expiry_stops_eod_before_downstream(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data" / "decisions").mkdir(parents=True)
+    monkeypatch.setattr(refresh, "tushare_pro", lambda: object())
+    monkeypatch.setattr(
+        refresh,
+        "fetch_trade_cal",
+        lambda *args, **kwargs: pd.DataFrame(
+            {"cal_date": ["20260826"], "is_open": [1]},
+        ),
+    )
+    monkeypatch.setattr(refresh, "trading_days_from_cal", lambda _cal: ["20260826"])
+    monkeypatch.setattr(
+        refresh,
+        "fetch_market_day",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TokenExpiredError("expired")),
+    )
+    calls: list[list[str]] = []
+
+    def run_with_refresh_main(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["-m", "scripts.refresh"]:
+            try:
+                refresh.main(
+                    0,
+                    str(tmp_path / "data/cache"),
+                    today=date(2026, 8, 26),
+                )
+            except SystemExit as exc:
+                return int(exc.code), "token 耗尽"
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", run_with_refresh_main)
+
+    with pytest.raises(SystemExit) as exc:
+        eod_ops.main(["--skip-probe"])
+
+    assert exc.value.code == 1
+    assert calls == [["-m", "scripts.refresh"]]
 
 
 def test_no_new_snapshot_does_not_invoke_c2(tmp_path, monkeypatch):

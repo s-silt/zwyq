@@ -169,6 +169,12 @@ def test_latest_decisions_validates_snapshot_contract(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="mismatch"):
         svc.latest_decisions(tmp_path)
 
+    bad_code = _decision_snapshot()
+    bad_code["decisions"][0]["ts_code"] = "A"
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", bad_code)
+    with pytest.raises(ValueError, match="invalid ts_code"):
+        svc.latest_decisions(tmp_path)
+
 
 def test_latest_decisions_rejects_incomplete_or_duplicate_snapshot(tmp_path: Path) -> None:
     for status in ("partial", "degraded"):
@@ -224,9 +230,9 @@ def test_latest_decisions_rejects_unavailable_c2_marked_complete(tmp_path: Path)
         "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
         "watch": ["001218.SZ", "001218.SZ"], "exit_eligible": [], "error": None,
     }),
-    ("invalid_code", {
+    ("empty_code", {
         "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
-        "watch": ["001218.SZ; DROP"], "exit_eligible": [], "error": None,
+        "watch": [""], "exit_eligible": [], "error": None,
     }),
     ("unsorted_codes", {
         "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
@@ -289,6 +295,33 @@ def test_latest_decisions_accepts_consumable_c2_projection(
         tmp_path: Path, c2_state: dict) -> None:
     snapshot = _decision_snapshot()
     snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
+
+
+def test_latest_decisions_accepts_opaque_code_from_real_c2_state(tmp_path: Path) -> None:
+    from ashare_gauntlet.c2_review import advance_review, initial_state
+    from ashare_gauntlet.decision_snapshot import validate_c2_projection
+    from scripts.buy_list import load_c2_projection
+
+    evidence = {
+        "period": "202601",
+        "as_of": "20260130",
+        "decision_snapshot": {"path": "decision.json", "sha256": "d" * 64},
+        "factor_snapshot": {"path": "factor.json", "sha256": "f" * 64},
+        "observations": [{"ts_code": "A", "name": "甲", "status": "OUTSIDE"}],
+    }
+    state, _ = advance_review(initial_state(), evidence)
+    sidecar = tmp_path / "c2_review_state.json"
+    dump(sidecar, state)
+    projection = load_c2_projection(sidecar)
+    assert projection["watch"] == ["A"]
+    assert validate_c2_projection(projection) is projection
+
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = projection
+    snapshot["decisions"] = []
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
 
     assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"

@@ -12,7 +12,6 @@ _C2_FIELDS = {
 _CONSUMABLE_C2_STATUSES = {
     "AVAILABLE", "NOT_INITIALIZED", "REVIEW_BLOCKED_DATA",
 }
-_TS_CODE = re.compile(r"^\d{6}\.(?:SH|SZ)$")
 _DATE8 = re.compile(r"^\d{8}$")
 _BLOCKED_ERROR_PREFIX = "REVIEW_BLOCKED_DATA:"
 
@@ -31,8 +30,8 @@ def _validate_real_date(value: Any, label: str) -> None:
 def _validate_code_list(value: Any, label: str) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"{label} must be a list")
-    if not all(isinstance(code, str) and _TS_CODE.fullmatch(code) for code in value):
-        raise ValueError(f"{label} must contain valid ts_code strings")
+    if not all(isinstance(code, str) and code for code in value):
+        raise ValueError(f"{label} must contain non-empty strings")
     if len(value) != len(set(value)):
         raise ValueError(f"{label} must not contain duplicates")
     if value != sorted(value):

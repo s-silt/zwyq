@@ -171,6 +171,103 @@ def test_semantically_corrupt_persisted_fields_are_rejected() -> None:
         eligible_codes(bad_position_date)
 
 
+def test_replay_rejects_exit_eligible_without_confirming_transition() -> None:
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+    state, _ = advance_review(state, evidence("202602", "20260227", [outside()]))
+    corrupt = copy.deepcopy(state)
+    corrupt["reviews"][-1]["transitions"] = []
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
+def test_replay_rejects_eligibility_on_first_outside_review() -> None:
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+    state, _ = advance_review(state, evidence("202602", "20260227", [outside()]))
+    corrupt = copy.deepcopy(state)
+    corrupt["positions"]["A"]["exit_eligible_as_of"] = "20260130"
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
+def test_replay_rejects_transition_exceeding_observation_count() -> None:
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+    corrupt = copy.deepcopy(state)
+    corrupt["reviews"][0]["observation_count"] = 0
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
+def test_replay_rejects_watch_with_unrelated_first_out_review() -> None:
+    inside = {"ts_code": "A", "name": "甲", "status": "INSIDE"}
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [inside]))
+    state, _ = advance_review(state, evidence("202602", "20260227", [outside()]))
+    corrupt = copy.deepcopy(state)
+    corrupt["positions"]["A"]["first_out_as_of"] = "20260130"
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
+def test_replay_rejects_position_name_disagreeing_with_latest_transition() -> None:
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+    corrupt = copy.deepcopy(state)
+    corrupt["positions"]["A"]["name"] = "乙"
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
+def test_replay_rejects_clear_transition_with_wrong_prior_status() -> None:
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+    inside = {"ts_code": "A", "name": "甲", "status": "INSIDE"}
+    state, _ = advance_review(state, evidence("202602", "20260227", [inside]))
+    corrupt = copy.deepcopy(state)
+    corrupt["reviews"][-1]["transitions"][0]["from_status"] = "EXIT_ELIGIBLE"
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
+@pytest.mark.parametrize(
+    ("target", "malformed"),
+    [
+        ("observation", []),
+        ("position", {}),
+        ("transition_from", []),
+        ("transition_action", {}),
+    ],
+)
+def test_unhashable_enum_values_raise_domain_error(target: str, malformed) -> None:
+    if target == "observation":
+        review = evidence("202601", "20260130", [outside()])
+        review["observations"][0]["status"] = malformed
+        operation = lambda: advance_review(initial_state(), review)
+    else:
+        state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+        if target == "position":
+            state["positions"]["A"]["status"] = malformed
+        elif target == "transition_from":
+            state["reviews"][0]["transitions"][0]["from_status"] = malformed
+        else:
+            state["reviews"][0]["transitions"][0]["action"] = malformed
+        operation = lambda: eligible_codes(state)
+    with pytest.raises(C2ReviewError):
+        operation()
+
+
+@pytest.mark.parametrize("target", ["state", "evidence"])
+def test_mixed_unexpected_keys_raise_domain_error(target: str) -> None:
+    if target == "state":
+        malformed = initial_state()
+        malformed[1] = "integer key"
+        malformed["extra"] = "string key"
+        operation = lambda: eligible_codes(malformed)
+    else:
+        malformed = evidence("202601", "20260130", [outside()])
+        malformed[1] = "integer key"
+        malformed["extra"] = "string key"
+        operation = lambda: advance_review(initial_state(), malformed)
+    with pytest.raises(C2ReviewError):
+        operation()
+
+
 def test_repeated_identical_blocked_attempt_is_deduplicated() -> None:
     state = record_blocked_review(
         initial_state(), period="202601", as_of="20260130",

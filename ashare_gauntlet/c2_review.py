@@ -38,6 +38,7 @@ _TRANSITION_ACTIONS = frozenset({
     "OUTSIDE_STARTED", "OUTSIDE_CONFIRMED", "OUTSIDE_CAPPED",
     "REENTERED_D10", "BYPASS", "HOLDING_REMOVED",
 })
+_REVIEW_STATUSES = frozenset({"VALID", "REVIEW_BLOCKED_DATA"})
 
 
 class C2ReviewError(ValueError):
@@ -56,11 +57,18 @@ def initial_state() -> dict[str, object]:
 
 
 def _require_exact_fields(value: dict, fields: set[str], label: str) -> None:
-    if set(value) != fields:
+    actual = set(value)
+    if actual != fields:
         raise C2ReviewError(
-            f"{label} fields mismatch: missing={sorted(fields - set(value))}, "
-            f"extra={sorted(set(value) - fields)}"
+            f"{label} fields mismatch: missing={sorted(fields - actual, key=repr)}, "
+            f"extra={sorted(actual - fields, key=repr)}"
         )
+
+
+def _validate_string_enum(value: Any, choices: frozenset[str], label: str) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise C2ReviewError(f"{label} is invalid")
+    return value
 
 
 def _validate_period(value: Any, label: str = "period") -> str:
@@ -116,27 +124,26 @@ def _validate_transition(value: Any, label: str) -> None:
     for field in ("ts_code", "name"):
         if not isinstance(value[field], str) or not value[field]:
             raise C2ReviewError(f"{label}.{field} must be a non-empty string")
-    if value["from_status"] not in _TRANSITION_STATUSES:
-        raise C2ReviewError(f"{label}.from_status is invalid")
-    if value["to_status"] not in _TRANSITION_STATUSES:
-        raise C2ReviewError(f"{label}.to_status is invalid")
-    if value["action"] not in _TRANSITION_ACTIONS:
-        raise C2ReviewError(f"{label}.action is invalid")
+    from_status = _validate_string_enum(
+        value["from_status"], _TRANSITION_STATUSES, f"{label}.from_status"
+    )
+    to_status = _validate_string_enum(
+        value["to_status"], _TRANSITION_STATUSES, f"{label}.to_status"
+    )
+    action = _validate_string_enum(value["action"], _TRANSITION_ACTIONS, f"{label}.action")
     exact_pairs = {
         "OUTSIDE_STARTED": ("CLEAR", "WATCH"),
         "OUTSIDE_CONFIRMED": ("WATCH", "EXIT_ELIGIBLE"),
         "OUTSIDE_CAPPED": ("EXIT_ELIGIBLE", "EXIT_ELIGIBLE"),
     }
-    expected = exact_pairs.get(value["action"])
-    if expected is not None and (value["from_status"], value["to_status"]) != expected:
+    expected = exact_pairs.get(action)
+    if expected is not None and (from_status, to_status) != expected:
         raise C2ReviewError(f"{label} action and statuses are inconsistent")
-    if value["action"] in {"REENTERED_D10", "BYPASS"} and (
-            value["from_status"] not in _POSITION_STATUSES
-            or value["to_status"] != "CLEARED"):
+    if action in {"REENTERED_D10", "BYPASS"} and (
+            from_status not in _POSITION_STATUSES or to_status != "CLEARED"):
         raise C2ReviewError(f"{label} action and statuses are inconsistent")
-    if value["action"] == "HOLDING_REMOVED" and (
-            value["from_status"] not in _POSITION_STATUSES
-            or value["to_status"] != "REMOVED"):
+    if action == "HOLDING_REMOVED" and (
+            from_status not in _POSITION_STATUSES or to_status != "REMOVED"):
         raise C2ReviewError(f"{label} action and statuses are inconsistent")
 
 
@@ -153,7 +160,7 @@ def _validate_review(value: Any, index: int) -> str:
     label = f"reviews[{index}]"
     if not isinstance(value, dict):
         raise C2ReviewError(f"{label} must be an object")
-    status = value.get("status")
+    status = _validate_string_enum(value.get("status"), _REVIEW_STATUSES, f"{label}.status")
     if status == "VALID":
         _require_exact_fields(value, _VALID_REVIEW_FIELDS, label)
         _validate_period_date(value["period"], value["as_of"], prefix=f"{label}.")
@@ -184,7 +191,7 @@ def _validate_review(value: Any, index: int) -> str:
             raise C2ReviewError(f"{label}.issues must be unique")
         _validate_hashes(value["evidence_hashes"], f"{label}.evidence_hashes")
         return status
-    raise C2ReviewError(f"{label}.status is invalid")
+    raise AssertionError("unreachable review status")
 
 
 def _validate_position(code: Any, value: Any, last_as_of: str | None,
@@ -200,9 +207,7 @@ def _validate_position(code: Any, value: Any, last_as_of: str | None,
     streak = value["out_streak"]
     if not isinstance(streak, int) or isinstance(streak, bool) or streak not in {1, 2}:
         raise C2ReviewError(f"{label}.out_streak must be 1 or 2")
-    status = value["status"]
-    if status not in _POSITION_STATUSES:
-        raise C2ReviewError(f"{label}.status is invalid")
+    status = _validate_string_enum(value["status"], _POSITION_STATUSES, f"{label}.status")
     first_out = _validate_date(value["first_out_as_of"], f"{label}.first_out_as_of")
     observed = _validate_date(
         value["last_valid_review_as_of"], f"{label}.last_valid_review_as_of"
@@ -225,6 +230,78 @@ def _validate_position(code: Any, value: Any, last_as_of: str | None,
             raise C2ReviewError(f"{label}.exit_eligible_as_of is inconsistent")
         if eligible not in valid_as_ofs:
             raise C2ReviewError(f"{label}.exit_eligible_as_of must reference a valid review")
+
+
+def _replay_valid_reviews(valid_reviews: list[dict]) -> dict[str, dict[str, Any]]:
+    active: dict[str, dict[str, Any]] = {}
+    for review in valid_reviews:
+        prior_codes = set(active)
+        transitioned: set[str] = set()
+        observation_driven = 0
+        for transition in review["transitions"]:
+            code = transition["ts_code"]
+            name = transition["name"]
+            action = transition["action"]
+            prior = active.get(code)
+            if action != "HOLDING_REMOVED":
+                observation_driven += 1
+
+            if action == "OUTSIDE_STARTED":
+                if prior is not None:
+                    raise C2ReviewError(
+                        f"review {review['period']} OUTSIDE_STARTED requires no active position {code}"
+                    )
+                active[code] = {
+                    "name": name,
+                    "out_streak": 1,
+                    "status": "WATCH",
+                    "first_out_as_of": review["as_of"],
+                    "last_valid_review_as_of": review["as_of"],
+                    "exit_eligible_as_of": None,
+                }
+            elif action == "OUTSIDE_CONFIRMED":
+                if prior is None or prior["status"] != "WATCH":
+                    raise C2ReviewError(
+                        f"review {review['period']} OUTSIDE_CONFIRMED requires WATCH {code}"
+                    )
+                active[code] = {
+                    **prior,
+                    "name": name,
+                    "out_streak": CONFIRMATIONS_REQUIRED,
+                    "status": "EXIT_ELIGIBLE",
+                    "last_valid_review_as_of": review["as_of"],
+                    "exit_eligible_as_of": review["as_of"],
+                }
+            elif action == "OUTSIDE_CAPPED":
+                if prior is None or prior["status"] != "EXIT_ELIGIBLE":
+                    raise C2ReviewError(
+                        f"review {review['period']} OUTSIDE_CAPPED requires EXIT_ELIGIBLE {code}"
+                    )
+                active[code] = {
+                    **prior,
+                    "name": name,
+                    "last_valid_review_as_of": review["as_of"],
+                }
+            else:
+                if prior is None or transition["from_status"] != prior["status"]:
+                    raise C2ReviewError(
+                        f"review {review['period']} {action} prior state mismatch for {code}"
+                    )
+                del active[code]
+            transitioned.add(code)
+
+        missing = prior_codes - transitioned
+        if missing:
+            raise C2ReviewError(
+                f"review {review['period']} does not account for active positions "
+                f"{sorted(missing, key=repr)}"
+            )
+        if review["observation_count"] < observation_driven:
+            raise C2ReviewError(
+                f"review {review['period']} observation_count is smaller than "
+                "observation-driven transitions"
+            )
+    return active
 
 
 def validate_state(state: dict) -> None:
@@ -276,6 +353,9 @@ def validate_state(state: dict) -> None:
         raise C2ReviewError("positions require a valid review")
     for code, position in state["positions"].items():
         _validate_position(code, position, as_of, {review["as_of"] for review in valid_reviews})
+    reconstructed = _replay_valid_reviews(valid_reviews)
+    if reconstructed != state["positions"]:
+        raise C2ReviewError("state.positions does not match replayed valid review history")
 
 
 def _validate_evidence(evidence: Any) -> None:
@@ -306,8 +386,9 @@ def _validate_evidence(evidence: Any) -> None:
         seen.add(code)
         if not isinstance(observation["name"], str) or not observation["name"]:
             raise C2ReviewError(f"{label}.name must be a non-empty string")
-        if observation["status"] not in OBSERVATION_STATUSES:
-            raise C2ReviewError(f"{label}.status is invalid")
+        _validate_string_enum(
+            observation["status"], OBSERVATION_STATUSES, f"{label}.status"
+        )
 
 
 def _events_from_transitions(transitions: list[dict]) -> dict[str, list[str]]:

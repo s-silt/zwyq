@@ -1,6 +1,9 @@
 """execution_record:影子建议→次日现实的闭环纯函数(spec §13.2 影子核对)。"""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 
@@ -91,3 +94,61 @@ def test_divergences_four_cases():
     assert out["600004.SH"]["outcome"] == "FOLLOWED"          # EXIT→已清
     assert out["600099.SH"]["outcome"] == "OFF_LIST_TRADE"    # 未建议却新增持仓(纪律偏差)
     assert "600005.SH" not in out                             # HOLD 持有中=一致,不记偏差
+
+
+@pytest.mark.parametrize(("data_status", "c2_state"), [
+    ("degraded", {
+        "status": "UNAVAILABLE", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_UNREADABLE",
+    }),
+    ("complete", {
+        "status": "UNAVAILABLE", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_INVALID_SCHEMA",
+    }),
+    ("complete", {"status": "AVAILABLE"}),
+])
+def test_main_rejects_latest_unready_snapshot_before_market_or_write(
+        tmp_path: Path, monkeypatch, data_status: str, c2_state: dict) -> None:
+    import scripts.execution_record as er
+
+    decision_dir = tmp_path / "decisions"
+    decision_dir.mkdir()
+    ready_c2 = {
+        "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }
+    (decision_dir / "20260101_buy_decisions.json").write_text(json.dumps({
+        "as_of": "20260101", "data_status": "complete",
+        "c2_state": ready_c2, "decisions": [],
+    }), encoding="utf-8")
+    (decision_dir / "20260102_buy_decisions.json").write_text(json.dumps({
+        "as_of": "20260102", "data_status": data_status,
+        "c2_state": c2_state, "decisions": [],
+    }), encoding="utf-8")
+    holdings_path = tmp_path / "holdings.json"
+    holdings_path.write_text(json.dumps({"positions": []}), encoding="utf-8")
+    records_path = tmp_path / "execution_records.json"
+    old = b'{"records": [{"sentinel": true}]}\r\n'
+    records_path.write_bytes(old)
+
+    calls: list[str] = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} called before snapshot readiness")
+        return fail
+
+    monkeypatch.setattr(er, "DECISION_DIR", str(decision_dir))
+    monkeypatch.setattr(er, "HOLDINGS_PATH", str(holdings_path))
+    monkeypatch.setattr(er, "RECORDS_PATH", str(records_path))
+    monkeypatch.setattr(er, "latest_trade_date", lambda: "20260103")
+    monkeypatch.setattr(er, "date_partition_files", forbidden("date_partition_files"))
+    monkeypatch.setattr(er, "tushare_pro", forbidden("tushare_pro"))
+    monkeypatch.setattr(er, "fetch_market_day", forbidden("fetch_market_day"))
+
+    with pytest.raises(ValueError, match="not complete|c2_state"):
+        er.main()
+
+    assert calls == []
+    assert records_path.read_bytes() == old

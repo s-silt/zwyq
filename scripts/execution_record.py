@@ -20,6 +20,7 @@ import re
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH, tushare_pro
 from ashare_gauntlet.data.fetch import fetch_market_day
 from ashare_gauntlet.data.partition import date_partition_files
+from ashare_gauntlet.decision_snapshot import require_decision_snapshot_ready
 from scripts.factor_backtest import one_word_limit_up
 from scripts.buy_list import DECISION_DIR, latest_trade_date
 
@@ -104,6 +105,7 @@ def main() -> None:
         raise SystemExit("无早于今日的决策快照——影子闭环从第二个交易日开始")
     snap_path = f"{DECISION_DIR}/{prev_files[-1]}"
     snap = json.load(open(snap_path, encoding="utf-8"))
+    require_decision_snapshot_ready(snap, source=f"decision snapshot: {snap_path}")
     decisions = snap["decisions"]
 
     hold = json.load(open(HOLDINGS_PATH, encoding="utf-8"))

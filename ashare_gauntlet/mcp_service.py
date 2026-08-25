@@ -22,6 +22,7 @@ import pandas as pd
 from ashare_gauntlet.governance import audit_opinion, controller_pledge
 from ashare_gauntlet.intraday import fetch_quotes
 from ashare_gauntlet.account_state import normalize_account_state, classify_account_freshness
+from ashare_gauntlet.decision_snapshot import require_decision_snapshot_ready
 
 _DATE8 = re.compile(r"^\d{8}$")
 _TS_CODE = re.compile(r"^\d{6}\.(?:SH|SZ)$", re.IGNORECASE)
@@ -350,11 +351,7 @@ def _validate_decision_snapshot(snapshot: Any, path: Path) -> dict[str, Any]:
         raise ValueError(f"decision snapshot has invalid as_of: {path}")
     if match is None or match.group(1) != as_of:
         raise ValueError(f"decision filename/as_of mismatch: {path.name} vs {as_of}")
-    if result.get("data_status") != "complete":
-        raise ValueError(f"decision snapshot is not complete: {path}")
-    c2_state = result.get("c2_state")
-    if isinstance(c2_state, dict) and c2_state.get("status") == "UNAVAILABLE":
-        raise ValueError(f"decision snapshot is not complete: unavailable C2 state: {path}")
+    require_decision_snapshot_ready(result, source=f"decision snapshot: {path}")
     decisions = result.get("decisions")
     if not isinstance(decisions, list):
         raise ValueError(f"decision snapshot decisions must be a list: {path}")

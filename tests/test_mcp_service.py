@@ -111,6 +111,10 @@ def test_stock_brief_surfaces_quote_failure(tmp_path: Path, monkeypatch) -> None
     dump(tmp_path / "data/trigger_bands.json", {"items": []})
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
         "as_of": "20260807", "data_status": "complete",
+        "c2_state": {
+            "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+            "watch": [], "exit_eligible": [], "error": None,
+        },
         "decisions": [{
             "ts_code": "001218.SZ", "state": "WAIT", "reason_codes": [],
             "evidence": {}, "execution": {"shares": 0}, "invalidations": [],
@@ -124,11 +128,22 @@ def test_stock_brief_surfaces_quote_failure(tmp_path: Path, monkeypatch) -> None
     assert result["actionable_view"]["user_action"] == "WAIT"
 
 
+def _c2_not_initialized() -> dict:
+    return {
+        "status": "NOT_INITIALIZED",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": None,
+    }
+
+
 def _decision_snapshot(state: str = "WAIT", max_entry_price=None) -> dict:
     reasons = ["D10", "FACTCHECK_CLEAR"] if state == "BUY" else []
     return {
         "as_of": "20260807",
         "data_status": "complete",
+        "c2_state": _c2_not_initialized(),
         "decisions": [{
             "ts_code": "001218.SZ",
             "state": state,
@@ -183,6 +198,100 @@ def test_latest_decisions_rejects_unavailable_c2_marked_complete(tmp_path: Path)
 
     with pytest.raises(ValueError, match="not complete"):
         svc.latest_decisions(tmp_path)
+
+
+@pytest.mark.parametrize(("case", "c2_state"), [
+    ("missing", None),
+    ("none", None),
+    ("empty", {}),
+    ("unknown_status", {
+        "status": "UNKNOWN", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("non_string_status", {
+        "status": [], "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("available_missing_exit_eligible", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [], "error": None,
+    }),
+    ("invalid_date", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260230",
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("duplicate_watch", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ", "001218.SZ"], "exit_eligible": [], "error": None,
+    }),
+    ("invalid_code", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ; DROP"], "exit_eligible": [], "error": None,
+    }),
+    ("unsorted_codes", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["600875.SH", "001218.SZ"], "exit_eligible": [], "error": None,
+    }),
+    ("overlapping_codes", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": ["001218.SZ"], "error": None,
+    }),
+    ("available_error", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": "unexpected",
+    }),
+    ("not_initialized_with_state", {
+        "status": "NOT_INITIALIZED", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": [], "error": None,
+    }),
+    ("not_initialized_with_error", {
+        "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "unexpected",
+    }),
+    ("blocked_without_error", {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("blocked_unstable_error", {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": "CORE_EOD_MISSING",
+    }),
+    ("extra_field", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": None, "extra": True,
+    }),
+])
+def test_latest_decisions_rejects_invalid_c2_projection(
+        tmp_path: Path, case: str, c2_state: object) -> None:
+    snapshot = _decision_snapshot()
+    if case == "missing":
+        snapshot.pop("c2_state")
+    else:
+        snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    with pytest.raises(ValueError, match="c2_state"):
+        svc.latest_decisions(tmp_path)
+
+
+@pytest.mark.parametrize("c2_state", [
+    {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": ["600875.SH"], "error": None,
+    },
+    {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": ["600875.SH"],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    },
+])
+def test_latest_decisions_accepts_consumable_c2_projection(
+        tmp_path: Path, c2_state: dict) -> None:
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
 
 
 def test_latest_decisions_rejects_buy_without_hard_evidence(tmp_path: Path) -> None:
@@ -422,7 +531,8 @@ def test_healthcheck_separates_operational_from_recommendation_readiness(tmp_pat
         path.write_bytes(b"x")
     dump(tmp_path / "data/holdscore/20260807_factor.json", [])
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
-        "as_of": "20260807", "data_status": "complete", "decisions": [],
+        "as_of": "20260807", "data_status": "complete",
+        "c2_state": _c2_not_initialized(), "decisions": [],
     })
     dump(tmp_path / "data/holdings.json", {
         "as_of": "20260805", "cash": 0, "conditional_orders": "待核对", "positions": [],
@@ -811,7 +921,8 @@ def test_readiness_strict_freshness_blocker(tmp_path: Path) -> None:
         path.write_bytes(b"x")
     dump(tmp_path / "data/holdscore/20260807_factor.json", [])
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
-        "as_of": "20260807", "data_status": "complete", "decisions": [],
+        "as_of": "20260807", "data_status": "complete",
+        "c2_state": _c2_not_initialized(), "decisions": [],
     })
     # 未来日期
     dump(tmp_path / "data/holdings.json", {
@@ -834,7 +945,8 @@ def test_readiness_conditional_orders_invalid_blocker(tmp_path: Path) -> None:
         path.write_bytes(b"x")
     dump(tmp_path / "data/holdscore/20260807_factor.json", [])
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
-        "as_of": "20260807", "data_status": "complete", "decisions": [],
+        "as_of": "20260807", "data_status": "complete",
+        "c2_state": _c2_not_initialized(), "decisions": [],
     })
     dump(tmp_path / "data/holdings.json", {
         "as_of": "20260807", "cash": 0, "positions": [],

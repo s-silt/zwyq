@@ -773,6 +773,50 @@ def test_same_period_replay_rejects_real_decision_change(tmp_path: Path) -> None
     assert state.read_bytes() == before
 
 
+def test_same_period_c2_exit_overlay_is_idempotent_but_other_decision_change_conflicts(
+    tmp_path: Path,
+) -> None:
+    decision = write_valid_review_fixture(
+        tmp_path,
+        outside={"A"},
+        decisions=[{
+            "ts_code": "A",
+            "name": "Alpha",
+            "state": "HOLD",
+            "reason_codes": ["HELD", "EXIT_RULE_C2_MONTHLY"],
+            "evidence": {"decile": 9, "source": "synthetic"},
+            "execution": {
+                "eligible_from": "NEXT_TRADING_DAY",
+                "max_entry_price": None,
+                "target_weight": None,
+                "shares": 0,
+            },
+            "invalidations": ["RISK_RED_FLAG", "MANUAL_LOGIC_FAIL"],
+        }],
+    )
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+    state = tmp_path / "data/decisions/c2_review_state.json"
+    before = state.read_bytes()
+
+    payload = json.loads(decision.read_text("utf-8"))
+    payload["generated_at"] = "2026-01-30T18:00:00+08:00"
+    payload["c2_state"] = _c2_projection("AVAILABLE")
+    payload["decisions"][0].update({
+        "state": "EXIT",
+        "reason_codes": ["EXIT_RULE_C2_CONFIRMED"],
+        "invalidations": [],
+    })
+    _write_json(decision, payload)
+
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0
+    assert state.read_bytes() == before
+
+    payload["decisions"][0]["name"] = "Changed evidence"
+    _write_json(decision, payload)
+    assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
+    assert state.read_bytes() == before
+
+
 def test_same_period_identical_hashes_are_idempotent_without_calendar(tmp_path: Path) -> None:
     decision = write_valid_review_fixture(tmp_path, outside={"A"})
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 0

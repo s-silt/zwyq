@@ -112,6 +112,27 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _normalize_c2_overlay(decisions: Any) -> Any:
+    """Normalize the buy-list C2 consumer overlay for evidence hashing."""
+    if not isinstance(decisions, list):
+        return decisions
+    normalized: list[Any] = []
+    for row in decisions:
+        if (
+            isinstance(row, dict)
+            and row.get("state") == "EXIT"
+            and row.get("reason_codes") == ["EXIT_RULE_C2_CONFIRMED"]
+        ):
+            row = {
+                **row,
+                "state": "HOLD",
+                "reason_codes": ["HELD", "EXIT_RULE_C2_MONTHLY"],
+                "invalidations": ["RISK_RED_FLAG", "MANUAL_LOGIC_FAIL"],
+            }
+        normalized.append(row)
+    return normalized
+
+
 def _decision_evidence_hash(decision: dict[str, Any]) -> str:
     """Hash decision evidence, excluding regenerated/consumed snapshot metadata.
 
@@ -124,6 +145,8 @@ def _decision_evidence_hash(decision: dict[str, Any]) -> str:
         key: value for key, value in decision.items()
         if key not in metadata_fields
     }
+    if "decisions" in evidence:
+        evidence["decisions"] = _normalize_c2_overlay(evidence["decisions"])
     canonical = json.dumps(
         evidence,
         ensure_ascii=True,

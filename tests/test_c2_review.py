@@ -76,6 +76,15 @@ def test_removed_holding_is_archived_by_transition() -> None:
     }]
 
 
+def test_replay_rejects_removed_holding_name_mismatch() -> None:
+    state, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
+    state, _ = advance_review(state, evidence("202602", "20260227", []))
+    corrupt = copy.deepcopy(state)
+    corrupt["reviews"][-1]["transitions"][0]["name"] = "乙"
+    with pytest.raises(C2ReviewError):
+        eligible_codes(corrupt)
+
+
 def test_skipped_month_can_later_advance_streak() -> None:
     first, _ = advance_review(initial_state(), evidence("202601", "20260130", [outside()]))
     third, events = advance_review(first, evidence("202603", "20260331", [outside()]))
@@ -295,6 +304,20 @@ def test_blocked_deduplication_ignores_as_of_and_preserves_first_record() -> Non
     assert replayed == first
     assert len(replayed["reviews"]) == 1
     assert replayed["reviews"][0]["as_of"] == "20260115"
+
+
+def test_validate_state_rejects_duplicate_normalized_blocked_identity() -> None:
+    state = record_blocked_review(
+        initial_state(), period="202601", as_of="20260115",
+        issues=["FACTOR_MISSING", "CORE_EOD_MISSING"],
+        evidence_hashes={"daily": "a" * 64},
+    )
+    duplicate = copy.deepcopy(state["reviews"][0])
+    duplicate["as_of"] = "20260130"
+    duplicate["issues"] = ["CORE_EOD_MISSING", "FACTOR_MISSING"]
+    state["reviews"].append(duplicate)
+    with pytest.raises(C2ReviewError):
+        eligible_codes(state)
 
 
 def test_repaired_valid_review_is_allowed_after_same_period_block() -> None:

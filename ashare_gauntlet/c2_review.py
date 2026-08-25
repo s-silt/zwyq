@@ -156,6 +156,11 @@ def _validate_hashes(value: Any, label: str) -> None:
         _validate_sha256(digest, f"{label}.{key}")
 
 
+def _blocked_identity(*, period: str, issues: list[str],
+                      evidence_hashes: dict[str, str]) -> tuple:
+    return period, tuple(sorted(issues)), tuple(sorted(evidence_hashes.items()))
+
+
 def _validate_review(value: Any, index: int) -> str:
     label = f"reviews[{index}]"
     if not isinstance(value, dict):
@@ -287,6 +292,10 @@ def _replay_valid_reviews(valid_reviews: list[dict]) -> dict[str, dict[str, Any]
                     raise C2ReviewError(
                         f"review {review['period']} {action} prior state mismatch for {code}"
                     )
+                if action == "HOLDING_REMOVED" and name != prior["name"]:
+                    raise C2ReviewError(
+                        f"review {review['period']} HOLDING_REMOVED name mismatch for {code}"
+                    )
                 del active[code]
             transitioned.add(code)
 
@@ -334,9 +343,19 @@ def validate_state(state: dict) -> None:
     if not isinstance(state["reviews"], list):
         raise C2ReviewError("state.reviews must be a list")
     valid_reviews: list[dict] = []
+    blocked_identities: set[tuple] = set()
     for index, review in enumerate(state["reviews"]):
-        if _validate_review(review, index) == "VALID":
+        review_status = _validate_review(review, index)
+        if review_status == "VALID":
             valid_reviews.append(review)
+        else:
+            identity = _blocked_identity(
+                period=review["period"], issues=review["issues"],
+                evidence_hashes=review["evidence_hashes"],
+            )
+            if identity in blocked_identities:
+                raise C2ReviewError(f"duplicate blocked review identity at reviews[{index}]")
+            blocked_identities.add(identity)
     valid_periods = [review["period"] for review in valid_reviews]
     if any(left >= right for left, right in zip(valid_periods, valid_periods[1:])):
         raise C2ReviewError("valid review ordering must be strictly increasing")
@@ -535,11 +554,15 @@ def record_blocked_review(state: dict, *, period: str, as_of: str,
         "issues": copy.deepcopy(issues),
         "evidence_hashes": copy.deepcopy(evidence_hashes),
     }
+    identity = _blocked_identity(
+        period=period, issues=issues, evidence_hashes=evidence_hashes,
+    )
     for review in state["reviews"]:
         if (review["status"] == "REVIEW_BLOCKED_DATA"
-                and review["period"] == period
-                and sorted(review["issues"]) == sorted(issues)
-                and review["evidence_hashes"] == evidence_hashes):
+                and _blocked_identity(
+                    period=review["period"], issues=review["issues"],
+                    evidence_hashes=review["evidence_hashes"],
+                ) == identity):
             return copy.deepcopy(state)
     advanced = copy.deepcopy(state)
     advanced["reviews"].append(blocked)

@@ -72,6 +72,9 @@ def test_main_detects_same_day_snapshot_overwrite(tmp_path, monkeypatch, capsys)
         return True, ""
 
     monkeypatch.setattr(eod_ops, "run_step", fake_run_step)
+    monkeypatch.setattr(
+        eod_ops, "run_step_code", lambda args, **kwargs: (0, '{"status":"NOT_DUE"}'),
+    )
     with pytest.raises(SystemExit) as exc:
         eod_ops.main(["--skip-probe"])
     assert exc.value.code == 2
@@ -143,3 +146,141 @@ def test_run_step_tail_is_bounded():
     assert ok is True
     assert len(tail.splitlines()) == eod_ops.TAIL_LINES
     assert tail.splitlines()[-1] == "49"          # 留的是最后几行
+
+
+def _run_main_with_new_snapshot(
+    tmp_path, monkeypatch, capsys, *, c2_code: int, c2_tail: str,
+):
+    monkeypatch.chdir(tmp_path)
+    decision_dir = tmp_path / "data" / "decisions"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "20260826_buy_decisions.json"
+    calls: list[list[str]] = []
+
+    def fake_run_step_code(args, **kwargs):
+        calls.append(list(args))
+        if args[:2] == ["-m", "scripts.buy_list"]:
+            decision_path.write_text(
+                json.dumps({"as_of": "20260826", "decisions": []}), encoding="utf-8",
+            )
+        if args[:2] == ["-m", "scripts.c2_review"]:
+            return c2_code, c2_tail
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", fake_run_step_code)
+    with pytest.raises(SystemExit) as exc:
+        eod_ops.main(["--skip-probe"])
+    return exc.value.code, calls, capsys.readouterr().out, decision_path
+
+
+def test_c2_action_is_alert_not_pipeline_failure(tmp_path, monkeypatch, capsys):
+    code, calls, out, _ = _run_main_with_new_snapshot(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        c2_code=2,
+        c2_tail='{"status":"VALID","newly_exit_eligible":["A"]}',
+    )
+
+    assert code == 2
+    assert "C2 退出资格成立" in out
+    assert "newly_exit_eligible" in out
+    assert "C2 月度审视数据失败" not in out
+    assert calls[-1][:2] == ["-m", "scripts.c2_review"]
+
+
+def test_c2_data_failure_returns_one(tmp_path, monkeypatch, capsys):
+    code, _, out, _ = _run_main_with_new_snapshot(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        c2_code=1,
+        c2_tail='{"status":"REVIEW_BLOCKED_DATA"}',
+    )
+
+    assert code == 1
+    assert "C2 月度审视数据失败" in out
+    assert "REVIEW_BLOCKED_DATA" in out
+
+
+def test_c2_not_due_keeps_calm_eod_success(tmp_path, monkeypatch, capsys):
+    code, _, out, _ = _run_main_with_new_snapshot(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        c2_code=0,
+        c2_tail='{"status":"NOT_DUE"}',
+    )
+
+    assert code == 0
+    assert "C2 退出资格成立" not in out
+    assert "C2 月度审视数据失败" not in out
+    assert "=== 无状态变化 ===" in out
+
+
+def test_core_failure_does_not_invoke_c2(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data" / "decisions").mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def fail_refresh(args, **kwargs):
+        calls.append(list(args))
+        return 1, "refresh failed"
+
+    monkeypatch.setattr(eod_ops, "run_step_code", fail_refresh)
+    with pytest.raises(SystemExit):
+        eod_ops.main(["--skip-probe"])
+
+    assert calls == [["-m", "scripts.refresh"]]
+    assert all("scripts.c2_review" not in args for args in calls)
+
+
+def test_no_new_snapshot_does_not_invoke_c2(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    decision_dir = tmp_path / "data" / "decisions"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "20260826_buy_decisions.json"
+    decision_path.write_text(
+        json.dumps({"as_of": "20260826", "decisions": []}), encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def succeed_without_change(args, **kwargs):
+        calls.append(list(args))
+        return 0, ""
+
+    monkeypatch.setattr(eod_ops, "run_step_code", succeed_without_change)
+    with pytest.raises(SystemExit) as exc:
+        eod_ops.main(["--skip-probe"])
+
+    assert exc.value.code == 0
+    assert all("scripts.c2_review" not in args for args in calls)
+
+
+def test_c2_uses_new_snapshot_after_core_once_without_rerunning_buy_list(
+    tmp_path, monkeypatch, capsys,
+):
+    code, calls, _, _ = _run_main_with_new_snapshot(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        c2_code=0,
+        c2_tail='{"status":"NOT_DUE"}',
+    )
+
+    assert code == 0
+    assert calls == [
+        ["-m", "scripts.refresh"],
+        ["-m", "scripts.factor_rank"],
+        ["-m", "scripts.buy_list"],
+        ["-m", "scripts.c2_review", "--decision", eod_ops.snapshot_paths()[-1]],
+    ]
+    assert sum("scripts.buy_list" in args for args in calls) == 1
+
+
+def test_run_step_code_preserves_real_exit_code():
+    code, tail = eod_ops.run_step_code(
+        ["-c", "import sys; print('ACTION'); sys.exit(2)"], echo=False,
+    )
+    assert code == 2
+    assert "ACTION" in tail

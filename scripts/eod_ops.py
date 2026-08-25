@@ -1,4 +1,4 @@
-"""每日 EOD 运维管线:refresh → factor_rank → buy_list → factcheck_probe,只报状态变化。
+"""每日 EOD 管线:refresh → factor_rank → buy_list → c2_review → factcheck_probe。
 
 设计边界:
 - 本脚本只做编排与状态对比,不含任何研究口径;各步失败 fail-loud 并入 ALERT,
@@ -43,9 +43,9 @@ STEP_TIMEOUT = 1800
 TAIL_LINES = 6      # 进 ALERT 的输出尾行数(失败定位够用,不灌爆提醒)
 
 
-def run_step(args: list[str], *, timeout: int = STEP_TIMEOUT,
-             echo: bool = True) -> tuple[bool, str]:
-    """跑一步管线;返回 (成功, 输出尾部)。不吞错——失败/超时原文进 ALERT(codex P1)。
+def run_step_code(args: list[str], *, timeout: int = STEP_TIMEOUT,
+                  echo: bool = True) -> tuple[int, str]:
+    """跑一步管线;返回 (退出码, 输出尾部)。失败/超时原文进 ALERT(codex P1)。
 
     **边跑边回显**(echo=True):此前用 capture_output 把子进程输出全吞了,factor_rank
     这种要算几分钟的步骤在屏幕上毫无动静,实测被当成死机而中断——中断会留下半成品
@@ -74,9 +74,16 @@ def run_step(args: list[str], *, timeout: int = STEP_TIMEOUT,
     except subprocess.TimeoutExpired:
         proc.kill()
         reader.join(timeout=5)
-        return False, f"超时(>{timeout}s): " + "\n".join(list(tail)[-3:])
+        return 1, f"超时(>{timeout}s): " + "\n".join(list(tail)[-3:])
     reader.join(timeout=5)
-    return code == 0, "\n".join(tail)
+    return code, "\n".join(tail)
+
+
+def run_step(args: list[str], *, timeout: int = STEP_TIMEOUT,
+             echo: bool = True) -> tuple[bool, str]:
+    """兼容旧调用方,返回 (成功, 输出尾部)。"""
+    code, tail = run_step_code(args, timeout=timeout, echo=echo)
+    return code == 0, tail
 
 
 def snapshot_paths(decision_dir: str = DECISION_DIR) -> list[str]:
@@ -184,6 +191,7 @@ def main(argv: "list[str] | None" = None) -> None:
         prev_snapshot = json.load(open(before[-1], encoding="utf-8"))
 
     alerts: list[str] = []
+    core_succeeded = True
     for name, args in STEPS:
         ok, tail = run_step(args)
         print(f"[{name}] {'ok' if ok else 'FAILED'}")
@@ -192,13 +200,30 @@ def main(argv: "list[str] | None" = None) -> None:
                 alerts.append(f"{name} 失败(多半是账户 as_of 未确认,先跑 holdings_confirm): {tail}")
             else:
                 alerts.append(f"{name} 失败: {tail}")
+            core_succeeded = False
             break   # 后续步骤依赖前置产物,断链即停(不在残缺数据上继续)
 
     # 按内容而非文件名判断快照更新:同一交易日重跑 buy_list 会覆盖同名文件,
     # 比较路径会漏报当次新产生的 BUY/EXIT/候选变化(codex P1)
     after = snapshot_paths()
     new_snapshot = json.load(open(after[-1], encoding="utf-8")) if after else None
-    if new_snapshot is not None and new_snapshot != prev_snapshot:
+    snapshot_changed = new_snapshot is not None and new_snapshot != prev_snapshot
+    c2_failed = False
+    if core_succeeded and snapshot_changed:
+        code, tail = run_step_code([
+            "-m", "scripts.c2_review", "--decision", after[-1],
+        ])
+        if code == 0:
+            print("[c2_review] ok")
+        elif code == 2:
+            print("[c2_review] ACTION")
+            alerts.append(f"C2 退出资格成立: {tail}")
+        else:
+            print("[c2_review] FAILED")
+            alerts.append(f"C2 月度审视数据失败(退出码 {code}): {tail}")
+            c2_failed = True
+
+    if snapshot_changed:
         alerts.extend(diff_alerts(prev_snapshot, new_snapshot))
         pending_new = (pending_factcheck_set(new_snapshot)
                        - (pending_factcheck_set(prev_snapshot) if prev_snapshot else set()))
@@ -234,8 +259,8 @@ def main(argv: "list[str] | None" = None) -> None:
     except OSError as exc:
         print(f"[alerts] 落盘失败(不影响本次判定): {exc}", file=sys.stderr)
 
-    # 退出码语义:2=有需人工处理的状态变化(供调度器/通知层判断),0=平静
-    raise SystemExit(2 if alerts else 0)
+    # 退出码语义:1=数据失败,2=有需人工处理的状态变化,0=平静
+    raise SystemExit(1 if c2_failed else (2 if alerts else 0))
 
 
 if __name__ == "__main__":

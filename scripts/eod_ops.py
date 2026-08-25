@@ -204,7 +204,7 @@ def main(argv: "list[str] | None" = None) -> None:
         prev_snapshot = json.load(open(before[-1], encoding="utf-8"))
 
     alerts: list[str] = []
-    core_succeeded = True
+    pipeline_failed = False
     for name, args in STEPS:
         ok, tail = run_step(args)
         print(f"[{name}] {'ok' if ok else 'FAILED'}")
@@ -213,7 +213,7 @@ def main(argv: "list[str] | None" = None) -> None:
                 alerts.append(f"{name} 失败(多半是账户 as_of 未确认,先跑 holdings_confirm): {tail}")
             else:
                 alerts.append(f"{name} 失败: {tail}")
-            core_succeeded = False
+            pipeline_failed = True
             break   # 后续步骤依赖前置产物,断链即停(不在残缺数据上继续)
 
     # 按内容而非文件名判断快照更新:同一交易日重跑 buy_list 会覆盖同名文件,
@@ -226,7 +226,7 @@ def main(argv: "list[str] | None" = None) -> None:
     snapshot_generated = after_artifact is not None and after_artifact != before_artifact
     snapshot_changed = new_snapshot is not None and new_snapshot != prev_snapshot
     c2_failed = False
-    if core_succeeded and snapshot_generated:
+    if not pipeline_failed and snapshot_generated:
         code, tail = run_step_code([
             "-m", "scripts.c2_review", "--decision", after[-1],
         ])
@@ -277,7 +277,7 @@ def main(argv: "list[str] | None" = None) -> None:
         print(f"[alerts] 落盘失败(不影响本次判定): {exc}", file=sys.stderr)
 
     # 退出码语义:1=数据失败,2=有需人工处理的状态变化,0=平静
-    raise SystemExit(1 if c2_failed else (2 if alerts else 0))
+    raise SystemExit(1 if pipeline_failed or c2_failed else (2 if alerts else 0))
 
 
 if __name__ == "__main__":

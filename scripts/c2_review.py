@@ -295,6 +295,7 @@ def _observations(decision: dict, factor_rows: list[dict]) -> list[dict]:
     if not isinstance(rows, list):
         raise C2ReviewError("decision snapshot decisions must be a list")
     factors = {row["ts_code"]: row["decile"] for row in factor_rows}
+    seen: dict[str, str] = {}
     held: dict[str, dict] = {}
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
@@ -306,15 +307,15 @@ def _observations(decision: dict, factor_rows: list[dict]) -> list[dict]:
         name = row.get("name")
         if not isinstance(code, str) or not code or not isinstance(name, str) or not name:
             raise C2ReviewError(f"decision row {index} is missing ts_code or name")
+        if code in seen:
+            qualifier = "contradictory" if seen[code] != state else "duplicate"
+            raise C2ReviewError(f"decision snapshot has {qualifier} row {code}")
+        seen[code] = state
         if state not in {"HOLD", "EXIT"}:
             continue
         reasons = row.get("reason_codes")
         if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
             raise C2ReviewError(f"held decision row {index} has invalid reason_codes")
-        if code in held:
-            prior = held[code]
-            qualifier = "contradictory" if prior["state"] != state else "duplicate"
-            raise C2ReviewError(f"decision snapshot has {qualifier} held row {code}")
         held[code] = row
 
     observations: list[dict] = []

@@ -219,7 +219,7 @@ def test_c2_not_due_keeps_calm_eod_success(tmp_path, monkeypatch, capsys):
     assert "=== 无状态变化 ===" in out
 
 
-def test_core_failure_does_not_invoke_c2(tmp_path, monkeypatch):
+def test_core_failure_does_not_invoke_c2_and_returns_one(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data" / "decisions").mkdir(parents=True)
     calls: list[list[str]] = []
@@ -229,9 +229,10 @@ def test_core_failure_does_not_invoke_c2(tmp_path, monkeypatch):
         return 1, "refresh failed"
 
     monkeypatch.setattr(eod_ops, "run_step_code", fail_refresh)
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc:
         eod_ops.main(["--skip-probe"])
 
+    assert exc.value.code == 1
     assert calls == [["-m", "scripts.refresh"]]
     assert all("scripts.c2_review" not in args for args in calls)
 

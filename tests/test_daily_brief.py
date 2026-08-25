@@ -95,6 +95,54 @@ def test_brief_consumes_c2_watch_blocked_and_confirmed_exit(tmp_path: Path) -> N
     assert any("EXIT 信号" in item and "000001.SZ" in item for item in brief["next_actions"])
 
 
+@pytest.mark.parametrize(("c2_state", "expected_code"), [
+    ({
+        "status": "REVIEW_BLOCKED_DATA",
+        "last_valid_review_as_of": "20260130",
+        "watch": [], "exit_eligible": [],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }, 1),
+    ({
+        "status": "NOT_INITIALIZED",
+        "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }, 0),
+])
+def test_c2_blocked_is_system_failure_but_not_initialized_is_calm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    c2_state: dict,
+    expected_code: int,
+) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["c2_state"] = c2_state
+    _dump(path, snapshot)
+    _dump(root / "data/holdscore/gate_baseline.json",
+          {"frozen_at": "2026-08-18T17:00:00+08:00", "factors": [], "composite": {}})
+
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": True, "status": "ready", "blockers": [], "warnings": [],
+            "as_of": AS_OF,
+            "components": {"eod": {"status": "ready", "as_of": AS_OF},
+                           "holdings": {"freshness": "aligned", "as_of": AS_OF}},
+        },
+    })
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["next_actions"] == []
+    assert brief["exit_code"] == expected_code
+    if c2_state["status"] == "REVIEW_BLOCKED_DATA":
+        c2 = brief["machine"]["c2_watch"]
+        assert c2["error"] == "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING"
+        assert c2["last_valid_review_as_of"] == "20260130"
+        assert "streak" in c2["reason"]
+
+
 def test_confirmed_reason_does_not_upgrade_wait_or_hold_to_exit(tmp_path: Path) -> None:
     decisions = [
         _decision("000001.SZ", "WAIT", reason_codes=["EXIT_RULE_C2_CONFIRMED"]),

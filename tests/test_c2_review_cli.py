@@ -791,22 +791,36 @@ def test_c2_derived_exit_is_decided_independently_from_factor_d10(
     assert state["positions"].get("A", {}).get("status") == expected_status
 
 
-@pytest.mark.parametrize("decisions", [
-    [
+@pytest.mark.parametrize(("decisions", "error_kind"), [
+    ([
         {"ts_code": "A", "name": "Alpha", "state": "HOLD", "reason_codes": ["HELD"]},
         {"ts_code": "A", "name": "Alpha", "state": "HOLD", "reason_codes": ["HELD"]},
-    ],
-    [
+    ], "duplicate"),
+    ([
         {"ts_code": "A", "name": "Alpha", "state": "HOLD", "reason_codes": ["HELD"]},
         {"ts_code": "A", "name": "Alpha", "state": "EXIT", "reason_codes": ["RISK_LINE_BREACH"]},
-    ],
+    ], "contradictory"),
+    ([
+        {"ts_code": "A", "name": "Alpha", "state": "WAIT", "reason_codes": []},
+        {"ts_code": "A", "name": "Alpha", "state": "HOLD", "reason_codes": ["HELD"]},
+    ], "contradictory"),
+    ([
+        {"ts_code": "A", "name": "Alpha", "state": "WAIT", "reason_codes": []},
+        {"ts_code": "A", "name": "Alpha", "state": "WAIT", "reason_codes": []},
+    ], "duplicate"),
 ])
-def test_duplicate_or_contradictory_held_decisions_block_whole_review(
-    tmp_path: Path, decisions: list[dict],
+def test_duplicate_or_contradictory_decisions_block_whole_review(
+    tmp_path: Path,
+    decisions: list[dict],
+    error_kind: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     decision = write_valid_review_fixture(tmp_path, decisions=decisions)
     assert _run(["--root", str(tmp_path), "--decision", str(decision)]) == 1
     assert not (tmp_path / "data/decisions/c2_review_state.json").exists()
+    summary = _last_summary(capsys)
+    assert summary["status"] == "REVIEW_BLOCKED_DATA"
+    assert error_kind in " ".join(summary["issues"])
 
 
 def test_blocked_review_is_appended_once_without_changing_streak(tmp_path: Path) -> None:

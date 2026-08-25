@@ -41,7 +41,6 @@ from ashare_gauntlet.stop_policy import (
     needs_attention,
 )
 _C2_CODE = "EXIT_RULE_C2_MONTHLY"
-_C2_CONFIRMED_CODE = "EXIT_RULE_C2_CONFIRMED"
 _C2_DEFAULT = {
     "status": "NOT_INITIALIZED",
     "last_valid_review_as_of": None,
@@ -185,7 +184,7 @@ def _classify(decisions: list[dict]) -> dict:
             counts[state] += 1
         if state == "BUY":
             buys.append(d)
-        elif state == "EXIT" or _C2_CONFIRMED_CODE in codes:
+        elif state == "EXIT":
             exits.append(d)
         if _C2_CODE in codes:
             # C2 是观察集合不是待办:跌出 D10 只在**有效月度审视日**记 1 期,
@@ -240,13 +239,11 @@ def _c2_member_rows(codes: list[str], decisions: list[dict]) -> list[dict]:
     return rows
 
 
-def _c2_watch_view(c2_state: dict, decisions: list[dict], legacy_c2: list[dict]) -> dict:
+def _c2_watch_view(c2_state: dict, decisions: list[dict], _legacy_c2: list[dict]) -> dict:
     status = c2_state.get("status")
     watch_codes = list(c2_state.get("watch") or [])
-    # Preserve useful pre-sidecar observations while clearly labelling the
-    # migration state; they are informational and never become actions.
-    if not watch_codes and status == "NOT_INITIALIZED":
-        watch_codes = [str(d.get("ts_code")) for d in legacy_c2 if d.get("ts_code")]
+    # A legacy daily observation is not durable C2 state. Until the sidecar is
+    # initialized, do not project it as WATCH membership.
 
     last_valid = c2_state.get("last_valid_review_as_of")
     error = c2_state.get("error")

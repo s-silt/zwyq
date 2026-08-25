@@ -95,6 +95,22 @@ def test_brief_consumes_c2_watch_blocked_and_confirmed_exit(tmp_path: Path) -> N
     assert any("EXIT 信号" in item and "000001.SZ" in item for item in brief["next_actions"])
 
 
+def test_confirmed_reason_does_not_upgrade_wait_or_hold_to_exit(tmp_path: Path) -> None:
+    decisions = [
+        _decision("000001.SZ", "WAIT", reason_codes=["EXIT_RULE_C2_CONFIRMED"]),
+        _decision("000002.SZ", "HOLD", reason_codes=["EXIT_RULE_C2_CONFIRMED"]),
+    ]
+    root = _setup_root(tmp_path, decisions=decisions)
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["decision_snapshot"]["state_counts"] == {
+        "BUY": 0, "WAIT": 1, "HOLD": 1, "EXIT": 0,
+    }
+    assert brief["machine"]["exits"] == []
+    assert not any(item.startswith("③") for item in brief["next_actions"])
+
+
 def test_brief_keeps_watch_informational_and_surfaces_unavailable(tmp_path: Path) -> None:
     root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
     path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
@@ -117,7 +133,10 @@ def test_brief_keeps_watch_informational_and_surfaces_unavailable(tmp_path: Path
 
 
 def test_brief_missing_c2_state_is_not_initialized(tmp_path: Path) -> None:
-    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    root = _setup_root(tmp_path, decisions=[
+        _decision("600000.SH", "WAIT", decile=5,
+                  reason_codes=["EXIT_RULE_C2_MONTHLY"]),
+    ])
     path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
     snapshot = json.loads(path.read_text(encoding="utf-8"))
     snapshot.pop("c2_state")
@@ -125,8 +144,12 @@ def test_brief_missing_c2_state_is_not_initialized(tmp_path: Path) -> None:
 
     brief = db.build_brief(root, now=NOW)
 
-    assert brief["machine"]["c2_watch"]["status"] == "NOT_INITIALIZED"
-    assert "尚未初始化" in brief["machine"]["c2_watch"]["reason"]
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "NOT_INITIALIZED"
+    assert "尚未初始化" in c2["reason"]
+    assert c2["watch"] == []
+    assert c2["members"] == []
+    assert "C2观察(WATCH)" not in db.render_text(brief)
 
 
 def test_brief_available_watch_is_informational_only(tmp_path: Path) -> None:

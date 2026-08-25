@@ -186,6 +186,20 @@ def test_repeated_identical_blocked_attempt_is_deduplicated() -> None:
     assert replayed["reviews"][0]["status"] == "REVIEW_BLOCKED_DATA"
 
 
+def test_blocked_deduplication_ignores_as_of_and_preserves_first_record() -> None:
+    first = record_blocked_review(
+        initial_state(), period="202601", as_of="20260115",
+        issues=["CORE_EOD_MISSING"], evidence_hashes={"daily": "a" * 64},
+    )
+    replayed = record_blocked_review(
+        first, period="202601", as_of="20260130",
+        issues=["CORE_EOD_MISSING"], evidence_hashes={"daily": "a" * 64},
+    )
+    assert replayed == first
+    assert len(replayed["reviews"]) == 1
+    assert replayed["reviews"][0]["as_of"] == "20260115"
+
+
 def test_repaired_valid_review_is_allowed_after_same_period_block() -> None:
     blocked = record_blocked_review(
         initial_state(), period="202601", as_of="20260130",

@@ -454,8 +454,12 @@ def record_blocked_review(state: dict, *, period: str, as_of: str,
         "issues": copy.deepcopy(issues),
         "evidence_hashes": copy.deepcopy(evidence_hashes),
     }
-    if blocked in state["reviews"]:
-        return copy.deepcopy(state)
+    for review in state["reviews"]:
+        if (review["status"] == "REVIEW_BLOCKED_DATA"
+                and review["period"] == period
+                and sorted(review["issues"]) == sorted(issues)
+                and review["evidence_hashes"] == evidence_hashes):
+            return copy.deepcopy(state)
     advanced = copy.deepcopy(state)
     advanced["reviews"].append(blocked)
     validate_state(advanced)

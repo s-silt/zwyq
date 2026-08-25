@@ -156,16 +156,32 @@ def test_latest_decisions_validates_snapshot_contract(tmp_path: Path) -> None:
 
 
 def test_latest_decisions_rejects_incomplete_or_duplicate_snapshot(tmp_path: Path) -> None:
-    incomplete = _decision_snapshot()
-    incomplete["data_status"] = "partial"
-    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", incomplete)
-    with pytest.raises(ValueError, match="not complete"):
-        svc.latest_decisions(tmp_path)
+    for status in ("partial", "degraded"):
+        incomplete = _decision_snapshot()
+        incomplete["data_status"] = status
+        dump(tmp_path / "data/decisions/20260807_buy_decisions.json", incomplete)
+        with pytest.raises(ValueError, match="not complete"):
+            svc.latest_decisions(tmp_path)
 
     duplicate = _decision_snapshot()
     duplicate["decisions"].append(dict(duplicate["decisions"][0]))
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", duplicate)
     with pytest.raises(ValueError, match="duplicate"):
+        svc.latest_decisions(tmp_path)
+
+
+def test_latest_decisions_rejects_unavailable_c2_marked_complete(tmp_path: Path) -> None:
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = {
+        "status": "UNAVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": "C2_STATE_UNREADABLE",
+    }
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    with pytest.raises(ValueError, match="not complete"):
         svc.latest_decisions(tmp_path)
 
 

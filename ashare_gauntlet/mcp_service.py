@@ -352,6 +352,9 @@ def _validate_decision_snapshot(snapshot: Any, path: Path) -> dict[str, Any]:
         raise ValueError(f"decision filename/as_of mismatch: {path.name} vs {as_of}")
     if result.get("data_status") != "complete":
         raise ValueError(f"decision snapshot is not complete: {path}")
+    c2_state = result.get("c2_state")
+    if isinstance(c2_state, dict) and c2_state.get("status") == "UNAVAILABLE":
+        raise ValueError(f"decision snapshot is not complete: unavailable C2 state: {path}")
     decisions = result.get("decisions")
     if not isinstance(decisions, list):
         raise ValueError(f"decision snapshot decisions must be a list: {path}")

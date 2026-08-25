@@ -117,6 +117,28 @@ def test_load_c2_projection_rejects_nonfinite_json(tmp_path):
     assert projection["error"] == "C2_STATE_INVALID_JSON"
 
 
+def test_load_c2_projection_unreadable_oserror(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.mkdir()
+
+    projection = bl.load_c2_projection(path)
+
+    assert projection["status"] == "UNAVAILABLE"
+    assert projection["exit_eligible"] == []
+    assert projection["error"] == "C2_STATE_UNREADABLE"
+
+
+def test_load_c2_projection_rejects_invalid_schema(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.write_text("{}", encoding="utf-8")
+
+    projection = bl.load_c2_projection(path)
+
+    assert projection["status"] == "UNAVAILABLE"
+    assert projection["exit_eligible"] == []
+    assert projection["error"] == "C2_STATE_INVALID_SCHEMA"
+
+
 def test_valid_c2_only_confirmed_position_exits(tmp_path, monkeypatch):
     out_path = _setup(tmp_path, monkeypatch, rows=[
         _row("600001.SH"), _row("600002.SH"),
@@ -137,6 +159,23 @@ def test_valid_c2_only_confirmed_position_exits(tmp_path, monkeypatch):
     assert decisions["600002.SH"]["state"] == "HOLD"
 
 
+def test_unheld_c2_eligible_code_does_not_create_decision(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("600002.SH")], holdings={
+        "as_of": "20260101", "positions": [{
+            "ts_code": "600002.SH", "name": "乙", "industry": "化工原料",
+            "shares": 100, "cost": 5.0, "last": 6.0, "mv": 600.0,
+        }], "cash": 100000.0,
+    })
+    sidecar = out_path.parent / "c2_review_state.json"
+    sidecar.write_text(json.dumps(_c2_state()), encoding="utf-8")
+
+    bl.main([])
+
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert {row["ts_code"] for row in out["decisions"]} == {"600002.SH"}
+    assert out["decisions"][0]["state"] == "HOLD"
+
+
 def test_corrupt_c2_writes_snapshot_then_exits_one(tmp_path, monkeypatch):
     out_path = _setup(tmp_path, monkeypatch, rows=[_row("600009.SH", last=3.0)], holdings={
         "as_of": "20260101", "positions": [{
@@ -151,6 +190,7 @@ def test_corrupt_c2_writes_snapshot_then_exits_one(tmp_path, monkeypatch):
     assert exc.value.code == 1
     assert sidecar.read_bytes() == b"{not-json"
     out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert out["data_status"] == "degraded"
     assert out["c2_state"] == {
         "status": "UNAVAILABLE", "last_valid_review_as_of": None,
         "watch": [], "exit_eligible": [], "error": "C2_STATE_INVALID_JSON",
@@ -360,3 +400,63 @@ def test_existing_decision_not_overwritten_on_fail(tmp_path, monkeypatch):
     with pytest.raises((SystemExit, AccountFreshnessError)):
         bl.main([])
     assert out_path.read_text(encoding="utf-8") == old_content
+
+
+def test_snapshot_serialization_failure_preserves_existing_bytes(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch)
+    old = b'{"old": true}\r\n'
+    out_path.write_bytes(old)
+    monkeypatch.setattr(bl, "load_c2_projection", lambda path: {
+        "status": "AVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": float("nan"),
+    })
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        bl.main([])
+
+    assert out_path.read_bytes() == old
+    assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))
+
+
+@pytest.mark.parametrize("failure_point", ["write", "fsync", "replace"])
+def test_snapshot_atomic_failure_preserves_existing_bytes(
+        tmp_path, monkeypatch, failure_point):
+    out_path = _setup(tmp_path, monkeypatch)
+    old = b'{"old": true}\r\n'
+    out_path.write_bytes(old)
+
+    if failure_point == "write":
+        class FailingWriter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, payload):
+                raise OSError("write failed")
+
+        def fail_write(fd, *args, **kwargs):
+            bl.os.close(fd)
+            return FailingWriter()
+
+        monkeypatch.setattr(bl.os, "fdopen", fail_write)
+    elif failure_point == "fsync":
+        monkeypatch.setattr(
+            bl.os, "fsync",
+            lambda fd: (_ for _ in ()).throw(OSError("fsync failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            bl.os, "replace",
+            lambda src, dst: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+
+    with pytest.raises(OSError, match=f"{failure_point} failed"):
+        bl.main([])
+
+    assert out_path.read_bytes() == old
+    assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))

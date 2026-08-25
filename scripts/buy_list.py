@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import tempfile
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -278,12 +279,32 @@ def main(argv: list[str] | None = None) -> None:
            "factor_snapshot": snap_path,
            "policy_version": str(policy["policy_version"]),
            "entry_model_version": ENTRY_MODEL_VERSION,
-           "data_status": "complete",
+           "data_status": ("degraded" if c2_state["status"] == "UNAVAILABLE"
+                           else "complete"),
            "c2_state": c2_state,
            "decisions": decisions}
-    os.makedirs(DECISION_DIR, exist_ok=True)
     out_path = f"{DECISION_DIR}/{as_of}_buy_decisions.json"
-    json.dump(out, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    payload = json.dumps(out, ensure_ascii=False, indent=2, allow_nan=False)
+    os.makedirs(DECISION_DIR, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        suffix=".json", prefix=".tmp_buy_decisions_", dir=DECISION_DIR,
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, out_path)
+    except BaseException:
+        try:
+            os.close(tmp_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
     print(f"=== 四态决策(as_of={as_of},entry_model={ENTRY_MODEL_VERSION},"
           f"policy v{policy['policy_version']})===")

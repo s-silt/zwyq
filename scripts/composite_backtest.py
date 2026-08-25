@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from ashare_gauntlet.backtest import information_coefficient, newey_west_tstat
+from ashare_gauntlet.c2_review import next_outside_streak
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDSCORE_DIR, tushare_pro
 from ashare_gauntlet.costs import round_trip_cost_rate
 from ashare_gauntlet.data.fetch import call_with_retry, fetch_market_day
@@ -150,8 +151,10 @@ def c2_step(prev_members: "set[str]", out_streak: dict[str, int], d10: "set[str]
     """
     keep_extra: set[str] = set()
     new_streak: dict[str, int] = {}
-    for c in prev_members - d10:
-        s = out_streak.get(c, 0) + 1
+    for c in prev_members:
+        s = next_outside_streak(out_streak.get(c, 0), inside=c in d10)
+        if s == 0:
+            continue
         if s < 2 and c in tradable:
             keep_extra.add(c)
             new_streak[c] = s

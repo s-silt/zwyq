@@ -7,12 +7,28 @@ import pandas as pd
 import pytest
 
 from ashare_gauntlet.data.fetch import TokenExpiredError
-from scripts.backfill import days_to_pull, fetch_trade_cal
+from scripts import backfill
+from scripts.backfill import TradeCalendarUnavailableError, days_to_pull, fetch_trade_cal
 
 
 def _cal(rows: list[tuple[str, int]]) -> pd.DataFrame:
     """(cal_date, is_open) 行 → trade_cal 形状的 df。"""
     return pd.DataFrame(rows, columns=["cal_date", "is_open"])
+
+
+def _january_calendar() -> pd.DataFrame:
+    days = pd.date_range("2026-01-01", "2026-01-31")
+    return _cal([
+        (day.strftime("%Y%m%d"), int(day.weekday() < 5)) for day in days
+    ])
+
+
+def _calendar_target(root) -> object:
+    return root / "trade_cal/20260101_20260131.parquet"
+
+
+def _calendar_temps(target) -> list:
+    return list(target.parent.glob(f".{target.name}.*"))
 
 
 # ---- days_to_pull:纯函数,trade_cal df + 区间 → 应拉日期列表 ----
@@ -102,3 +118,154 @@ def test_fetch_trade_cal_token_expired_propagates(tmp_path):
     pro = _FakePro(error=Exception("您的token已过期"))
     with pytest.raises(TokenExpiredError):
         fetch_trade_cal(pro, "20260628", "20260629", str(tmp_path))
+
+
+def test_strict_invalid_fresh_calendar_is_not_cached_and_can_recover(tmp_path):
+    days = pd.date_range("2026-01-01", "2026-01-31")
+    complete = _cal([
+        (day.strftime("%Y%m%d"), int(day.weekday() < 5)) for day in days
+    ])
+
+    class RecoveringPro:
+        def __init__(self):
+            self.calls = 0
+
+        def trade_cal(self, **kwargs):
+            self.calls += 1
+            return complete.iloc[:-1] if self.calls == 1 else complete
+
+    pro = RecoveringPro()
+    target = tmp_path / "trade_cal/20260101_20260131.parquet"
+
+    with pytest.raises(TradeCalendarUnavailableError, match="未覆盖区间内全部自然日"):
+        fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert not target.exists()
+    recovered = fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+    assert recovered is not None
+    assert pro.calls == 2
+    assert target.is_file()
+
+
+def test_strict_invalid_cached_calendar_recovers_without_losing_failed_evidence(tmp_path):
+    days = pd.date_range("2026-01-01", "2026-01-31")
+    complete = _cal([
+        (day.strftime("%Y%m%d"), int(day.weekday() < 5)) for day in days
+    ])
+    target = tmp_path / "trade_cal/20260101_20260131.parquet"
+    target.parent.mkdir(parents=True)
+    complete.iloc[:-1].to_parquet(target, index=False)
+    invalid_bytes = target.read_bytes()
+
+    class RecoveringPro:
+        def __init__(self):
+            self.calls = 0
+
+        def trade_cal(self, **kwargs):
+            self.calls += 1
+            return complete.iloc[:-1] if self.calls == 1 else complete
+
+    pro = RecoveringPro()
+
+    with pytest.raises(TradeCalendarUnavailableError, match="未覆盖区间内全部自然日"):
+        fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert pro.calls == 1
+    assert target.read_bytes() == invalid_bytes
+    recovered = fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+    assert recovered is not None
+    assert pro.calls == 2
+    assert len(pd.read_parquet(target)) == 31
+
+
+def test_strict_unreadable_cached_calendar_is_atomically_recovered(tmp_path):
+    target = _calendar_target(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"not parquet")
+    pro = _FakePro(df=_january_calendar())
+
+    recovered = fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert recovered is not None and len(recovered) == 31
+    assert pro.calls == 1
+    assert len(pd.read_parquet(target)) == 31
+    assert _calendar_temps(target) == []
+
+
+def test_strict_failed_recovery_preserves_unreadable_cache_bytes(tmp_path):
+    target = _calendar_target(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"not parquet")
+    before = target.read_bytes()
+    pro = _FakePro(df=_january_calendar().iloc[:-1])
+
+    with pytest.raises(TradeCalendarUnavailableError, match="未覆盖区间内全部自然日"):
+        fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert pro.calls == 1
+    assert target.read_bytes() == before
+    assert _calendar_temps(target) == []
+
+
+@pytest.mark.parametrize("failure_point", ["write", "fsync", "replace"])
+def test_strict_atomic_recovery_failure_preserves_cache_and_cleans_temp(
+    tmp_path, monkeypatch, failure_point,
+):
+    target = _calendar_target(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"not parquet")
+    before = target.read_bytes()
+    pro = _FakePro(df=_january_calendar())
+
+    if failure_point == "write":
+        monkeypatch.setattr(
+            pd.DataFrame,
+            "to_parquet",
+            lambda self, *args, **kwargs: (_ for _ in ()).throw(OSError("write failed")),
+        )
+    elif failure_point == "fsync":
+        monkeypatch.setattr(backfill.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("fsync failed")))
+    else:
+        monkeypatch.setattr(
+            backfill.os,
+            "replace",
+            lambda source, destination: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+
+    with pytest.raises(TradeCalendarUnavailableError, match=f"{failure_point} failed"):
+        fetch_trade_cal(pro, "20260101", "20260131", tmp_path, strict=True)
+
+    assert pro.calls == 1
+    assert target.read_bytes() == before
+    assert _calendar_temps(target) == []
+
+
+def test_strict_fresh_calendar_is_atomic_and_replace_failure_leaves_no_cache(
+    tmp_path, monkeypatch,
+):
+    success_root = tmp_path / "success"
+    success_target = _calendar_target(success_root)
+    recovered = fetch_trade_cal(
+        _FakePro(df=_january_calendar()),
+        "20260101", "20260131", success_root, strict=True,
+    )
+    assert recovered is not None
+    assert len(pd.read_parquet(success_target)) == 31
+    assert _calendar_temps(success_target) == []
+
+    failure_root = tmp_path / "failure"
+    failure_target = _calendar_target(failure_root)
+    monkeypatch.setattr(
+        backfill.os,
+        "replace",
+        lambda source, destination: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+
+    with pytest.raises(TradeCalendarUnavailableError, match="replace failed"):
+        fetch_trade_cal(
+            _FakePro(df=_january_calendar()),
+            "20260101", "20260131", failure_root, strict=True,
+        )
+
+    assert not failure_target.exists()
+    assert _calendar_temps(failure_target) == []

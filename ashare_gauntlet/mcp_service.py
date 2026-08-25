@@ -22,6 +22,7 @@ import pandas as pd
 from ashare_gauntlet.governance import audit_opinion, controller_pledge
 from ashare_gauntlet.intraday import fetch_quotes
 from ashare_gauntlet.account_state import normalize_account_state, classify_account_freshness
+from ashare_gauntlet.decision_snapshot import require_decision_snapshot_ready
 
 _DATE8 = re.compile(r"^\d{8}$")
 _TS_CODE = re.compile(r"^\d{6}\.(?:SH|SZ)$", re.IGNORECASE)
@@ -148,6 +149,8 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
 
     factor_as_of: str | None = None
     decision_as_of: str | None = None
+    decision_data_status: str | None = None
+    c2_status: str | None = None
     factor_status = "missing"
     decision_status = "missing"
     try:
@@ -158,6 +161,15 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
     if factor_status != "ready":
         blockers.append("FACTOR_NOT_ALIGNED")
     try:
+        decision_path = latest_decision_path(root)
+        decision_snapshot = read_json(str(decision_path.relative_to(root)), root)
+        if isinstance(decision_snapshot, dict):
+            raw_data_status = decision_snapshot.get("data_status")
+            if isinstance(raw_data_status, str):
+                decision_data_status = raw_data_status
+            c2_state = decision_snapshot.get("c2_state")
+            if isinstance(c2_state, dict) and isinstance(c2_state.get("status"), str):
+                c2_status = c2_state["status"]
         decision = latest_decisions(root)
         decision_as_of = decision["as_of"]
         decision_status = "ready" if decision_as_of == factor_as_of == eod_as_of else "stale"
@@ -165,6 +177,12 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
         decision_status = "invalid"
     if decision_status != "ready":
         blockers.append("DECISION_NOT_ALIGNED")
+    if decision_data_status == "degraded":
+        blockers.append("DECISION_SNAPSHOT_DEGRADED")
+    if c2_status == "REVIEW_BLOCKED_DATA":
+        blockers.append("C2_REVIEW_BLOCKED_DATA")
+    elif c2_status == "UNAVAILABLE":
+        blockers.append("C2_REVIEW_UNAVAILABLE")
 
     account_status = "missing"
     holdings_as_of = None
@@ -218,7 +236,12 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
             "eod": {"status": eod_status, "as_of": eod_as_of,
                     "endpoint_dates": endpoint_dates},
             "factor": {"status": factor_status, "as_of": factor_as_of},
-            "decision": {"status": decision_status, "as_of": decision_as_of},
+            "decision": {
+                "status": decision_status,
+                "as_of": decision_as_of,
+                "data_status": decision_data_status,
+                "c2_status": c2_status,
+            },
             "holdings": {"status": account_status, "as_of": holdings_as_of,
                          "freshness": holdings_freshness},
             "short_slot": short_slot,
@@ -350,25 +373,11 @@ def _validate_decision_snapshot(snapshot: Any, path: Path) -> dict[str, Any]:
         raise ValueError(f"decision snapshot has invalid as_of: {path}")
     if match is None or match.group(1) != as_of:
         raise ValueError(f"decision filename/as_of mismatch: {path.name} vs {as_of}")
-    if result.get("data_status") != "complete":
-        raise ValueError(f"decision snapshot is not complete: {path}")
-    decisions = result.get("decisions")
-    if not isinstance(decisions, list):
-        raise ValueError(f"decision snapshot decisions must be a list: {path}")
+    require_decision_snapshot_ready(result, source=f"decision snapshot: {path}")
+    decisions = result["decisions"]
 
-    seen: set[str] = set()
     for index, decision in enumerate(decisions):
-        if not isinstance(decision, dict):
-            raise ValueError(f"decision[{index}] must be an object: {path}")
-        code = decision.get("ts_code")
-        if not isinstance(code, str) or not _TS_CODE.fullmatch(code):
-            raise ValueError(f"decision[{index}] has invalid ts_code: {path}")
-        if code in seen:
-            raise ValueError(f"duplicate decision ts_code {code}: {path}")
-        seen.add(code)
         state = decision.get("state")
-        if state not in _DECISION_STATES:
-            raise ValueError(f"decision[{index}] has invalid state {state!r}: {path}")
         if not isinstance(decision.get("execution"), dict):
             raise ValueError(f"decision[{index}] has invalid execution: {path}")
         reasons = decision.get("reason_codes")
@@ -456,6 +465,8 @@ def latest_decisions(
         "as_of": snapshot["as_of"],
         "generated_at": snapshot.get("generated_at"),
         "data_status": snapshot["data_status"],
+        "c2_state": dict(snapshot["c2_state"]),
+        "c2_status": snapshot["c2_state"]["status"],
         "source_file": str(path.relative_to(root)),
         "summary": {"total": len(all_items), "state_counts": counts},
         "page": {

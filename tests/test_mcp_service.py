@@ -111,6 +111,10 @@ def test_stock_brief_surfaces_quote_failure(tmp_path: Path, monkeypatch) -> None
     dump(tmp_path / "data/trigger_bands.json", {"items": []})
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
         "as_of": "20260807", "data_status": "complete",
+        "c2_state": {
+            "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+            "watch": [], "exit_eligible": [], "error": None,
+        },
         "decisions": [{
             "ts_code": "001218.SZ", "state": "WAIT", "reason_codes": [],
             "evidence": {}, "execution": {"shares": 0}, "invalidations": [],
@@ -124,11 +128,22 @@ def test_stock_brief_surfaces_quote_failure(tmp_path: Path, monkeypatch) -> None
     assert result["actionable_view"]["user_action"] == "WAIT"
 
 
+def _c2_not_initialized() -> dict:
+    return {
+        "status": "NOT_INITIALIZED",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": None,
+    }
+
+
 def _decision_snapshot(state: str = "WAIT", max_entry_price=None) -> dict:
     reasons = ["D10", "FACTCHECK_CLEAR"] if state == "BUY" else []
     return {
         "as_of": "20260807",
         "data_status": "complete",
+        "c2_state": _c2_not_initialized(),
         "decisions": [{
             "ts_code": "001218.SZ",
             "state": state,
@@ -144,6 +159,35 @@ def _decision_snapshot(state: str = "WAIT", max_entry_price=None) -> dict:
     }
 
 
+def _write_ready_service_fixture(
+    root: Path, *, c2_state: dict, data_status: str = "complete",
+) -> None:
+    for endpoint in ("daily", "adj_factor", "daily_basic", "stk_limit"):
+        path = root / "data/cache" / endpoint / "20260807.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    dump(root / "data/holdscore/20260807_factor.json", [])
+    snapshot = _decision_snapshot()
+    snapshot["data_status"] = data_status
+    snapshot["c2_state"] = c2_state
+    dump(root / "data/decisions/20260807_buy_decisions.json", snapshot)
+    dump(root / "data/holdings.json", {
+        "as_of": "20260807", "cash": 1000, "positions": [],
+        "conditional_orders": {
+            "schema_version": 2,
+            "orders": [{
+                "order_id": "ord-001", "ts_code": "000001.SZ", "side": "BUY",
+                "condition": {"field": "close", "operator": "<="},
+                "price": 10.5, "shares": 100, "valid_from": "20260801",
+                "valid_until": "20260831", "status": "active",
+            }],
+        },
+    })
+    dump(root / "data/trading_policy.json", {})
+    dump(root / "data/profile.json", {})
+    dump(root / "data/factcheck_overrides.json", {"overrides": []})
+
+
 def test_latest_decisions_validates_snapshot_contract(tmp_path: Path) -> None:
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", _decision_snapshot())
     assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
@@ -154,19 +198,187 @@ def test_latest_decisions_validates_snapshot_contract(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="mismatch"):
         svc.latest_decisions(tmp_path)
 
+    bad_code = _decision_snapshot()
+    bad_code["decisions"][0]["ts_code"] = "A"
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", bad_code)
+    with pytest.raises(ValueError, match="invalid ts_code"):
+        svc.latest_decisions(tmp_path)
+
 
 def test_latest_decisions_rejects_incomplete_or_duplicate_snapshot(tmp_path: Path) -> None:
-    incomplete = _decision_snapshot()
-    incomplete["data_status"] = "partial"
-    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", incomplete)
-    with pytest.raises(ValueError, match="not complete"):
-        svc.latest_decisions(tmp_path)
+    for status in ("partial", "degraded"):
+        incomplete = _decision_snapshot()
+        incomplete["data_status"] = status
+        dump(tmp_path / "data/decisions/20260807_buy_decisions.json", incomplete)
+        with pytest.raises(ValueError, match="not complete"):
+            svc.latest_decisions(tmp_path)
 
     duplicate = _decision_snapshot()
     duplicate["decisions"].append(dict(duplicate["decisions"][0]))
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", duplicate)
     with pytest.raises(ValueError, match="duplicate"):
         svc.latest_decisions(tmp_path)
+
+
+def test_latest_decisions_rejects_unavailable_c2_marked_complete(tmp_path: Path) -> None:
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = {
+        "status": "UNAVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": "C2_STATE_UNREADABLE",
+    }
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    with pytest.raises(ValueError, match="not complete"):
+        svc.latest_decisions(tmp_path)
+
+
+@pytest.mark.parametrize(("case", "c2_state"), [
+    ("missing", None),
+    ("none", None),
+    ("empty", {}),
+    ("unknown_status", {
+        "status": "UNKNOWN", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("non_string_status", {
+        "status": [], "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("available_missing_exit_eligible", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [], "error": None,
+    }),
+    ("invalid_date", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260230",
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("duplicate_watch", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ", "001218.SZ"], "exit_eligible": [], "error": None,
+    }),
+    ("empty_code", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [""], "exit_eligible": [], "error": None,
+    }),
+    ("unsorted_codes", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["600875.SH", "001218.SZ"], "exit_eligible": [], "error": None,
+    }),
+    ("overlapping_codes", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": ["001218.SZ"], "error": None,
+    }),
+    ("available_error", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": "unexpected",
+    }),
+    ("available_members_without_last_valid", {
+        "status": "AVAILABLE", "last_valid_review_as_of": None,
+        "watch": ["A"], "exit_eligible": [], "error": None,
+    }),
+    ("not_initialized_with_state", {
+        "status": "NOT_INITIALIZED", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": [], "error": None,
+    }),
+    ("not_initialized_with_error", {
+        "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "unexpected",
+    }),
+    ("blocked_without_error", {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": None,
+    }),
+    ("blocked_unstable_error", {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": "CORE_EOD_MISSING",
+    }),
+    ("blocked_members_without_last_valid", {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": ["A"],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }),
+    ("extra_field", {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": [], "exit_eligible": [], "error": None, "extra": True,
+    }),
+])
+def test_latest_decisions_rejects_invalid_c2_projection(
+        tmp_path: Path, case: str, c2_state: object) -> None:
+    snapshot = _decision_snapshot()
+    if case == "missing":
+        snapshot.pop("c2_state")
+    else:
+        snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    with pytest.raises(ValueError, match="c2_state"):
+        svc.latest_decisions(tmp_path)
+
+
+@pytest.mark.parametrize("c2_state", [
+    {
+        "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": ["600875.SH"], "error": None,
+    },
+    {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
+        "watch": ["001218.SZ"], "exit_eligible": ["600875.SH"],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    },
+])
+def test_latest_decisions_accepts_consumable_c2_projection(
+        tmp_path: Path, c2_state: dict) -> None:
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
+
+
+def test_latest_decisions_projects_c2_state_and_status(tmp_path: Path) -> None:
+    c2_state = {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260731",
+        "watch": ["001218.SZ"], "exit_eligible": [],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = c2_state
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    result = svc.latest_decisions(tmp_path, summary_only=True)
+
+    assert result["c2_status"] == "REVIEW_BLOCKED_DATA"
+    assert result["c2_state"] == c2_state
+
+
+def test_latest_decisions_accepts_opaque_code_from_real_c2_state(tmp_path: Path) -> None:
+    from ashare_gauntlet.c2_review import advance_review, initial_state
+    from ashare_gauntlet.decision_snapshot import validate_c2_projection
+    from scripts.buy_list import load_c2_projection
+
+    evidence = {
+        "period": "202601",
+        "as_of": "20260130",
+        "decision_snapshot": {"path": "decision.json", "sha256": "d" * 64},
+        "factor_snapshot": {"path": "factor.json", "sha256": "f" * 64},
+        "observations": [{"ts_code": "A", "name": "甲", "status": "OUTSIDE"}],
+    }
+    state, _ = advance_review(initial_state(), evidence)
+    sidecar = tmp_path / "c2_review_state.json"
+    dump(sidecar, state)
+    projection = load_c2_projection(sidecar)
+    assert projection["watch"] == ["A"]
+    assert validate_c2_projection(projection) is projection
+
+    snapshot = _decision_snapshot()
+    snapshot["c2_state"] = projection
+    snapshot["decisions"] = []
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+
+    assert svc.latest_decisions(tmp_path)["as_of"] == "20260807"
 
 
 def test_latest_decisions_rejects_buy_without_hard_evidence(tmp_path: Path) -> None:
@@ -406,7 +618,8 @@ def test_healthcheck_separates_operational_from_recommendation_readiness(tmp_pat
         path.write_bytes(b"x")
     dump(tmp_path / "data/holdscore/20260807_factor.json", [])
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
-        "as_of": "20260807", "data_status": "complete", "decisions": [],
+        "as_of": "20260807", "data_status": "complete",
+        "c2_state": _c2_not_initialized(), "decisions": [],
     })
     dump(tmp_path / "data/holdings.json", {
         "as_of": "20260805", "cash": 0, "conditional_orders": "待核对", "positions": [],
@@ -420,6 +633,39 @@ def test_healthcheck_separates_operational_from_recommendation_readiness(tmp_pat
     assert readiness["ready"] is False
     assert "ACCOUNT_AS_OF_STALE" in readiness["blockers"]
     assert "CONDITIONAL_ORDERS_UNVERIFIED" in readiness["blockers"]
+
+
+def test_healthcheck_blocks_review_blocked_c2_snapshot(tmp_path: Path) -> None:
+    c2_state = {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260731",
+        "watch": ["001218.SZ"], "exit_eligible": [],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }
+    _write_ready_service_fixture(tmp_path, c2_state=c2_state)
+
+    readiness = svc.healthcheck(tmp_path)["recommendation_readiness"]
+
+    assert readiness["ready"] is False
+    assert "C2_REVIEW_BLOCKED_DATA" in readiness["blockers"]
+    assert readiness["components"]["decision"]["c2_status"] == "REVIEW_BLOCKED_DATA"
+
+
+def test_readiness_names_unavailable_and_degraded_decision_blockers(
+    tmp_path: Path,
+) -> None:
+    c2_state = {
+        "status": "UNAVAILABLE", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_UNREADABLE",
+    }
+    _write_ready_service_fixture(
+        tmp_path, c2_state=c2_state, data_status="degraded",
+    )
+
+    readiness = svc._recommendation_readiness(tmp_path)
+
+    assert readiness["ready"] is False
+    assert "C2_REVIEW_UNAVAILABLE" in readiness["blockers"]
+    assert "DECISION_SNAPSHOT_DEGRADED" in readiness["blockers"]
 
 
 def test_maintenance_stages_run_exactly_one_allowlisted_module(
@@ -795,7 +1041,8 @@ def test_readiness_strict_freshness_blocker(tmp_path: Path) -> None:
         path.write_bytes(b"x")
     dump(tmp_path / "data/holdscore/20260807_factor.json", [])
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
-        "as_of": "20260807", "data_status": "complete", "decisions": [],
+        "as_of": "20260807", "data_status": "complete",
+        "c2_state": _c2_not_initialized(), "decisions": [],
     })
     # 未来日期
     dump(tmp_path / "data/holdings.json", {
@@ -818,7 +1065,8 @@ def test_readiness_conditional_orders_invalid_blocker(tmp_path: Path) -> None:
         path.write_bytes(b"x")
     dump(tmp_path / "data/holdscore/20260807_factor.json", [])
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", {
-        "as_of": "20260807", "data_status": "complete", "decisions": [],
+        "as_of": "20260807", "data_status": "complete",
+        "c2_state": _c2_not_initialized(), "decisions": [],
     })
     dump(tmp_path / "data/holdings.json", {
         "as_of": "20260807", "cash": 0, "positions": [],

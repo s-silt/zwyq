@@ -40,8 +40,14 @@ from ashare_gauntlet.stop_policy import (
     conditional_order_coverage,
     needs_attention,
 )
-
 _C2_CODE = "EXIT_RULE_C2_MONTHLY"
+_C2_DEFAULT = {
+    "status": "NOT_INITIALIZED",
+    "last_valid_review_as_of": None,
+    "watch": [],
+    "exit_eligible": [],
+    "error": None,
+}
 # 判据单一来源=candidates.HARD_VETO_CODES(含 SPEC_CROWD/SPIKE_LIMIT 等 clear 也解不开的码)
 _PENDING_BLOCK_CODES = HARD_VETO_CODES
 _ACCT_STATE_RE = re.compile(r"^(\d{8})_account_state\.json$")
@@ -128,8 +134,41 @@ def _load_snapshot(root: Path) -> tuple[str, dict | None, str | None]:
         return "missing", None, None
     try:
         raw = svc.read_json(str(path.relative_to(root)), root)
-        snapshot = svc._validate_decision_snapshot(raw, path)
-    except (ValueError, json.JSONDecodeError) as exc:
+        if not isinstance(raw, dict):
+            raise ValueError("decision snapshot must be an object")
+
+        # Pre-C2 snapshots are still useful for daily operations. Treat the
+        # absent sidecar as an explicit migration state, while malformed or
+        # present-but-unavailable C2 metadata remains visible as degraded.
+        if "c2_state" not in raw:
+            raw = {**raw, "c2_state": dict(_C2_DEFAULT)}
+        c2_state = raw.get("c2_state")
+        c2_unavailable = isinstance(c2_state, dict) and c2_state.get("status") == "UNAVAILABLE"
+        if c2_unavailable:
+            if raw.get("data_status") not in {"complete", "degraded"}:
+                raise ValueError("decision snapshot has invalid data_status")
+            if (
+                set(c2_state) != set(_C2_DEFAULT)
+                or c2_state.get("last_valid_review_as_of") is not None
+                or c2_state.get("watch") != []
+                or c2_state.get("exit_eligible") != []
+                or not isinstance(c2_state.get("error"), str)
+                or not c2_state["error"]
+            ):
+                raise ValueError("c2_state UNAVAILABLE projection is malformed")
+            # The shared ready-validator intentionally rejects UNAVAILABLE.
+            # Validate the rest of the snapshot through that same contract by
+            # substituting the neutral NOT_INITIALIZED projection temporarily.
+            validation_snapshot = {
+                **raw,
+                "c2_state": dict(_C2_DEFAULT),
+                "data_status": "complete",
+            }
+            svc._validate_decision_snapshot(validation_snapshot, path)
+            snapshot = raw
+        else:
+            snapshot = svc._validate_decision_snapshot(raw, path)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
         return "invalid", None, f"{type(exc).__name__}: {exc}"
     return "ok", snapshot, None
 
@@ -180,6 +219,53 @@ def _compact_decision(decision: dict) -> dict:
         "reason_codes": decision.get("reason_codes", []),
         "decile": ev.get("decile"),
         "score": ev.get("score"),
+    }
+
+
+def _c2_member_rows(codes: list[str], decisions: list[dict]) -> list[dict]:
+    """Project durable C2 codes onto decision rows without inventing signals."""
+    by_code = {str(d.get("ts_code")): d for d in decisions}
+    rows: list[dict] = []
+    for code in codes:
+        decision = by_code.get(str(code))
+        if decision is not None:
+            rows.append(_compact_decision(decision))
+        else:
+            # A durable WATCH may outlive the current daily decision list.
+            rows.append({
+                "ts_code": str(code), "name": str(code), "state": "WATCH",
+                "reason_codes": [_C2_CODE], "decile": None, "score": None,
+            })
+    return rows
+
+
+def _c2_watch_view(c2_state: dict, decisions: list[dict], _legacy_c2: list[dict]) -> dict:
+    status = c2_state.get("status")
+    watch_codes = list(c2_state.get("watch") or [])
+    # A legacy daily observation is not durable C2 state. Until the sidecar is
+    # initialized, do not project it as WATCH membership.
+
+    last_valid = c2_state.get("last_valid_review_as_of")
+    error = c2_state.get("error")
+    if status == "REVIEW_BLOCKED_DATA":
+        reason = (f"C2 月度审视数据不可用({error});上次有效审视={last_valid or '—'};"
+                  "本次 streak 未推进")
+    elif status == "UNAVAILABLE":
+        reason = f"C2 数据不可用({error or 'unknown'});不能据此判断无退出"
+    elif status == "NOT_INITIALIZED":
+        reason = "C2 尚未初始化(迁移/尚未运行 scripts.c2_review)"
+    elif watch_codes:
+        reason = "C2 WATCH 仅作信息展示;需连续 2 个有效月度审视确认退出"
+    else:
+        reason = "C2 已可用;当前无 WATCH"
+    return {
+        "status": status,
+        "reason": reason,
+        "error": error,
+        "last_valid_review_as_of": last_valid,
+        "watch": watch_codes,
+        "exit_eligible": list(c2_state.get("exit_eligible") or []),
+        "members": _c2_member_rows(watch_codes, decisions),
     }
 
 
@@ -321,13 +407,8 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         view["dv_ttm"] = _dv(d.get("ts_code"))
         buys_view.append(view)
     exits_view = [_compact_decision(d) for d in buckets["exits"]]
-    # C2 观察名单**不是当日待办**:退出要连续 2 个有效月度审视仍在档外(methodology
-    # §10 M3),而本层既拿不到 streak(第 1 期还是第 2 期)也不知道今天算不算审视日。
-    # 逐日渲染成"该审视/待退出"会把 C2 退化成立即退出变体,抹掉换手 41%→22% 这个
-    # 主要收益来源;"未跟踪"如实标注,与上面时间止损 NOT_CHECKED 同精神。
-    c2_watch = {"status": "STREAK_NOT_TRACKED",
-                "reason": "日频快照不含 c2_streak/有效审视日,无法判断第几期或今天是否审视日",
-                "members": [_compact_decision(d) for d in buckets["c2"]]}
+    c2_state = snapshot.get("c2_state", _C2_DEFAULT) if snapshot else dict(_C2_DEFAULT)
+    c2_watch = _c2_watch_view(c2_state, decisions, buckets["c2"])
     pending_view = [{**_compact_decision(d), "dv_ttm": _dv(d.get("ts_code"))}
                     for d in buckets["pending"]]
 
@@ -383,16 +464,23 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         actions.append(f"⑨ 止损与双仓制政策不符 {len(other_stop)} 只({names})"
                        "——人工核对是否抄错/写反(工具只提示不改)")
     # readiness 其余 blocker(数据/条件单等)如实列出
-    _surfaced = {"ACCOUNT_STATE_INCOMPLETE", "DECISION_NOT_ALIGNED"}
+    _surfaced = {
+        "ACCOUNT_STATE_INCOMPLETE",
+        "DECISION_NOT_ALIGNED",
+        # The dedicated C2 view already explains these states; do not turn a
+        # monthly review problem into a duplicate daily action.
+        "C2_REVIEW_BLOCKED_DATA",
+        "C2_REVIEW_UNAVAILABLE",
+    }
     for b in blockers:
         if b not in _surfaced and b != "CORE_EOD_MISSING_OR_MISALIGNED":
             actions.append(f"• readiness blocker: {b}(须人工处理后方可正式荐股)")
 
     # —— 退出码 ——
     system_failed = (
-        "CORE_EOD_MISSING_OR_MISALIGNED" in blockers
-        or "SERVICE_NOT_OPERATIONAL" in blockers
+        (readiness.get("ready") is False and bool(blockers))
         or snap_status == "invalid"
+        or c2_state.get("status") in {"UNAVAILABLE", "REVIEW_BLOCKED_DATA"}
     )
     if system_failed:
         exit_code = 1
@@ -544,9 +632,10 @@ def render_text(brief: dict) -> str:
         lines.append(f"  EXIT {_fmt(e.get('name'))}({_fmt(e.get('ts_code'))}) "
                      f"{','.join(e.get('reason_codes', []))}")
     c2 = brief["machine"]["c2_watch"]
+    if c2.get("status") != "AVAILABLE" or c2.get("reason"):
+        lines.append(f"  C2状态={_fmt(c2.get('status'))}: {c2.get('reason')}")
     if c2["members"]:
-        lines.append(f"  C2观察 {len(c2['members'])} 只(跌出 D10;退出需连续 2 个有效月度"
-                     f"审视仍在档外确认,{c2['status']}=本层无期数): "
+        lines.append(f"  C2观察(WATCH) {len(c2['members'])} 只(仅信息展示): "
                      + ",".join(f"{_fmt(c.get('name'))}({_fmt(c.get('ts_code'))})"
                                 for c in c2["members"]))
     for p in brief["machine"]["pending_factcheck"]:

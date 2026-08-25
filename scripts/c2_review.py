@@ -1,0 +1,756 @@
+"""Validate evidence and persist the production C2 monthly review sidecar."""
+from __future__ import annotations
+
+import argparse
+import calendar
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import errno
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import tempfile
+import time
+from typing import Any
+
+import pandas as pd
+
+from ashare_gauntlet.c2_review import (
+    C2ReviewError,
+    advance_review,
+    eligible_codes,
+    initial_state,
+    record_blocked_review,
+    validate_state,
+)
+from ashare_gauntlet.decision_snapshot import validate_c2_projection
+
+
+CORE_COLUMNS = {
+    "daily": {"ts_code", "trade_date", "open", "high", "low", "close"},
+    "adj_factor": {"ts_code", "trade_date", "adj_factor"},
+    "daily_basic": {
+        "ts_code", "trade_date", "total_mv", "pe_ttm", "pb", "turnover_rate",
+    },
+    "stk_limit": {"ts_code", "trade_date", "up_limit", "down_limit"},
+}
+
+_DECISION_RE = re.compile(r"^(\d{8})_buy_decisions\.json$")
+_IMMEDIATE_BYPASS_REASONS = frozenset({
+    "GOVERNANCE_RED", "RISK_LINE_BREACH", "MANUAL_LOGIC_FAIL",
+})
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise C2ReviewError(f"invalid arguments: {message}")
+
+
+class _ReviewConflict(C2ReviewError):
+    """A frozen valid period was presented with different decision evidence."""
+
+
+def _inside_root(root: Path, path: Path) -> Path:
+    resolved_root, resolved = root.resolve(), path.resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise C2ReviewError(f"path escapes root: {path}")
+    return resolved
+
+
+def _resolve_under_root(root: Path, value: str | Path) -> Path:
+    path = Path(value)
+    return _inside_root(root, path if path.is_absolute() else root / path)
+
+
+def _validate_state_target(root: Path, state_path: Path) -> None:
+    decisions = (root.resolve() / "data/decisions").resolve()
+    allowed = (
+        state_path.parent == decisions
+        and state_path.suffix.casefold() == ".json"
+        and not _DECISION_RE.fullmatch(state_path.name.casefold())
+        and (not state_path.exists() or state_path.is_file())
+    )
+    if not allowed:
+        relative = state_path.relative_to(root.resolve()).as_posix()
+        raise C2ReviewError(
+            "state output must be a JSON file directly under data/decisions; "
+            f"protected state output target: {relative}"
+        )
+
+
+def _real_date(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{8}", value):
+        raise C2ReviewError(f"{label} must be a real YYYYMMDD date")
+    try:
+        datetime.strptime(value, "%Y%m%d")
+    except ValueError as exc:
+        raise C2ReviewError(f"{label} must be a real YYYYMMDD date") from exc
+    return value
+
+
+def _read_bytes(path: Path, label: str) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise C2ReviewError(f"{label} is unreadable") from exc
+
+
+def _parse_json(raw: bytes, label: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise C2ReviewError(f"{label} contains non-standard JSON constant {value}")
+
+    try:
+        return json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise C2ReviewError(f"{label} is not valid UTF-8 JSON") from exc
+
+
+def _sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _normalize_c2_overlay(decisions: Any) -> Any:
+    """Normalize the buy-list C2 consumer overlay for evidence hashing."""
+    if not isinstance(decisions, list):
+        return decisions
+    normalized: list[Any] = []
+    for row in decisions:
+        if (
+            isinstance(row, dict)
+            and row.get("state") == "EXIT"
+            and row.get("reason_codes") == ["EXIT_RULE_C2_CONFIRMED"]
+        ):
+            row = {
+                **row,
+                "state": "HOLD",
+                "reason_codes": ["HELD", "EXIT_RULE_C2_MONTHLY"],
+                "invalidations": ["RISK_RED_FLAG", "MANUAL_LOGIC_FAIL"],
+            }
+        normalized.append(row)
+    return normalized
+
+
+def _decision_evidence_hash(decision: dict[str, Any]) -> str:
+    """Hash decision evidence, excluding regenerated/consumed snapshot metadata.
+
+    Raw bytes are still hashed before parsing for blocked-review audit evidence.
+    This canonical hash identifies a valid review, so an EOD rerun must not
+    conflict merely because buy_list refreshed its timestamp or C2 projection.
+    """
+    metadata_fields = {"c2_state", "generated_at"}
+    evidence = {
+        key: value for key, value in decision.items()
+        if key not in metadata_fields
+    }
+    if "decisions" in evidence:
+        evidence["decisions"] = _normalize_c2_overlay(evidence["decisions"])
+    canonical = json.dumps(
+        evidence,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return _sha256(canonical)
+
+
+def _require_decision_readiness(decision: dict[str, Any], source: str) -> None:
+    if decision.get("data_status") != "complete":
+        raise ValueError(f"{source} is not complete")
+    c2_state = decision.get("c2_state")
+    if isinstance(c2_state, dict) and c2_state.get("status") == "UNAVAILABLE":
+        raise ValueError(f"{source} is not complete: c2_state.status is UNAVAILABLE")
+    validate_c2_projection(c2_state)
+
+
+def _relative_path(root: Path, path: Path) -> str:
+    return path.relative_to(root.resolve()).as_posix()
+
+
+def _calendar_shard_span(stem: str) -> tuple[str, str] | None:
+    try:
+        if re.fullmatch(r"\d{6}", stem):
+            parsed = datetime.strptime(stem, "%Y%m")
+            last = calendar.monthrange(parsed.year, parsed.month)[1]
+            return f"{stem}01", f"{stem}{last:02d}"
+        if re.fullmatch(r"\d{8}", stem):
+            datetime.strptime(stem, "%Y%m%d")
+            return stem, stem
+        match = re.fullmatch(r"(\d{8})_(\d{8})", stem)
+        if match is not None:
+            start, end = match.groups()
+            datetime.strptime(start, "%Y%m%d")
+            datetime.strptime(end, "%Y%m%d")
+            return (start, end) if start <= end else None
+    except ValueError:
+        return None
+    return None
+
+
+def _is_month_end(root: Path, as_of: str) -> bool:
+    """Require cached calendar through calendar month end, then compare last open day."""
+    checked = _real_date(as_of, "as_of")
+    year, month = int(checked[:4]), int(checked[4:6])
+    first = f"{checked[:6]}01"
+    final_day = calendar.monthrange(year, month)[1]
+    final = f"{checked[:6]}{final_day:02d}"
+    directory = _inside_root(root, root / "data/cache/trade_cal")
+    paths: list[Path] = []
+    for path in sorted(directory.glob("*.parquet")) if directory.exists() else []:
+        span = _calendar_shard_span(path.stem)
+        if span is None or span[1] < first or span[0] > final:
+            continue
+        paths.append(path)
+    if not paths:
+        raise C2ReviewError("trade_cal cache missing")
+    frames: list[pd.DataFrame] = []
+    for candidate in paths:
+        path = _inside_root(root, candidate)
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            raise C2ReviewError("trade_cal cache unreadable") from exc
+        if not {"cal_date", "is_open"}.issubset(frame.columns):
+            raise C2ReviewError("trade_cal cache missing required fields")
+        frames.append(frame[["cal_date", "is_open"]])
+    calendar_rows = pd.concat(frames, ignore_index=True)
+    if calendar_rows.empty:
+        raise C2ReviewError("trade_cal cache empty")
+    if not all(
+        isinstance(value, str) and bool(value.strip())
+        for value in calendar_rows["cal_date"].tolist()
+    ):
+        raise C2ReviewError("trade_cal cache has invalid cal_date values")
+    calendar_rows = calendar_rows[
+        (calendar_rows["cal_date"] >= first) & (calendar_rows["cal_date"] <= final)
+    ]
+    expected = {
+        day.strftime("%Y%m%d")
+        for day in pd.date_range(datetime(year, month, 1), datetime(year, month, final_day))
+    }
+    actual = set(calendar_rows["cal_date"])
+    if not expected.issubset(actual):
+        raise C2ReviewError("trade_cal cache does not prove coverage through month end")
+    if calendar_rows["cal_date"].duplicated().any():
+        duplicates = calendar_rows[calendar_rows["cal_date"].duplicated(False)]
+        for _, group in duplicates.groupby("cal_date"):
+            if len(set(pd.to_numeric(group["is_open"], errors="coerce"))) != 1:
+                raise C2ReviewError("trade_cal cache has contradictory duplicate rows")
+        calendar_rows = calendar_rows.drop_duplicates("cal_date", keep="last")
+    open_column = calendar_rows["is_open"]
+    if (pd.api.types.is_bool_dtype(open_column.dtype)
+            or not pd.api.types.is_numeric_dtype(open_column.dtype)):
+        raise C2ReviewError("trade_cal cache is_open must have numeric non-boolean dtype")
+    open_values = pd.to_numeric(open_column, errors="raise")
+    if (not all(math.isfinite(float(value)) for value in open_values)
+            or not set(open_values).issubset({0, 1})):
+        raise C2ReviewError("trade_cal cache has invalid is_open values")
+    open_days = sorted(calendar_rows.loc[open_values == 1, "cal_date"])
+    if not open_days:
+        raise C2ReviewError("trade_cal cache has no open day in review month")
+    if checked not in open_days:
+        raise C2ReviewError("decision as_of is not an open trading day")
+    return checked == open_days[-1]
+
+
+def _validate_core(cache: Path, as_of: str) -> None:
+    """Require each exact partition, non-empty rows, one matching date, and CORE_COLUMNS."""
+    root = cache.resolve().parent.parent
+    for endpoint, required in CORE_COLUMNS.items():
+        path = _inside_root(root, cache / endpoint / f"{as_of}.parquet")
+        if not path.is_file():
+            raise C2ReviewError(f"core endpoint partition missing: {endpoint}/{as_of}")
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            raise C2ReviewError(f"core endpoint partition unreadable: {endpoint}/{as_of}") from exc
+        missing = required - set(frame.columns)
+        if missing:
+            raise C2ReviewError(
+                f"core endpoint fields missing: {endpoint}/{as_of}: {sorted(missing)}"
+            )
+        if frame.empty:
+            raise C2ReviewError(f"core endpoint partition empty: {endpoint}/{as_of}")
+        dates = frame["trade_date"].tolist()
+        if (not all(isinstance(value, str) and bool(value.strip()) for value in dates)
+                or set(dates) != {as_of}):
+            raise C2ReviewError(f"core endpoint partition date mismatch: {endpoint}/{as_of}")
+        codes = frame["ts_code"]
+        if not all(
+            isinstance(code, str) and bool(code.strip()) for code in codes.tolist()
+        ):
+            raise C2ReviewError(f"core endpoint has invalid ts_code: {endpoint}/{as_of}")
+        if codes.duplicated().any():
+            raise C2ReviewError(f"core endpoint has duplicate ts_code: {endpoint}/{as_of}")
+        numeric_columns = required - {"ts_code", "trade_date"}
+        converted: dict[str, pd.Series] = {}
+        for column in numeric_columns:
+            source = frame[column]
+            if (pd.api.types.is_bool_dtype(source.dtype)
+                    or not pd.api.types.is_numeric_dtype(source.dtype)):
+                raise C2ReviewError(
+                    f"core endpoint numeric field must have numeric non-boolean dtype: "
+                    f"{column}: {endpoint}/{as_of}"
+                )
+            values = pd.to_numeric(source, errors="raise")
+            if not all(math.isfinite(float(value)) for value in values.dropna()):
+                raise C2ReviewError(
+                    f"core endpoint numeric field must be finite: {column}: {endpoint}/{as_of}"
+                )
+            converted[column] = values
+        if endpoint == "daily":
+            present = pd.DataFrame(converted)[["open", "high", "low", "close"]].notna().sum(axis=1)
+            if bool(((present != 0) & (present != 4)).any()):
+                raise C2ReviewError(f"daily OHLC must be all present or all null: {as_of}")
+            traded = present == 4
+            daily = pd.DataFrame(converted)
+            invalid_ohlc = traded & (
+                (daily[["open", "high", "low", "close"]] <= 0).any(axis=1)
+                | (daily["low"] > daily["high"])
+                | (daily["open"] < daily["low"])
+                | (daily["open"] > daily["high"])
+                | (daily["close"] < daily["low"])
+                | (daily["close"] > daily["high"])
+            )
+            if bool(invalid_ohlc.any()):
+                raise C2ReviewError(f"daily OHLC values are inconsistent: {as_of}")
+        elif endpoint in {"adj_factor", "stk_limit"}:
+            values = pd.DataFrame(converted)
+            if bool((values.isna() | (values <= 0)).any(axis=None)):
+                raise C2ReviewError(f"core endpoint has missing or non-positive values: {endpoint}/{as_of}")
+
+
+def _validate_factor_rows(value: Any) -> list[dict]:
+    if not isinstance(value, list) or not value:
+        raise C2ReviewError("factor snapshot must be a non-empty list")
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for index, row in enumerate(value):
+        if not isinstance(row, dict):
+            raise C2ReviewError(f"factor row {index} must be an object")
+        code = row.get("ts_code")
+        decile = row.get("decile")
+        if not isinstance(code, str) or not code:
+            raise C2ReviewError(f"factor row {index} has invalid ts_code")
+        if code in seen:
+            raise C2ReviewError(f"factor snapshot has duplicate ts_code {code}")
+        if not isinstance(decile, int) or isinstance(decile, bool) or not 1 <= decile <= 10:
+            raise C2ReviewError(f"factor row {index} has invalid decile")
+        seen.add(code)
+        rows.append(row)
+    return rows
+
+
+def _observations(decision: dict, factor_rows: list[dict]) -> list[dict]:
+    """Use HOLD/EXIT for held set and map D10 independently from factor rows."""
+    rows = decision.get("decisions")
+    if not isinstance(rows, list):
+        raise C2ReviewError("decision snapshot decisions must be a list")
+    factors = {row["ts_code"]: row["decile"] for row in factor_rows}
+    seen: dict[str, str] = {}
+    held: dict[str, dict] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise C2ReviewError(f"decision row {index} must be an object")
+        state = row.get("state")
+        if not isinstance(state, str) or state not in {"BUY", "WAIT", "HOLD", "EXIT"}:
+            raise C2ReviewError(f"decision row {index} has invalid state")
+        code = row.get("ts_code")
+        name = row.get("name")
+        if not isinstance(code, str) or not code or not isinstance(name, str) or not name:
+            raise C2ReviewError(f"decision row {index} is missing ts_code or name")
+        if code in seen:
+            qualifier = "contradictory" if seen[code] != state else "duplicate"
+            raise C2ReviewError(f"decision snapshot has {qualifier} row {code}")
+        seen[code] = state
+        if state not in {"HOLD", "EXIT"}:
+            continue
+        reasons = row.get("reason_codes")
+        if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
+            raise C2ReviewError(f"held decision row {index} has invalid reason_codes")
+        held[code] = row
+
+    observations: list[dict] = []
+    for code in sorted(held):
+        row = held[code]
+        reasons = set(row["reason_codes"])
+        if row["state"] == "EXIT" and reasons & _IMMEDIATE_BYPASS_REASONS:
+            status = "BYPASS"
+        else:
+            status = "INSIDE" if factors.get(code) == 10 else "OUTSIDE"
+        observations.append({"ts_code": code, "name": row["name"], "status": status})
+    return observations
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write allow_nan=False with temporary file, flush, fsync, replace, cleanup."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, ensure_ascii=True, indent=2, allow_nan=False) + "\n"
+    fd, temporary = tempfile.mkstemp(
+        prefix=".tmp_c2_review_", suffix=".json", dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _state_lock(state_path: Path):
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(f".{state_path.name}.lock")
+    handle = lock_path.open("a+b")
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+                os.fsync(handle.fileno())
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _load_state(path: Path) -> tuple[dict | None, bool]:
+    if not path.exists():
+        return None, False
+    payload = _parse_json(_read_bytes(path, "existing C2 state"), "existing C2 state")
+    if not isinstance(payload, dict):
+        raise C2ReviewError("existing C2 state must be an object")
+    validate_state(payload)
+    return payload, True
+
+
+def _discover_decision(root: Path) -> Path:
+    directory = _inside_root(root, root / "data/decisions")
+    matches = sorted(
+        path for path in directory.glob("*_buy_decisions.json")
+        if _DECISION_RE.fullmatch(path.name)
+    ) if directory.exists() else []
+    if not matches:
+        raise C2ReviewError("no dated buy decision snapshot found")
+    return _inside_root(root, matches[-1])
+
+
+def _factor_source(
+    root: Path, state_path: Path, decision: dict, as_of: str,
+) -> tuple[Path, bytes, str]:
+    factor_reference = decision.get("factor_snapshot")
+    if not isinstance(factor_reference, str) or not factor_reference:
+        raise C2ReviewError("decision factor_snapshot must be a non-empty path string")
+    factor_path = _resolve_under_root(root, factor_reference)
+    if not re.search(rf"(?:^|[/\\]){as_of}_factor\.json$", factor_reference):
+        raise C2ReviewError("factor_snapshot filename date must match decision as_of")
+    if state_path == factor_path:
+        raise C2ReviewError("state output path must differ from source input")
+    factor_raw = _read_bytes(factor_path, "factor snapshot")
+    return factor_path, factor_raw, _sha256(factor_raw)
+
+
+def _summary_error(message: str, *, status: str = "ERROR", **fields: Any) -> dict:
+    return {"status": status, **fields, "error": message}
+
+
+def _stamp_for_write(state: dict) -> dict:
+    stamped = dict(state)
+    stamped["updated_at"] = datetime.now(timezone.utc).isoformat()
+    validate_state(stamped)
+    return stamped
+
+
+def _blocked_result(
+    *,
+    state: dict | None,
+    state_path: Path,
+    period: str,
+    as_of: str,
+    issue: str,
+    evidence_hashes: dict[str, str],
+) -> tuple[dict, int]:
+    recorded = False
+    if state is not None:
+        blocked = record_blocked_review(
+            state,
+            period=period,
+            as_of=as_of,
+            issues=[issue],
+            evidence_hashes=evidence_hashes,
+        )
+        if blocked != state:
+            _atomic_write_json(state_path, _stamp_for_write(blocked))
+            recorded = True
+    return {
+        "status": "REVIEW_BLOCKED_DATA",
+        "period": period,
+        "as_of": as_of,
+        "issues": [issue],
+        "recorded": recorded,
+    }, 1
+
+
+def _run(args: argparse.Namespace) -> tuple[dict, int]:
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        raise C2ReviewError("root must be an existing directory")
+    decision_path = (
+        _resolve_under_root(root, args.decision)
+        if args.decision is not None else _discover_decision(root)
+    )
+    state_path = _resolve_under_root(
+        root, args.state or "data/decisions/c2_review_state.json",
+    )
+    _validate_state_target(root, state_path)
+    if state_path == decision_path:
+        raise C2ReviewError("state output path must differ from source input")
+
+    match = _DECISION_RE.fullmatch(decision_path.name)
+    if match is None:
+        raise C2ReviewError("decision filename must be YYYYMMDD_buy_decisions.json")
+    file_as_of = _real_date(match.group(1), "decision filename date")
+    period = file_as_of[:6]
+    decision_raw = _read_bytes(decision_path, "decision snapshot")
+    decision_hash = _sha256(decision_raw)
+
+    decision: dict | None = None
+    decision_error: C2ReviewError | None = None
+    readiness_error: str | None = None
+    try:
+        parsed_decision = _parse_json(decision_raw, "decision snapshot")
+        if not isinstance(parsed_decision, dict):
+            raise C2ReviewError("decision snapshot must be an object")
+        as_of = _real_date(parsed_decision.get("as_of"), "decision as_of")
+        if as_of != file_as_of:
+            raise C2ReviewError("decision as_of must match dated decision filename")
+        decision = parsed_decision
+        decision_hash = _decision_evidence_hash(decision)
+        try:
+            _require_decision_readiness(
+                decision, source=f"decision snapshot: {decision_path}",
+            )
+        except ValueError as exc:
+            c2_state = decision.get("c2_state")
+            explicitly_unready = (
+                decision.get("data_status") != "complete"
+                or (
+                    isinstance(c2_state, dict)
+                    and c2_state.get("status") == "UNAVAILABLE"
+                )
+            )
+            if explicitly_unready:
+                readiness_error = str(exc)
+            else:
+                raise C2ReviewError(str(exc)) from exc
+    except C2ReviewError as exc:
+        as_of = file_as_of
+        decision_error = exc
+    period = as_of[:6]
+    if readiness_error is not None:
+        return _blocked_result(
+            state=None,
+            state_path=state_path,
+            period=period,
+            as_of=as_of,
+            issue=readiness_error,
+            evidence_hashes={"decision_snapshot": decision_hash},
+        )
+    calendar_error: C2ReviewError | None = None
+    month_end = False
+    try:
+        month_end = _is_month_end(root, as_of)
+    except C2ReviewError as exc:
+        calendar_error = exc
+    if decision_error is None and calendar_error is None and not month_end:
+        return {"status": "NOT_DUE", "period": period, "as_of": as_of}, 0
+
+    if decision_error is not None and calendar_error is None and not month_end:
+        return _blocked_result(
+            state=None,
+            state_path=state_path,
+            period=period,
+            as_of=as_of,
+            issue=str(decision_error),
+            evidence_hashes={"decision_snapshot": decision_hash},
+        )
+
+    with _state_lock(state_path):
+        state, _ = _load_state(state_path)
+        existing = next((
+            review for review in (state or {}).get("reviews", [])
+            if review["status"] == "VALID" and review["period"] == period
+        ), None)
+        if (existing is not None
+                and existing["decision_snapshot"]["sha256"] != decision_hash):
+            raise _ReviewConflict(f"valid review conflict for period {period}")
+        if decision_error is not None:
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(decision_error),
+                evidence_hashes={"decision_snapshot": decision_hash},
+            )
+        assert decision is not None
+        if existing is not None:
+            try:
+                _, _, factor_hash = _factor_source(root, state_path, decision, as_of)
+            except C2ReviewError as exc:
+                raise _ReviewConflict(
+                    f"valid review evidence unavailable for period {period}: {exc}"
+                ) from exc
+            if existing["factor_snapshot"]["sha256"] != factor_hash:
+                raise _ReviewConflict(f"valid review conflict for period {period}")
+            return {
+                "status": "IDEMPOTENT",
+                "period": period,
+                "as_of": as_of,
+                "newly_exit_eligible": [],
+                "eligible_codes": sorted(eligible_codes(state)),
+            }, 0
+        if calendar_error is not None:
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(calendar_error),
+                evidence_hashes={"decision_snapshot": decision_hash},
+            )
+
+        assert month_end
+
+        factor_hash: str | None = None
+        try:
+            factor_path, factor_raw, factor_hash = _factor_source(
+                root, state_path, decision, as_of,
+            )
+            factor_value = _parse_json(factor_raw, "factor snapshot")
+            factor_rows = _validate_factor_rows(factor_value)
+        except C2ReviewError as exc:
+            blocked_hashes = {"decision_snapshot": decision_hash}
+            if factor_hash is not None:
+                blocked_hashes["factor_snapshot"] = factor_hash
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(exc),
+                evidence_hashes=blocked_hashes,
+            )
+
+        assert factor_hash is not None
+        evidence_hashes = {
+            "decision_snapshot": decision_hash,
+            "factor_snapshot": factor_hash,
+        }
+        try:
+            _validate_core(_inside_root(root, root / "data/cache"), as_of)
+            observations = _observations(decision, factor_rows)
+        except C2ReviewError as exc:
+            return _blocked_result(
+                state=state,
+                state_path=state_path,
+                period=period,
+                as_of=as_of,
+                issue=str(exc),
+                evidence_hashes=evidence_hashes,
+            )
+
+        evidence = {
+            "period": period,
+            "as_of": as_of,
+            "decision_snapshot": {
+                "path": _relative_path(root, decision_path), "sha256": decision_hash,
+            },
+            "factor_snapshot": {
+                "path": _relative_path(root, factor_path), "sha256": factor_hash,
+            },
+            "observations": observations,
+        }
+        advanced, events = advance_review(
+            state if state is not None else initial_state(), evidence,
+        )
+        stamped = _stamp_for_write(advanced)
+        _atomic_write_json(state_path, stamped)
+        newly = events["newly_exit_eligible"]
+        return {
+            "status": "VALID",
+            "period": period,
+            "as_of": as_of,
+            "observation_count": len(observations),
+            "newly_exit_eligible": newly,
+            "eligible_codes": sorted(eligible_codes(stamped)),
+        }, 2 if newly else 0
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(description="Validate and persist a monthly C2 holding review")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--decision")
+    parser.add_argument("--state")
+    return parser
+
+
+def _emit(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=True, sort_keys=True, allow_nan=False))
+
+
+def main(argv: list[str] | None = None) -> None:
+    try:
+        args = _parser().parse_args(argv)
+        summary, code = _run(args)
+    except C2ReviewError as exc:
+        summary, code = _summary_error(str(exc)), 1
+    except Exception as exc:
+        summary, code = _summary_error(f"{type(exc).__name__}: operation failed"), 1
+    _emit(summary)
+    raise SystemExit(code)
+
+
+if __name__ == "__main__":
+    main()

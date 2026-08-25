@@ -7,6 +7,7 @@ import pytest
 
 import scripts.buy_list as bl
 from ashare_gauntlet.account_state import AccountFreshnessError
+from ashare_gauntlet.c2_review import advance_review, initial_state, record_blocked_review
 
 
 def _setup(tmp_path, monkeypatch, snap_date="20260101", rows=None, holdings=None):
@@ -30,6 +31,7 @@ def _setup(tmp_path, monkeypatch, snap_date="20260101", rows=None, holdings=None
         {"ts_code": "600001.SH", "as_of": "20251201", "verdict": "clear",
          "reason": "t", "expires_on": "20270101"}]}, ensure_ascii=False), encoding="utf-8")
     ddir = tmp_path / "decisions"
+    ddir.mkdir(exist_ok=True)
     monkeypatch.setattr(bl, "CACHE", str(cache))
     monkeypatch.setattr(bl, "FACTOR_DIR", str(fdir))
     monkeypatch.setattr(bl, "HOLDINGS_PATH", str(hpath))
@@ -46,6 +48,156 @@ def _row(ts="600001.SH", **kw):
             "f_EP": 0.9, "f_BP": 0.9, "f_IVOL": 0.9}
     base.update(kw)
     return base
+
+
+def _c2_state(*, blocked=False):
+    def evidence(period, as_of, observations):
+        return {
+            "period": period,
+            "as_of": as_of,
+            "decision_snapshot": {"path": f"{as_of}_buy_decisions.json", "sha256": "d" * 64},
+            "factor_snapshot": {"path": f"{as_of}_factor.json", "sha256": "f" * 64},
+            "observations": observations,
+        }
+
+    state, _ = advance_review(initial_state(), evidence(
+        "202601", "20260130", [{"ts_code": "600001.SH", "name": "甲", "status": "OUTSIDE"}]))
+    state, _ = advance_review(state, evidence(
+        "202602", "20260227", [{"ts_code": "600001.SH", "name": "甲", "status": "OUTSIDE"}]))
+    state, _ = advance_review(state, evidence(
+        "202603", "20260331", [
+            {"ts_code": "600001.SH", "name": "甲", "status": "OUTSIDE"},
+            {"ts_code": "600002.SH", "name": "乙", "status": "OUTSIDE"},
+        ]))
+    if blocked:
+        state = record_blocked_review(state, period="202604", as_of="20260430",
+                                      issues=["CORE_EOD_MISSING", "ADJ_FACTOR_GAP"],
+                                      evidence_hashes={})
+    return state
+
+
+def test_load_c2_projection_missing_is_normal(tmp_path):
+    assert bl.load_c2_projection(tmp_path / "c2_review_state.json") == {
+        "status": "NOT_INITIALIZED",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": None,
+    }
+
+
+def test_load_c2_projection_projects_sorted_valid_positions(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.write_text(json.dumps(_c2_state()), encoding="utf-8")
+    projection = bl.load_c2_projection(path)
+    assert projection["status"] == "AVAILABLE"
+    assert projection["last_valid_review_as_of"] == "20260331"
+    assert projection["watch"] == ["600002.SH"]
+    assert projection["exit_eligible"] == ["600001.SH"]
+    assert all(isinstance(code, str) for code in projection["watch"] + projection["exit_eligible"])
+
+
+def test_load_c2_projection_blocked_retains_prior_positions_and_issues(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.write_text(json.dumps(_c2_state(blocked=True)), encoding="utf-8")
+    projection = bl.load_c2_projection(path)
+    assert projection["status"] == "REVIEW_BLOCKED_DATA"
+    assert projection["last_valid_review_as_of"] == "20260331"
+    assert projection["watch"] == ["600002.SH"]
+    assert projection["exit_eligible"] == ["600001.SH"]
+    assert projection["error"] == "REVIEW_BLOCKED_DATA:ADJ_FACTOR_GAP,CORE_EOD_MISSING"
+
+
+def test_load_c2_projection_rejects_nonfinite_json(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.write_text('{"value": NaN}', encoding="utf-8")
+    projection = bl.load_c2_projection(path)
+    assert projection["status"] == "UNAVAILABLE"
+    assert projection["exit_eligible"] == []
+    assert projection["error"] == "C2_STATE_INVALID_JSON"
+
+
+def test_load_c2_projection_unreadable_oserror(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.mkdir()
+
+    projection = bl.load_c2_projection(path)
+
+    assert projection["status"] == "UNAVAILABLE"
+    assert projection["exit_eligible"] == []
+    assert projection["error"] == "C2_STATE_UNREADABLE"
+
+
+def test_load_c2_projection_rejects_invalid_schema(tmp_path):
+    path = tmp_path / "c2_review_state.json"
+    path.write_text("{}", encoding="utf-8")
+
+    projection = bl.load_c2_projection(path)
+
+    assert projection["status"] == "UNAVAILABLE"
+    assert projection["exit_eligible"] == []
+    assert projection["error"] == "C2_STATE_INVALID_SCHEMA"
+
+
+def test_valid_c2_only_confirmed_position_exits(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[
+        _row("600001.SH"), _row("600002.SH"),
+    ], holdings={"as_of": "20260101", "positions": [
+        {"ts_code": "600001.SH", "name": "甲", "industry": "化工原料",
+         "shares": 100, "cost": 5.0, "last": 6.0, "mv": 600.0},
+        {"ts_code": "600002.SH", "name": "乙", "industry": "化工原料",
+         "shares": 100, "cost": 5.0, "last": 6.0, "mv": 600.0},
+    ], "cash": 100000.0})
+    sidecar = out_path.parent / "c2_review_state.json"
+    sidecar.write_text(json.dumps(_c2_state()), encoding="utf-8")
+    bl.main([])
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert out["c2_state"]["status"] == "AVAILABLE"
+    decisions = {row["ts_code"]: row for row in out["decisions"]}
+    assert decisions["600001.SH"]["state"] == "EXIT"
+    assert decisions["600001.SH"]["reason_codes"] == ["EXIT_RULE_C2_CONFIRMED"]
+    assert decisions["600002.SH"]["state"] == "HOLD"
+
+
+def test_unheld_c2_eligible_code_does_not_create_decision(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("600002.SH")], holdings={
+        "as_of": "20260101", "positions": [{
+            "ts_code": "600002.SH", "name": "乙", "industry": "化工原料",
+            "shares": 100, "cost": 5.0, "last": 6.0, "mv": 600.0,
+        }], "cash": 100000.0,
+    })
+    sidecar = out_path.parent / "c2_review_state.json"
+    sidecar.write_text(json.dumps(_c2_state()), encoding="utf-8")
+
+    bl.main([])
+
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert {row["ts_code"] for row in out["decisions"]} == {"600002.SH"}
+    assert out["decisions"][0]["state"] == "HOLD"
+
+
+def test_corrupt_c2_writes_snapshot_then_exits_one(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("600009.SH", last=3.0)], holdings={
+        "as_of": "20260101", "positions": [{
+            "ts_code": "600009.SH", "name": "破线股", "industry": "航空",
+            "shares": 100, "cost": 5.0, "last": 3.0, "mv": 300.0, "stop": 4.0,
+        }], "cash": 100000.0,
+    })
+    sidecar = out_path.parent / "c2_review_state.json"
+    sidecar.write_bytes(b"{not-json")
+    with pytest.raises(SystemExit) as exc:
+        bl.main([])
+    assert exc.value.code == 1
+    assert sidecar.read_bytes() == b"{not-json"
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert out["data_status"] == "degraded"
+    assert out["c2_state"] == {
+        "status": "UNAVAILABLE", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_INVALID_JSON",
+    }
+    decision = out["decisions"][0]
+    assert decision["state"] == "EXIT"
+    assert "RISK_LINE_BREACH" in decision["reason_codes"]
 
 
 def test_stale_snapshot_fails_loud(tmp_path, monkeypatch):
@@ -248,3 +400,75 @@ def test_existing_decision_not_overwritten_on_fail(tmp_path, monkeypatch):
     with pytest.raises((SystemExit, AccountFreshnessError)):
         bl.main([])
     assert out_path.read_text(encoding="utf-8") == old_content
+
+
+def test_invalid_decision_code_preserves_existing_snapshot_bytes(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("A")])
+    old = b'{"old": true}\r\n'
+    out_path.write_bytes(old)
+
+    with pytest.raises(ValueError, match="invalid ts_code"):
+        bl.main([])
+
+    assert out_path.read_bytes() == old
+    assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))
+
+
+def test_snapshot_serialization_failure_preserves_existing_bytes(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch)
+    old = b'{"old": true}\r\n'
+    out_path.write_bytes(old)
+    monkeypatch.setattr(bl, "load_c2_projection", lambda path: {
+        "status": "AVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [],
+        "exit_eligible": [],
+        "error": float("nan"),
+    })
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        bl.main([])
+
+    assert out_path.read_bytes() == old
+    assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))
+
+
+@pytest.mark.parametrize("failure_point", ["write", "fsync", "replace"])
+def test_snapshot_atomic_failure_preserves_existing_bytes(
+        tmp_path, monkeypatch, failure_point):
+    out_path = _setup(tmp_path, monkeypatch)
+    old = b'{"old": true}\r\n'
+    out_path.write_bytes(old)
+
+    if failure_point == "write":
+        class FailingWriter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, payload):
+                raise OSError("write failed")
+
+        def fail_write(fd, *args, **kwargs):
+            bl.os.close(fd)
+            return FailingWriter()
+
+        monkeypatch.setattr(bl.os, "fdopen", fail_write)
+    elif failure_point == "fsync":
+        monkeypatch.setattr(
+            bl.os, "fsync",
+            lambda fd: (_ for _ in ()).throw(OSError("fsync failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            bl.os, "replace",
+            lambda src, dst: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+
+    with pytest.raises(OSError, match=f"{failure_point} failed"):
+        bl.main([])
+
+    assert out_path.read_bytes() == old
+    assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))

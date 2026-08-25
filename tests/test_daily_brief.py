@@ -56,13 +56,212 @@ def _setup_root(tmp_path: Path, *, decisions, as_of=AS_OF, holdings=None,
     _dump(tmp_path / f"data/holdscore/{as_of}_factor.json", [])
     _dump(tmp_path / f"data/decisions/{as_of}_buy_decisions.json", {
         "as_of": as_of, "data_status": "complete",
-        "generated_at": "2026-08-18T17:40:00+08:00", "decisions": decisions})
+        "generated_at": "2026-08-18T17:40:00+08:00",
+        "c2_state": {
+            "status": "NOT_INITIALIZED",
+            "last_valid_review_as_of": None,
+            "watch": [], "exit_eligible": [], "error": None,
+        },
+        "decisions": decisions})
     if account_state is not None:
         _dump(tmp_path / f"data/account_state/{as_of}_account_state.json", account_state)
     return tmp_path
 
 
-def test_machine_states_read_verbatim_and_dividend_overlay(tmp_path: Path) -> None:
+def test_brief_consumes_c2_watch_blocked_and_confirmed_exit(tmp_path: Path) -> None:
+    decisions = [_decision("000001.SZ", "EXIT",
+                           reason_codes=["EXIT_RULE_C2_CONFIRMED"])]
+    root = _setup_root(tmp_path, decisions=decisions)
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["c2_state"] = {
+        "status": "REVIEW_BLOCKED_DATA",
+        "last_valid_review_as_of": "20260130",
+        "watch": ["600000.SH"],
+        "exit_eligible": ["000001.SZ"],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "REVIEW_BLOCKED_DATA"
+    assert [row["ts_code"] for row in c2["members"]] == ["600000.SH"]
+    assert c2["error"] == "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING"
+    assert c2["last_valid_review_as_of"] == "20260130"
+    assert "streak" in c2["reason"]
+    assert [row["ts_code"] for row in brief["machine"]["exits"]] == ["000001.SZ"]
+    assert any("EXIT 信号" in item and "000001.SZ" in item for item in brief["next_actions"])
+
+
+@pytest.mark.parametrize(("c2_state", "expected_code"), [
+    ({
+        "status": "REVIEW_BLOCKED_DATA",
+        "last_valid_review_as_of": "20260130",
+        "watch": [], "exit_eligible": [],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
+    }, 1),
+    ({
+        "status": "NOT_INITIALIZED",
+        "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": None,
+    }, 0),
+])
+def test_c2_blocked_is_system_failure_but_not_initialized_is_calm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    c2_state: dict,
+    expected_code: int,
+) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["c2_state"] = c2_state
+    _dump(path, snapshot)
+    _dump(root / "data/holdscore/gate_baseline.json",
+          {"frozen_at": "2026-08-18T17:00:00+08:00", "factors": [], "composite": {}})
+
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": True, "status": "ready", "blockers": [], "warnings": [],
+            "as_of": AS_OF,
+            "components": {"eod": {"status": "ready", "as_of": AS_OF},
+                           "holdings": {"freshness": "aligned", "as_of": AS_OF}},
+        },
+    })
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["next_actions"] == []
+    assert brief["exit_code"] == expected_code
+    if c2_state["status"] == "REVIEW_BLOCKED_DATA":
+        c2 = brief["machine"]["c2_watch"]
+        assert c2["error"] == "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING"
+        assert c2["last_valid_review_as_of"] == "20260130"
+        assert "streak" in c2["reason"]
+
+
+@pytest.mark.parametrize("blocker", [
+    "ACCOUNT_STATE_INCOMPLETE",
+    "ACCOUNT_STATE_UNAVAILABLE",
+    "DECISION_NOT_ALIGNED",
+    "FUTURE_READINESS_BLOCKER",
+])
+def test_readiness_alignment_blockers_are_system_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocker: str,
+) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    _dump(root / "data/holdscore/gate_baseline.json", {
+        "frozen_at": "2026-08-18T17:00:00+08:00",
+        "factors": [],
+        "composite": {},
+    })
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": False,
+            "status": "blocked",
+            "blockers": [blocker],
+            "warnings": [],
+            "as_of": AS_OF,
+            "components": {
+                "eod": {"status": "ready", "as_of": AS_OF},
+                "holdings": {"freshness": "aligned", "as_of": AS_OF},
+            },
+        },
+    })
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["readiness"]["blockers"] == [blocker]
+    assert brief["machine"]["c2_watch"]["status"] == "NOT_INITIALIZED"
+    assert brief["exit_code"] == 1
+
+
+def test_confirmed_reason_does_not_upgrade_wait_or_hold_to_exit(tmp_path: Path) -> None:
+    decisions = [
+        _decision("000001.SZ", "WAIT", reason_codes=["EXIT_RULE_C2_CONFIRMED"]),
+        _decision("000002.SZ", "HOLD", reason_codes=["EXIT_RULE_C2_CONFIRMED"]),
+    ]
+    root = _setup_root(tmp_path, decisions=decisions)
+
+    brief = db.build_brief(root, now=NOW)
+
+    assert brief["decision_snapshot"]["state_counts"] == {
+        "BUY": 0, "WAIT": 1, "HOLD": 1, "EXIT": 0,
+    }
+    assert brief["machine"]["exits"] == []
+    assert not any(item.startswith("③") for item in brief["next_actions"])
+
+
+def test_brief_keeps_watch_informational_and_surfaces_unavailable(tmp_path: Path) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["data_status"] = "degraded"
+    snapshot["c2_state"] = {
+        "status": "UNAVAILABLE",
+        "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": [], "error": "C2_STATE_INVALID_SCHEMA",
+    }
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "UNAVAILABLE"
+    assert "数据不可用" in c2["reason"]
+    assert brief["machine"]["exits"] == []
+    assert not any("C2" in item for item in brief["next_actions"])
+
+
+def test_brief_missing_c2_state_is_not_initialized(tmp_path: Path) -> None:
+    root = _setup_root(tmp_path, decisions=[
+        _decision("600000.SH", "WAIT", decile=5,
+                  reason_codes=["EXIT_RULE_C2_MONTHLY"]),
+    ])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot.pop("c2_state")
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "NOT_INITIALIZED"
+    assert "尚未初始化" in c2["reason"]
+    assert c2["watch"] == []
+    assert c2["members"] == []
+    assert "C2观察(WATCH)" not in db.render_text(brief)
+
+
+def test_brief_available_watch_is_informational_only(tmp_path: Path) -> None:
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    path = root / f"data/decisions/{AS_OF}_buy_decisions.json"
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    snapshot["c2_state"] = {
+        "status": "AVAILABLE",
+        "last_valid_review_as_of": "20260130",
+        "watch": ["600000.SH"], "exit_eligible": [], "error": None,
+    }
+    _dump(path, snapshot)
+
+    brief = db.build_brief(root, now=NOW)
+
+    c2 = brief["machine"]["c2_watch"]
+    assert c2["status"] == "AVAILABLE"
+    assert c2["watch"] == ["600000.SH"]
+    assert brief["machine"]["exits"] == []
+    assert not any("600000.SH" in item and "EXIT" in item for item in brief["next_actions"])
+
+
+def test_machine_states_read_verbatim_and_dividend_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     decisions = [
         _decision("600000.SH", "BUY", decile=10, max_entry=12.3, shares=1000,
                   reason_codes=["D10", "TIER_GREEN", "FACTCHECK_CLEAR"]),
@@ -73,6 +272,17 @@ def test_machine_states_read_verbatim_and_dividend_overlay(tmp_path: Path) -> No
         {"ts_code": "600000.SH", "dv_ttm": 4.2, "dv_ratio": 3.9},
         {"ts_code": "000001.SZ", "dv_ttm": 1.8, "dv_ratio": 1.5},
     ])
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": True, "status": "ready", "blockers": [], "warnings": [],
+            "as_of": AS_OF,
+            "components": {
+                "eod": {"status": "ready", "as_of": AS_OF},
+                "holdings": {"freshness": "aligned", "as_of": AS_OF},
+            },
+        },
+    })
     brief = db.build_brief(root, now=NOW)
 
     # 状态计数逐字来自快照

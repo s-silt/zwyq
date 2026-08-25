@@ -13,7 +13,9 @@ import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Sequence
 
 import pandas as pd
@@ -35,6 +37,10 @@ REPORT_PREFIX = "BACKFILL_RESULT_JSON="
 
 class TradeCalendarUnavailableError(RuntimeError):
     """Raised when strict mode cannot establish the complete open-day set."""
+
+
+class _CalendarCacheMiss(Exception):
+    """Internal sentinel that keeps read_or_fetch from persisting a cache miss."""
 
 
 def _validate_date_range(start: str, end: str) -> None:
@@ -97,6 +103,21 @@ def days_to_pull(cal: pd.DataFrame | None, start: str, end: str) -> list[str]:
     return [d for d in trading_days_from_cal(cal) if start <= d <= end]
 
 
+def _atomic_write_trade_cal(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{path.name}.", suffix=".parquet", dir=path.parent, delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        frame.to_parquet(temporary, index=False)
+        with temporary.open("r+b") as completed:
+            os.fsync(completed.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def fetch_trade_cal(
     pro: object,
     start: str,
@@ -114,31 +135,44 @@ def fetch_trade_cal(
         )
         if df.empty:
             raise RuntimeError(f"trade_cal returned 0 rows for {start}..{end}")
-        return df
+        return _validate_trade_cal(df, start, end)
+
+    cache_error: Exception | None = None
+    try:
+        cached = read_or_fetch(
+            path,
+            lambda: (_ for _ in ()).throw(_CalendarCacheMiss()),
+        )
+        return _validate_trade_cal(cached, start, end)
+    except _CalendarCacheMiss:
+        pass
+    except Exception as exc:  # noqa: BLE001 - corrupt cache triggers one recovery pull.
+        cache_error = exc
 
     try:
-        cal = read_or_fetch(path, _pull)
+        recovered = _pull()
+        _atomic_write_trade_cal(path, recovered)
+        return recovered
     except TokenExpiredError:
         raise
-    except Exception as exc:  # noqa: BLE001 - strict mode converts this to a contract failure.
-        if strict:
-            raise TradeCalendarUnavailableError(
+    except Exception as exc:  # noqa: BLE001 - strict mode converts to contract failure.
+        if cache_error is None:
+            message = (
                 f"trade_cal {start}..{end} unavailable: {type(exc).__name__}: {exc}"
-            ) from exc
-        print(
-            f"warning: trade_cal {start}..{end} 拉取失败({type(exc).__name__}: {str(exc)[:80]})"
-            "—— 回退区间内全自然日逐日试错(休市日会以 EmptyMarketDayError 暴露)",
-            flush=True,
-        )
-        return None
-
-    try:
-        return _validate_trade_cal(cal, start, end)
-    except TradeCalendarUnavailableError as exc:
-        message = f"{exc}(在 {path})"
+            )
+        else:
+            message = (
+                f"trade_cal cache invalid at {path}: "
+                f"{type(cache_error).__name__}: {cache_error}; recovery unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
         if strict:
             raise TradeCalendarUnavailableError(message) from exc
-        print(f"warning: {message}—— 回退区间内全自然日逐日试错", flush=True)
+        print(
+            f"warning: {message[:500]}—— 回退区间内全自然日逐日试错"
+            "(休市日会以 EmptyMarketDayError 暴露)",
+            flush=True,
+        )
         return None
 
 

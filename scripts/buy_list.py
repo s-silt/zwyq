@@ -25,6 +25,7 @@ from ashare_gauntlet.candidates import candidate_assessment, override_status
 from ashare_gauntlet.config import CACHE_DIR as CACHE, HOLDINGS_PATH
 from ashare_gauntlet.c2_review import C2ReviewError, eligible_codes, validate_state
 from ashare_gauntlet.data.partition import date_partition_files
+from ashare_gauntlet.decision_snapshot import validate_decision_snapshot
 from ashare_gauntlet.portfolio_decision import decide_states, validate_policy
 from scripts.illiq_capacity import BUCKETS, mv_terciles
 
@@ -284,6 +285,7 @@ def main(argv: list[str] | None = None) -> None:
            "c2_state": c2_state,
            "decisions": decisions}
     out_path = f"{DECISION_DIR}/{as_of}_buy_decisions.json"
+    validate_decision_snapshot(out, source=f"decision snapshot: {out_path}")
     payload = json.dumps(out, ensure_ascii=False, indent=2, allow_nan=False)
     os.makedirs(DECISION_DIR, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(

@@ -13,6 +13,8 @@ _CONSUMABLE_C2_STATUSES = {
     "AVAILABLE", "NOT_INITIALIZED", "REVIEW_BLOCKED_DATA",
 }
 _DATE8 = re.compile(r"^\d{8}$")
+_TS_CODE = re.compile(r"^\d{6}\.(?:SH|SZ)$")
+_DECISION_STATES = frozenset({"BUY", "WAIT", "HOLD", "EXIT"})
 _BLOCKED_ERROR_PREFIX = "REVIEW_BLOCKED_DATA:"
 
 
@@ -57,6 +59,14 @@ def validate_c2_projection(value: Any, *, label: str = "c2_state") -> dict[str, 
     eligible = _validate_code_list(value["exit_eligible"], f"{label}.exit_eligible")
     if set(watch) & set(eligible):
         raise ValueError(f"{label}.watch and {label}.exit_eligible must be disjoint")
+    if (
+        status in {"AVAILABLE", "REVIEW_BLOCKED_DATA"}
+        and (watch or eligible)
+        and value["last_valid_review_as_of"] is None
+    ):
+        raise ValueError(
+            f"{label}.last_valid_review_as_of must be a real date when members exist"
+        )
 
     error = value["error"]
     if status in {"AVAILABLE", "NOT_INITIALIZED"} and error is not None:
@@ -74,12 +84,39 @@ def validate_c2_projection(value: Any, *, label: str = "c2_state") -> dict[str, 
     return value
 
 
+def validate_decision_snapshot(
+    snapshot: Any, *, source: str = "decision snapshot",
+) -> dict[str, Any]:
+    """Validate the minimal decision-row contract shared by all consumers."""
+    if not isinstance(snapshot, dict):
+        raise ValueError(f"{source} must be an object")
+    decisions = snapshot.get("decisions")
+    if not isinstance(decisions, list):
+        raise ValueError(f"{source} decisions must be a list")
+
+    seen: set[str] = set()
+    for index, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            raise ValueError(f"{source} decision[{index}] must be an object")
+        code = decision.get("ts_code")
+        if not isinstance(code, str) or not _TS_CODE.fullmatch(code):
+            raise ValueError(f"{source} decision[{index}] has invalid ts_code")
+        if code in seen:
+            raise ValueError(f"{source} has duplicate decision ts_code {code}")
+        seen.add(code)
+        state = decision.get("state")
+        if not isinstance(state, str) or state not in _DECISION_STATES:
+            raise ValueError(
+                f"{source} decision[{index}] has invalid state {state!r}"
+            )
+    return snapshot
+
+
 def require_decision_snapshot_ready(
     snapshot: Any, *, source: str = "decision snapshot",
 ) -> dict[str, Any]:
     """Require a complete snapshot with a consumable C2 projection."""
-    if not isinstance(snapshot, dict):
-        raise ValueError(f"{source} must be an object")
+    validate_decision_snapshot(snapshot, source=source)
     if snapshot.get("data_status") != "complete":
         raise ValueError(f"{source} is not complete")
     c2_state = snapshot.get("c2_state")

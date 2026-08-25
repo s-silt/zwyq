@@ -246,6 +246,10 @@ def test_latest_decisions_rejects_unavailable_c2_marked_complete(tmp_path: Path)
         "status": "AVAILABLE", "last_valid_review_as_of": "20260807",
         "watch": [], "exit_eligible": [], "error": "unexpected",
     }),
+    ("available_members_without_last_valid", {
+        "status": "AVAILABLE", "last_valid_review_as_of": None,
+        "watch": ["A"], "exit_eligible": [], "error": None,
+    }),
     ("not_initialized_with_state", {
         "status": "NOT_INITIALIZED", "last_valid_review_as_of": "20260807",
         "watch": ["001218.SZ"], "exit_eligible": [], "error": None,
@@ -261,6 +265,11 @@ def test_latest_decisions_rejects_unavailable_c2_marked_complete(tmp_path: Path)
     ("blocked_unstable_error", {
         "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": "20260807",
         "watch": [], "exit_eligible": [], "error": "CORE_EOD_MISSING",
+    }),
+    ("blocked_members_without_last_valid", {
+        "status": "REVIEW_BLOCKED_DATA", "last_valid_review_as_of": None,
+        "watch": [], "exit_eligible": ["A"],
+        "error": "REVIEW_BLOCKED_DATA:CORE_EOD_MISSING",
     }),
     ("extra_field", {
         "status": "AVAILABLE", "last_valid_review_as_of": "20260807",

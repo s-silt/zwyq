@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 
@@ -152,3 +153,76 @@ def test_main_rejects_latest_unready_snapshot_before_market_or_write(
 
     assert calls == []
     assert records_path.read_bytes() == old
+
+
+def test_main_rejects_invalid_decision_before_market_or_write(tmp_path: Path, monkeypatch) -> None:
+    import scripts.execution_record as er
+
+    decision_dir = tmp_path / "decisions"
+    decision_dir.mkdir()
+    (decision_dir / "20260102_buy_decisions.json").write_text(json.dumps({
+        "as_of": "20260102", "data_status": "complete",
+        "c2_state": {
+            "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+            "watch": [], "exit_eligible": [], "error": None,
+        },
+        "decisions": [{"ts_code": "A", "state": "WAIT"}],
+    }), encoding="utf-8")
+    records_path = tmp_path / "execution_records.json"
+    old = b'{"records": [{"sentinel": true}]}\r\n'
+    records_path.write_bytes(old)
+    calls: list[str] = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} called before snapshot validation")
+        return fail
+
+    monkeypatch.setattr(er, "DECISION_DIR", str(decision_dir))
+    monkeypatch.setattr(er, "RECORDS_PATH", str(records_path))
+    monkeypatch.setattr(er, "latest_trade_date", lambda: "20260103")
+    monkeypatch.setattr(er, "date_partition_files", forbidden("date_partition_files"))
+    monkeypatch.setattr(er, "tushare_pro", forbidden("tushare_pro"))
+    monkeypatch.setattr(er, "fetch_market_day", forbidden("fetch_market_day"))
+
+    with pytest.raises(ValueError, match="invalid ts_code"):
+        er.main()
+
+    assert calls == []
+    assert records_path.read_bytes() == old
+
+
+def test_main_accepts_valid_empty_decisions(tmp_path: Path, monkeypatch) -> None:
+    import scripts.execution_record as er
+
+    decision_dir = tmp_path / "decisions"
+    decision_dir.mkdir()
+    (decision_dir / "20260102_buy_decisions.json").write_text(json.dumps({
+        "as_of": "20260102", "data_status": "complete",
+        "c2_state": {
+            "status": "NOT_INITIALIZED", "last_valid_review_as_of": None,
+            "watch": [], "exit_eligible": [], "error": None,
+        },
+        "decisions": [],
+    }), encoding="utf-8")
+    holdings_path = tmp_path / "holdings.json"
+    holdings_path.write_text(json.dumps({"positions": []}), encoding="utf-8")
+    records_path = tmp_path / "execution_records.json"
+
+    monkeypatch.setattr(er, "DECISION_DIR", str(decision_dir))
+    monkeypatch.setattr(er, "HOLDINGS_PATH", str(holdings_path))
+    monkeypatch.setattr(er, "RECORDS_PATH", str(records_path))
+    monkeypatch.setattr(er, "CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(er, "latest_trade_date", lambda: "20260103")
+    monkeypatch.setattr(er, "date_partition_files", lambda cache, endpoint: [
+        tmp_path / "cache" / endpoint / "20260103.parquet",
+    ])
+    monkeypatch.setattr(er, "tushare_pro", lambda: object())
+    monkeypatch.setattr(er, "fetch_market_day", lambda *args: pd.DataFrame())
+
+    er.main()
+
+    book = json.loads(records_path.read_text(encoding="utf-8"))
+    assert book["records"][0]["decision_as_of"] == "20260102"
+    assert book["records"][0]["buy_checks"] == []

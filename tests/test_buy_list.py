@@ -402,6 +402,18 @@ def test_existing_decision_not_overwritten_on_fail(tmp_path, monkeypatch):
     assert out_path.read_text(encoding="utf-8") == old_content
 
 
+def test_invalid_decision_code_preserves_existing_snapshot_bytes(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("A")])
+    old = b'{"old": true}\r\n'
+    out_path.write_bytes(old)
+
+    with pytest.raises(ValueError, match="invalid ts_code"):
+        bl.main([])
+
+    assert out_path.read_bytes() == old
+    assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))
+
+
 def test_snapshot_serialization_failure_preserves_existing_bytes(tmp_path, monkeypatch):
     out_path = _setup(tmp_path, monkeypatch)
     old = b'{"old": true}\r\n'

@@ -352,23 +352,10 @@ def _validate_decision_snapshot(snapshot: Any, path: Path) -> dict[str, Any]:
     if match is None or match.group(1) != as_of:
         raise ValueError(f"decision filename/as_of mismatch: {path.name} vs {as_of}")
     require_decision_snapshot_ready(result, source=f"decision snapshot: {path}")
-    decisions = result.get("decisions")
-    if not isinstance(decisions, list):
-        raise ValueError(f"decision snapshot decisions must be a list: {path}")
+    decisions = result["decisions"]
 
-    seen: set[str] = set()
     for index, decision in enumerate(decisions):
-        if not isinstance(decision, dict):
-            raise ValueError(f"decision[{index}] must be an object: {path}")
-        code = decision.get("ts_code")
-        if not isinstance(code, str) or not _TS_CODE.fullmatch(code):
-            raise ValueError(f"decision[{index}] has invalid ts_code: {path}")
-        if code in seen:
-            raise ValueError(f"duplicate decision ts_code {code}: {path}")
-        seen.add(code)
         state = decision.get("state")
-        if state not in _DECISION_STATES:
-            raise ValueError(f"decision[{index}] has invalid state {state!r}: {path}")
         if not isinstance(decision.get("execution"), dict):
             raise ValueError(f"decision[{index}] has invalid execution: {path}")
         reasons = decision.get("reason_codes")

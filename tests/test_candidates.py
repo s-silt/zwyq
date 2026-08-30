@@ -26,6 +26,28 @@ def test_perfect_candidate_is_buy_eligible():
     assert a["reason_codes"] == ["D10", "TIER_GREEN", "FACTCHECK_CLEAR"]
 
 
+def test_b8_band_member_is_buy_eligible_with_band_code():
+    """X-14:D9 且 b8_band=True(上期成员仍在带内)→ 资格成立,来源码 B8_BAND。"""
+    from ashare_gauntlet.candidates import candidate_assessment
+
+    a = candidate_assessment(_row(decile=9, b8_band=True), _ov(), AS_OF)
+    assert a["eligible_buy"] is True
+    assert a["reason_codes"] == ["B8_BAND", "TIER_GREEN", "FACTCHECK_CLEAR"]
+    # D8 也在带内
+    a8 = candidate_assessment(_row(decile=8, b8_band=True), _ov(), AS_OF)
+    assert a8["eligible_buy"] is True
+
+
+def test_b8_band_requires_decile_in_band():
+    """防御:跌穿带(decile≤7)即使误标 b8_band 也被 NOT_D10 否决;不注入字段=旧口径。"""
+    from ashare_gauntlet.candidates import candidate_assessment
+
+    for row in (_row(decile=7, b8_band=True), _row(decile=9), _row(decile=9, b8_band=False)):
+        a = candidate_assessment(row, _ov(), AS_OF)
+        assert a["eligible_buy"] is False, row
+        assert "NOT_D10" in a["reason_codes"], row
+
+
 def test_veto_truth_table():
     from ashare_gauntlet.candidates import candidate_assessment
 

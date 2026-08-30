@@ -33,11 +33,62 @@ FACTOR_DIR = "data/holdscore"
 DECISION_DIR = "data/decisions"
 POLICY_PATH = "data/trading_policy.json"
 OVERRIDES_PATH = "data/factcheck_overrides.json"
+B8_STATE_PATH = os.path.join(DECISION_DIR, "b8_state.json")   # X-14:带保留成员持久状态
+B8_SCHEMA = "b8_state.v1"
 REQUIRED_ROW_FIELDS = ("ts_code", "name", "industry", "decile", "tier",
                        "spec_crowd", "spike_limit", "score", "last", "mv",
                        "f_EP", "f_BP", "f_IVOL")   # 生产因子字段在场=snapshot 出自现役口径
 ENTRY_MODEL_VERSION = "research-only"   # M2 过门前不得宣称择时(spec §13)
 SIZE_BUCKET_RANK = {b: i for i, b in enumerate(BUCKETS)}   # 小0/中1/大2(X-08 接线)
+
+
+def load_b8_state(path: "str | None" = None) -> dict:
+    """加载 B8 带保留状态(X-14)。缺失=未初始化(空成员起步);非法=fail-loud。
+
+    状态契约:{schema, last_as_of, prev_members, members}——members=last_as_of 当期
+    成员,prev_members=其上一期成员(同日重跑时以此为基数,保证幂等)。
+    """
+    try:
+        with open(path or B8_STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh, parse_constant=_reject_json_constant)
+    except FileNotFoundError:
+        return {"schema": B8_SCHEMA, "last_as_of": None,
+                "prev_members": [], "members": []}
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"B8 状态不可读({path or B8_STATE_PATH}):{type(exc).__name__}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"B8 状态不是合法 JSON({path or B8_STATE_PATH}):{exc}")
+    if (not isinstance(state, dict) or state.get("schema") != B8_SCHEMA
+            or not isinstance(state.get("members"), list)
+            or not isinstance(state.get("prev_members"), list)):
+        raise SystemExit(f"B8 状态 schema 非法({path or B8_STATE_PATH}):需 {B8_SCHEMA}")
+    for key in ("members", "prev_members"):
+        if not all(isinstance(c, str) and c for c in state[key]):
+            raise SystemExit(f"B8 状态 {key} 必须是非空字符串列表")
+    last = state.get("last_as_of")
+    if last is not None and (not isinstance(last, str) or not last.isdigit() or len(last) != 8):
+        raise SystemExit(f"B8 状态 last_as_of 非法:{last!r}")
+    return state
+
+
+def advance_b8_members(rows: list[dict], state: dict, as_of: str) -> tuple[set[str], dict]:
+    """推进 B8 成员资格(纯计算):members = 当期 D10 ∪ (上期成员 ∩ D8+ 带)。
+
+    与 composite_backtest.band_step 同一语义(状态=当期排名,时间无界):带上限
+    D8+ 即 decile∈{8,9,10},跌出快照(变ST/🔴/亏损/停牌)=跌穿带,如实移出。
+    返回 (当期成员, 推进后状态)。as_of 回退 fail-loud;同日重跑以 prev_members
+    为基数(幂等,不叠加推进)。
+    """
+    if state["last_as_of"] and as_of < state["last_as_of"]:
+        raise SystemExit(f"B8 状态 last_as_of={state['last_as_of']} 晚于 as_of={as_of}"
+                         "——状态不可倒退,核对行情缓存/日期")
+    base = state["prev_members"] if state["last_as_of"] == as_of else state["members"]
+    d10 = {str(r["ts_code"]) for r in rows if r.get("decile") == 10}
+    band = {str(r["ts_code"]) for r in rows if r.get("decile") in (8, 9)}
+    members = d10 | (set(base) & band)
+    advanced = {"schema": B8_SCHEMA, "last_as_of": as_of,
+                "prev_members": sorted(set(base)), "members": sorted(members)}
+    return members, advanced
 
 
 def _reject_json_constant(value: str) -> None:
@@ -138,9 +189,9 @@ def validate_rows(rows: list[dict], held: "set[str] | None" = None) -> None:
         if ts in seen:
             raise SystemExit(f"factor snapshot 重复代码 {ts}——不生成决策")
         seen.add(ts)
-        # 被消费的行(D10 候选/持仓)score 与 last 必须有限——NaN 会破坏排序确定性
-        # 并伪装成合法证据(Codex review §③④)
-        if r.get("decile") == 10 or ts in held:
+        # 被消费的行(D10 候选/B8 带成员/持仓)score 与 last 必须有限——NaN 会破坏
+        # 排序确定性并伪装成合法证据(Codex review §③④)
+        if r.get("decile") == 10 or ts in held or bool(r.get("b8_band")):
             for f in ("score", "last"):
                 v = r.get(f)
                 if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v):
@@ -214,6 +265,13 @@ def main(argv: list[str] | None = None) -> None:
     # P0-1: 账户状态归一化 + 严格日期门禁(任何 missing/invalid/stale/future → fail-loud)
     account = normalize_account_state(hold, expected_as_of=as_of)
     require_account_as_of(account, as_of)
+    # X-14 B8 带保留成员:先推进持久状态并注入行标记,再做行校验(校验需要知道
+    # 哪些 D8/D9 行会被消费)
+    b8_state = load_b8_state(os.path.join(DECISION_DIR, "b8_state.json"))
+    b8_members, b8_advanced = advance_b8_members(rows, b8_state, as_of)
+    band_keep = b8_members - {str(r["ts_code"]) for r in rows if r.get("decile") == 10}
+    for r in rows:
+        r["b8_band"] = str(r["ts_code"]) in band_keep
     validate_rows(rows, held={p["ts_code"] for p in hold["positions"]})
     policy = json.load(open(POLICY_PATH, encoding="utf-8"))
     validate_policy(policy)
@@ -238,10 +296,11 @@ def main(argv: list[str] | None = None) -> None:
     account_value = (sum(float(p["mv"]) for p in hold["positions"]) + float(cash)
                      if cash is not None else None)
 
-    # 相关股票 = D10 全档(BUY 候选与其 WAIT 理由)+ 当前持仓(HOLD/EXIT 判定)
+    # 相关股票 = 生产候选池成员(BUY 候选与其 WAIT 理由)+ 当前持仓(HOLD/EXIT 判定)
     assessments = [candidate_assessment(r, overrides.get(str(r["ts_code"])), as_of)
                    for r in rows
-                   if r.get("decile") == 10 or r["ts_code"] in held]
+                   if r.get("decile") == 10 or bool(r.get("b8_band"))
+                   or r["ts_code"] in held]
     # P0 修复(对抗审查):持仓股掉出 snapshot(变ST/🔴/亏损/停牌——恰是最危险情形)
     # 时仍须消费人工红灯覆盖,否则 verdict=red 被静默吞掉、错误输出 HOLD
     in_snap = {a["ts_code"] for a in assessments}
@@ -286,6 +345,26 @@ def main(argv: list[str] | None = None) -> None:
            "decisions": decisions}
     out_path = f"{DECISION_DIR}/{as_of}_buy_decisions.json"
     validate_decision_snapshot(out, source=f"decision snapshot: {out_path}")
+    # X-14:B8 状态先于快照原子落盘——快照写失败时状态已前进,但同日重跑会以
+    # prev_members 为基数重算(幂等),不会叠加推进
+    os.makedirs(DECISION_DIR, exist_ok=True)
+    b8_fd, b8_tmp = tempfile.mkstemp(suffix=".json", prefix=".tmp_b8_state_", dir=DECISION_DIR)
+    try:
+        with os.fdopen(b8_fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(b8_advanced, ensure_ascii=False, indent=2, allow_nan=False))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(b8_tmp, os.path.join(DECISION_DIR, "b8_state.json"))
+    except BaseException:
+        try:
+            os.close(b8_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(b8_tmp)
+        except OSError:
+            pass
+        raise
     payload = json.dumps(out, ensure_ascii=False, indent=2, allow_nan=False)
     os.makedirs(DECISION_DIR, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(

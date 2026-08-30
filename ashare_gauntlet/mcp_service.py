@@ -403,9 +403,13 @@ def _validate_decision_snapshot(snapshot: Any, path: Path) -> dict[str, Any]:
             if execution.get("eligible_from") != "NEXT_TRADING_DAY":
                 raise ValueError(
                     f"decision[{index}] BUY has invalid eligible_from: {path}")
-            if evidence.get("decile") != 10 or "FACTCHECK_CLEAR" not in reasons:
+            decile = evidence.get("decile")
+            # X-14:生产候选池 = 当期 D10(D10 码)∪ B8 带保留成员(B8_BAND 码,decile 8/9)
+            in_pool = ((decile == 10 and "D10" in reasons)
+                       or (decile in (8, 9) and "B8_BAND" in reasons))
+            if not in_pool or "FACTCHECK_CLEAR" not in reasons:
                 raise ValueError(
-                    f"decision[{index}] BUY lacks D10/FACTCHECK_CLEAR evidence: {path}")
+                    f"decision[{index}] BUY lacks D10/B8_BAND/FACTCHECK_CLEAR evidence: {path}")
     result["source_file"] = str(path)
     return result
 

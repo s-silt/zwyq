@@ -180,8 +180,12 @@ def audit_snapshot(snapshot: Any, file_date: str, factor_rows: Any | None,
             errors.append(f"{prefix}.execution.max_entry_price 必须为正有限数或 null")
 
         if state == "BUY":
-            if evidence.get("decile") != 10:
-                errors.append(f"BUY {code} 的 evidence.decile 必须为 10")
+            decile = evidence.get("decile")
+            # X-14:生产候选池 = 当期 D10(D10 码)∪ B8 带保留成员(B8_BAND 码);decile
+            # 与来源码不一致=证据自相矛盾,按错误上报
+            if not ((decile == 10 and "D10" in reasons)
+                    or (decile in (8, 9) and "B8_BAND" in reasons)):
+                errors.append(f"BUY {code} 不在生产候选池(decile={decile!r} 与 D10/B8_BAND 码不一致)")
             if "FACTCHECK_CLEAR" not in reasons:
                 errors.append(f"BUY {code} 缺 FACTCHECK_CLEAR")
             if fc != "clear_as_recorded":
@@ -189,8 +193,9 @@ def audit_snapshot(snapshot: Any, file_date: str, factor_rows: Any | None,
             factor_row = factor_by_code.get(code)
             if factor_row is None:
                 errors.append(f"BUY {code} 在 factor snapshot 中缺行")
-            elif factor_row.get("decile") != 10:
-                errors.append(f"BUY {code} 在 factor snapshot 中不是 D10")
+            elif factor_row.get("decile") not in (8, 9, 10):
+                errors.append(f"BUY {code} 在 factor snapshot 中不在 D8+ 池(decile="
+                              f"{factor_row.get('decile')!r})")
         elif state in {"HOLD", "EXIT"} and code not in factor_by_code:
             warnings.append(f"{state} {code} 已掉出 factor snapshot；保留冻结持仓状态")
 

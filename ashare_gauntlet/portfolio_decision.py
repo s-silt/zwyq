@@ -86,7 +86,8 @@ def decide_states(assessments: list[dict], held: dict[str, dict], policy: dict,
         hold_codes = ["HELD"]
         if a is None or not a.get("eligible_buy"):
             # 跌出生产资格≠当日退出:生产退出规则=C2(连续2个月度审视仍在D10档外才
-            # EXIT,methodology §10 退出规则实验:净+0.33% vs 立即退出+0.30%,换手减半);
+            # EXIT,methodology §10 退出规则实验(2026-08-31 复跑):
+            # 净+0.34% vs 立即退出+0.29%(换手 22% vs 41% 近半);
             # 月度审视=人工例行(仓库内暂无 c2_streak/审视日跟踪实现),日频快照只挂
             # 语义码不累计——消费方只能当观察集合呈现,不得逐日翻成"待退出"
             hold_codes.append("EXIT_RULE_C2_MONTHLY")

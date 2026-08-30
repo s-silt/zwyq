@@ -134,12 +134,17 @@ def dedt_ttm_pit(fd: pd.DataFrame, asof: str) -> pd.Series:
 
 
 PORTS = ("D10", "PROD", "PROD_G", "PROD_GX", "PROD_DEDT", "CS_EP", "CS_EPD", "PROD_XP",
-         "PROD_C2", "PROD_U3")
+         "PROD_C2", "PROD_U3", "PROD_B8")
 # M3 退出规则变体(spec §7:跌出 D10 何时退出不手拍,组合级实验定):
 # PROD    = 立即退出(每期重建为当期 D10,现行语义)
 # PROD_C2 = 连续确认:跌出 D10 第 1 个**有效审视期**保留,连续第 2 期才剔
 # PROD_U3 = 近 3 个有效观测期 D10 **唯一成员并集等权**(注意:非严格 1/3 梯队——
 #           连续入选者不叠加权重,cohort 加权版留待需要时实现;Codex review 订正)
+# PROD_B8 = 排名带缓冲(X-14 预注册 2026-08-31):当期 D10 全收 + 上期成员仍处
+#           D8+ 带内才保留,时间无界。与 C2/U3 的**时间**耐心不同维度——横截面
+#           排名短期抖动是换手主源,带缓冲直接吸收抖动(先验:C2 时间耐心不减
+#           净超额,排名带耐心应同向且对噪声更稳;band=8 为定义性带宽=一个档位,
+#           改带宽须重注册实验)
 
 
 def c2_step(prev_members: "set[str]", out_streak: dict[str, int], d10: "set[str]",
@@ -159,6 +164,19 @@ def c2_step(prev_members: "set[str]", out_streak: dict[str, int], d10: "set[str]
             keep_extra.add(c)
             new_streak[c] = s
     return d10 | keep_extra, new_streak
+
+
+def band_step(prev_members: "set[str]", d10: "set[str]", in_band: "set[str]",
+              tradable: "set[str]") -> "set[str]":
+    """B8 排名带缓冲单步状态机(可单测,X-14):当期 D10 全收;上期成员仍在
+    D8+ 带内且可交易才保留;跌出带(≤D7)即移出。
+
+    与 C2 的区别:状态就是当期排名本身(时间无界,不累计 streak)——票在带内
+    挂多久都保留,跌穿带立刻剔;与 C2 的时间确认形成正交对照。tradable 过滤
+    同 C2(持有延续项只保留仍可交易的票,停牌价缺失不硬持)。
+    """
+    keep = {c for c in prev_members if c in in_band and c in tradable}
+    return set(d10) | keep
 
 
 def tag_exit_step(prev_members: "set[str]", d10: "set[str]", flagged: "set[str]",
@@ -299,6 +317,7 @@ def main(argv: list[str] | None = None) -> None:
     c2_prev: set[str] = set()               # M3:PROD_C2 上期持仓
     c2_out_streak: dict[str, int] = {}      # M3:跌出 D10 连续期数
     d10_hist: list[set[str]] = []           # M3:PROD_U3 近 3 期 D10 集合
+    b8_prev: set[str] = set()               # X-14:PROD_B8 上期成员(排名带缓冲)
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()] if board_of(str(c)) in MAIN]
@@ -465,6 +484,11 @@ def main(argv: list[str] | None = None) -> None:
             u3 = set().union(*d10_hist)
             members["PROD_U3"] = pd.Index(sorted(c for c in u3
                                                  if c in fwd.index and pd.notna(entry.get(c))))
+            # X-14 排名带缓冲:带=D8+(decile>=8,含 D10),上期成员在带内且可交易才保留
+            band8 = {str(c) for c in dec_b.index[dec_b >= 8]}
+            b8_members = band_step(b8_prev, d10_set, band8, tradable)
+            b8_prev = b8_members
+            members["PROD_B8"] = pd.Index(sorted(b8_members))
             # X-08 市值三分位子组合(mv=total_mv 万元)。切桶在**剔 locked 之前**的
             # D10 全集上——桶界只用 t 日信息(ex-ante 可实施),选完桶再剔 T+1 锁定
             # 与不可交易,与 PROD"想买没买进"的被动语义一致(对抗验证 P1 修正;

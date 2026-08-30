@@ -78,6 +78,25 @@ def test_c2_step_state_machine():
     assert m5 == {"A"} and s5 == {}
 
 
+# ---------- band_step:B8 排名带缓冲状态机(X-14;带内保留时间无界/跌穿带即剔) ----------
+
+def test_band_step_state_machine():
+    from scripts.composite_backtest import band_step
+
+    tradable = {"A", "B", "C", "D"}
+    d10 = {"A"}
+    # 首期:B 跌出 D10 但仍在 D8 带内 → 保留(时间无界)
+    assert band_step({"A", "B"}, d10, {"A", "B"}, tradable) == {"A", "B"}
+    # 次期 B 仍在带内 → 继续保留(与 C2 不同:无连续期数上限)
+    assert band_step({"A", "B"}, d10, {"A", "B"}, tradable) == {"A", "B"}
+    # B 跌穿带(≤D7)→ 立即移出
+    assert band_step({"A", "B"}, d10, {"A"}, tradable) == {"A"}
+    # 带内但不可交易(停牌,E 不在 tradable)→ 不保留
+    assert band_step({"A", "E"}, d10, {"A", "E"}, tradable) == {"A"}
+    # 当期 D10 新成员照收(即使上期不在持仓)
+    assert band_step(set(), {"A", "C"}, {"A", "C"}, tradable) == {"A", "C"}
+
+
 # ---------- dedt_ttm_pit:扣非 TTM,构件严格 PIT(评审三轮 R6:不得用未来更正值) ----------
 
 def _fina(rows, code="000001.SZ"):

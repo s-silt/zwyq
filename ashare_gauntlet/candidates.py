@@ -1,7 +1,11 @@
-"""生产候选资格与硬否决(spec §5)——从 factor snapshot 行构造 BUY 资格判定。
+"""生产候选资格与硬否决(spec §5 + X-14)——从 factor snapshot 行构造 BUY 资格判定。
 
 设计约束(全部承自 docs/superpowers/specs/2026-07-19-actionable-buy-decisions-design.md):
-- 生产候选只来自现役 composite 的 D10+🟢;🟡 最高 WAIT;风险层只否决不加分;
+- 生产候选池 = **当期 D10 ∪ B8 带保留成员**(X-14,用户认可 2026-08-31 采纳):
+  D10 之外,上期成员仍处 D8+ 带内的也保留候选资格——组合级实验(N=139)显示
+  排名带缓冲把换手 41%→17% 的同时净超额 +0.29%→+0.36%、年胜率 62%→69%。
+  b8_band 由 buy_list 按持久化 B8 状态(唯一真相源)注入,本层只消费不计算;
+  🟡 最高 WAIT;风险层只否决不加分;
 - 第四关强制:BUY 必须有未过期 verdict=clear 的人工 factcheck 覆盖
   (data/factcheck_overrides.json,过期自动回 WAIT);
 - reason code 顺序=固定检查序,运行间不变(下游测试与 CLI 依赖);
@@ -16,6 +20,7 @@ from ashare_gauntlet.screen import board_of
 MAIN = ("沪主板", "深主板")
 
 # 固定检查序(spec §12:reason code 完整且顺序确定)
+# NOT_D10 语义(X-14 后)= 不在生产候选池(既非当期 D10,也非 B8 带保留成员)
 _CHECKS = ("NOT_MAIN_BOARD", "ST_NAME", "NOT_D10", "TIER_NOT_GREEN",
            "SPEC_CROWD", "SPIKE_LIMIT", "POLLUTION_PENDING_FACTCHECK",
            "FACTCHECK_AFTER_AS_OF", "GOVERNANCE_RED", "FACTCHECK_EXPIRED",
@@ -70,7 +75,8 @@ def candidate_assessment(row: dict, override: "dict | None", as_of: str) -> dict
     """单行资格判定 → {ts_code, eligible_buy, reason_codes, governance_red}。
 
     row 必须含 ts_code/name/decile/tier/spec_crowd/spike_limit(缺失 KeyError
-    fail-loud);poll_mark 可选(结构化污染标记,来自 R6 探针口径,缺省=未标记)。
+    fail-loud);poll_mark 可选(结构化污染标记,来自 R6 探针口径,缺省=未标记);
+    b8_band 可选(X-14 带保留成员标记,buy_list 注入;缺省=非带成员,行为同旧口径)。
     """
     ts, name = str(row["ts_code"]), str(row["name"])
     ov = override_status(override, as_of)
@@ -79,7 +85,7 @@ def candidate_assessment(row: dict, override: "dict | None", as_of: str) -> dict
         hits.add("NOT_MAIN_BOARD")
     if "ST" in name:
         hits.add("ST_NAME")
-    if row["decile"] != 10:
+    if row["decile"] != 10 and not (bool(row.get("b8_band", False)) and row["decile"] in (8, 9)):
         hits.add("NOT_D10")
     if row["tier"] != "🟢":
         hits.add("TIER_NOT_GREEN")
@@ -100,7 +106,9 @@ def candidate_assessment(row: dict, override: "dict | None", as_of: str) -> dict
     codes = [c for c in _CHECKS if c in hits]
     eligible = not codes
     if eligible:
-        codes = ["D10", "TIER_GREEN", "FACTCHECK_CLEAR"]
+        # 池内来源码分开报:当期 D10 vs B8 带保留(X-14)——审计/复核据此区分入场路径
+        codes = ["D10" if row["decile"] == 10 else "B8_BAND",
+                 "TIER_GREEN", "FACTCHECK_CLEAR"]
     return {"ts_code": ts, "name": name, "industry": row.get("industry", "其他"),
             "score": row.get("score"), "last": row.get("last"),
             "decile": row["decile"], "spec_crowd": bool(row["spec_crowd"]),

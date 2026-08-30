@@ -385,7 +385,23 @@ def test_latest_decisions_rejects_buy_without_hard_evidence(tmp_path: Path) -> N
     snapshot = _decision_snapshot("BUY", 8.2)
     snapshot["decisions"][0]["reason_codes"] = []
     dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
-    with pytest.raises(ValueError, match="D10/FACTCHECK_CLEAR"):
+    with pytest.raises(ValueError, match="D10/B8_BAND/FACTCHECK_CLEAR"):
+        svc.latest_decisions(tmp_path)
+
+
+def test_latest_decisions_accepts_b8_band_buy(tmp_path: Path) -> None:
+    """X-14:B8 带保留成员(decile 8/9 + B8_BAND 码)的 BUY 通过快照契约;
+    decile 与来源码不一致仍拒。"""
+    snapshot = _decision_snapshot("BUY", 8.2)
+    snapshot["decisions"][0]["reason_codes"] = ["B8_BAND", "FACTCHECK_CLEAR"]
+    snapshot["decisions"][0]["evidence"]["decile"] = 9
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", snapshot)
+    svc.latest_decisions(tmp_path)   # 不抛即通过
+
+    mismatch = _decision_snapshot("BUY", 8.2)          # decile=10 却带 B8_BAND → 拒
+    mismatch["decisions"][0]["reason_codes"] = ["B8_BAND", "FACTCHECK_CLEAR"]
+    dump(tmp_path / "data/decisions/20260807_buy_decisions.json", mismatch)
+    with pytest.raises(ValueError, match="D10/B8_BAND"):
         svc.latest_decisions(tmp_path)
 
 

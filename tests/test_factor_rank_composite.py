@@ -70,15 +70,20 @@ def test_spec_crowd_flags_union_of_family_top_decile():
 # "ACC/MAX 统计上就不行"这个错前提在仓库里活了一个多月——而它正是"某因子该不该
 # 重审"的直接依据。读数只准有一份源(methodology §5/§6/§10),代码只准复述:
 # 文档改了这里先红(逼同步),旧字面量复活这里也红(防回退)。
+# 2026-08-31 刷新:退市股财务回填(survivorship 修复)后复跑,N=149→N=139(样本窗
+# 起点不同),EP 6.59→6.44、BP 9.16→8.56、IVOL −17.02→−16.36,五门结论与入分集
+# 不变;增量表沿用 2026-07 X-02/X-03 读数(增量实验未复跑,methodology §10 已标
+# vintage)。
 
 REPO = Path(__file__).resolve().parents[1]
-AUTHORITATIVE_NW_T = {"EP": 6.59, "BP": 9.16, "IVOL": -17.02, "ACC": 4.05,
-                      "MOM": -2.20, "MAX": -14.08, "NLIMIT": -11.66, "TURN": -9.14}
+AUTHORITATIVE_NW_T = {"EP": 6.44, "BP": 8.56, "IVOL": -16.36, "ACC": 4.05,
+                      "MOM": -1.88, "MAX": -13.48, "NLIMIT": -11.70, "TURN": -9.44}
 AUTHORITATIVE_INCREMENT_T = {"ACC": 1.63, "MAX": 0.73, "NLIMIT": 0.74}
-# 2026-07-10 修复前的旧读数字面量,不得再出现在生产源码里(本文件是白名单——
-# 旧值就存在这里当靶子)
+# 数据修复前的旧读数字面量,不得再出现在生产源码里(本文件是白名单——旧值就存在
+# 这里当靶子);2026-08-31 追加被本轮复跑取代的 2026-07-20 读数。
 SUPERSEDED_LITERALS = ("t4.36", "t7.14", "t-14.7", "t2.36", "t 2.36",
-                       "+0.34%", "-0.28%", "多头腿≈0")
+                       "+0.34%", "-0.28%", "多头腿≈0",
+                       "6.59", "9.16", "17.02", "14.08", "11.66")
 CITING_SOURCES = ("scripts/factor_rank.py", "ashare_gauntlet/factor_model.py",
                   "scripts/factor_tearsheet.py")
 
@@ -97,7 +102,13 @@ def _table_nw_t(section: str, wanted: dict[str, float]) -> dict[str, float]:
 
 
 def test_methodology_still_carries_the_readings_the_code_quotes():
-    doc = (REPO / "docs" / "methodology.md").read_text(encoding="utf-8")
+    # docs/ 按 2026-08-12 决定不入公开仓:干净 clone 上缺文件=skip(与
+    # test_docs_consistency._read 同理由);本地(文件在)照常守住读数漂移
+    path = REPO / "docs" / "methodology.md"
+    if not path.exists():
+        import pytest
+        pytest.skip("docs/methodology.md 不在版本控制内(见 .gitignore),跳过读数守卫")
+    doc = path.read_text(encoding="utf-8")
     five_six = doc.split("## 5.")[1].split("## 7.")[0]
     assert _table_nw_t(five_six, AUTHORITATIVE_NW_T) == AUTHORITATIVE_NW_T
     increments = doc.split("毛增量/期")[1].split("四者全军覆没")[0]
@@ -113,7 +124,7 @@ def test_no_production_source_quotes_pre_20260710_readings():
 
 def test_factor_rank_states_the_real_reason_acc_and_max_are_out():
     # "不入分"的理由必须落在增量门上而不是"统计不行":ACC 五门全过(t+4.05)、被
-    # X-02 增量 t+1.63 拦下,这两个数同时出现才算把理由写对
+    # X-02 增量 t+1.63 拦下,这两个数同时出现才算把理由写对(读数=2026-08-31 复跑)
     src = (REPO / "scripts" / "factor_rank.py").read_text(encoding="utf-8").replace("−", "-")
-    for lit in ("6.59", "9.16", "17.02", "+0.29%", "4.05", "1.63", "-2.20"):
+    for lit in ("6.44", "8.56", "16.36", "+0.28%", "4.05", "1.63", "-1.88"):
         assert lit in src, f"factor_rank.py 未复述权威读数 {lit}"

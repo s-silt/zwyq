@@ -2,14 +2,15 @@
 
 为什么是这套(对照审计 scoring-needs-theory):每个因子映射公认 anomaly、全程零 magic number。
 - 入分因子(COMPOSITE_FACTORS):EP=1/PE(Basu 1977/FF 价值)、BP=1/PB(FF 1992)、
-  IVOL 负向(Ang 2006,CAPM 残差)——经本地 12.5 年回测(N=149)+P0 三修(退出侧
-  卖出约束/真实换手/退市股财务回填)验证,EP/BP 真实净 +0.66%/+0.96% 月、换手仅
-  13-16%。**读数只有一份源:docs/methodology.md §5/§6**(本处为 2026-07-20 复跑快照)。
+  IVOL 负向(Ang 2006,CAPM 残差)——经 2014-12→2026-06 回测(N=139,2026-08-31
+  退市股财务回填后复跑)+P0 三修(退出侧卖出约束/真实换手/退市股财务回填)验证,
+  EP/BP 真实净 +0.69%/+0.96% 月、换手仅 13-16%。**读数只有一份源:docs/methodology.md
+  §5/§6**(本处为 2026-08-31 复跑快照)。
 - 展示因子(不入分):"不入分"多数不等于"统计上不行"——过五门与对 composite 有增量
   是两道门,混为一谈会让后人以为某因子已被证伪而拒绝重审(2026-07-10 total_mv 缺期
-  修复正是这样翻掉了旧结论)。ACC(Sloan 1996 应计)五门全过(t+4.05/真实净+0.14%),
+  修复正是这样翻掉了旧结论)。ACC(Sloan 1996 应计)五门全过(t+4.05/真实净+0.16%),
   只是 X-02 common-support 增量 t+1.63 未过 t>3 门;ROE、GP/A(Novy-Marx 2013)
-  t+2.23/+1.66 是 12 年噪声、且与 EP/BP 冗余 ~0.6;MOM 反转向,NW t−2.20 连门 1 都
+  t+2.71/+2.24 未过门 1、且与 EP/BP 冗余 ~0.6;MOM 反转向,NW t−1.88 连门 1 都
   没过。保留 f_ 列供判断层参考。
 - 方法:每因子 行业+市值双中性 → 横截面百分位 → 等权合成 → 十分位(见 factor_model)。
 - 过滤:lean_tier 剔 🔴(三降/亏损),避免给恶化业务做"便宜"排序=价值陷阱;只对 🟢🟡 排。
@@ -30,10 +31,10 @@ Usage: PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m scripts.factor_rank [-
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -58,19 +59,20 @@ from scripts.backfill_fina import expected_min_end_date
 
 MAIN = ("沪主板", "深主板")
 
-# 入分因子读数(权威口径=docs/methodology.md §5/§6,2026-07-20 X-06 后复跑 N=149;
-# 明细 data/holdscore/factor_ic_backtest.json + scripts.factor_tearsheet 现算):
-# EP NW t+6.59 真实净+0.66%/期、BP t+9.16 +0.96%/期(换手仅13-16%);
-# IVOL(负向,CAPM残差口径)t−17.02、13折LOYO无变号、涨跌市同号、**多头腿成本后
-# +0.29%/期**(纯多头拿得到的部分),与 EP/BP 秩相关−0.2/−0.3(源=回测运行时相关
-# 矩阵打印,未落库)——五门全过。
+# 入分因子读数(权威口径=docs/methodology.md §5/§6,2026-08-31 退市股财务回填后
+# 复跑 N=139(2014-12→2026-06);明细 data/holdscore/factor_ic_backtest.json +
+# scripts.factor_tearsheet 现算):
+# EP NW t+6.44 真实净+0.69%/期、BP t+8.56 +0.96%/期(换手仅13-16%);
+# IVOL(负向,CAPM残差口径)t−16.36、13折LOYO无变号(最弱2022 t−14.47)、涨跌市
+# 同号、**多头腿成本后+0.28%/期**(纯多头拿得到的部分),与 EP/BP 秩相关−0.2/−0.3
+# (源=回测运行时相关矩阵打印,未落库)——五门全过。
 # 不入分分两类,写混了就等于污染因子准入这条决策线:
-# ① 统计没过门:ROE t+2.23、GP t+1.66(12年噪声+与 EP/BP 冗余~0.6);MOM NW t−2.20
-#   连门1都没过、多头腿成本后−0.18%(反转的钱在空头腿,散户拿不到)——腿分解自此为
-#   准入必查;TURN t−9.14 但多头腿−0.04%(门5 未过),只作 🎰 标签输入。
+# ① 统计没过门:ROE t+2.71、GP t+2.24(12年噪声+与 EP/BP 冗余~0.6);MOM NW t−1.88
+#   连门1都没过、多头腿成本后−0.17%(反转的钱在空头腿,散户拿不到)——腿分解自此为
+#   准入必查;TURN t−9.44 但多头腿−0.04%(门5 未过,7/20口径),只作 🎰 标签输入。
 # ② 五门全过、只是对现役 composite 没增量(§10 增量表,common-support 口径):ACC
-#   t+4.05 多头腿+0.01% → X-02 增量 t+1.63 未过门,不回归;MAX t−14.08 多头腿+0.02%、
-#   NLIMIT t−11.66 多头腿+0.20% → X-03 增量 t0.73/0.74、MAX-IVOL 秩相关 0.78 冗余
+#   t+4.05 多头腿+0.01% → X-02 增量 t+1.63 未过门,不回归;MAX t−13.48 多头腿+0.02%、
+#   NLIMIT t−11.70 多头腿+0.20% → X-03 增量 t0.73/0.74、MAX-IVOL 秩相关 0.78 冗余
 #   坐实 → 退 🎰 风险标签层(spec_crowd_flags)。
 COMPOSITE_FACTORS = ("f_EP", "f_BP", "f_IVOL")
 
@@ -112,31 +114,45 @@ def latest_rows(endpoint: str, cols: list[str], as_of: str) -> pd.DataFrame:
     旧日而财务缓存已刷到新公告时,不带闸门会拿"未来财报"排旧日横截面(前视偏差)。
     ann_date 缺失(NaN)的行无法证明其时点合法性,同样被过滤(字符序 'nan'/'None'
     恒大于 8 位日期,PIT 从严);某票 as_of 时点无任何已公告行 → 如实不入横截面。
-    """
     # ann_date/update_flag 参与排序:同 (end_date) 多行(快照 vs 更正重述)时必须确定性地取
     # 最新更正值——update_flag='1' 是 tushare 更正后记录(官方语义),字符序恰排最后;
     # 否则不稳定排序会随机取到更正前的错值(实测 600115 归母净利更正前后差 1.6 亿,直接进 ACC 分子)。
     # f_ann_date:重述行实际发布日并入 ann_date(restated_visibility)——价格缓存停在
     # 旧日而财务已刷新时,晚于 as_of 发布的更正不得以原公告日混入 PIT 闸门(与回测同修)。
+
+    实现:pyarrow.dataset 一次读整目录(2026-08-31 IO 优化;per-symbol 文件数 ~3.4k/表
+    ×4 表,逐文件 open 在退市股回填后成为 factor_rank 最大 IO 项)。显式 schema 统一
+    类型:键列(ts_code/end_date/ann_date/f_ann_date/update_flag)=string、数据列=float64
+    ——同表不同批次文件的 int64/float64 混型会让 dataset 自动统一成 int64 并在大幅
+    量级处截断(cashflow 实测),声明目标类型由 pyarrow 逐文件安全 cast。列在文件里
+    缺失(如旧文件无 f_ann_date)→ 该列全 NaN,与旧实现 fallback 同语义;目录缺失 →
+    空表。per-symbol 布局约定:每文件单票(目录级读取行级 ts_code 的全局最新行,
+    二者在单票文件上等价)。**数据列 float64 契约**:调用方只传数值列(本函数历史
+    调用全部如此),非数值列须另走专用读取。
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as pads
+
     from ashare_gauntlet.backtest import restated_visibility
-    need = ["ts_code", "end_date", "ann_date", "f_ann_date", "update_flag"] + cols
-    out: dict[str, pd.Series] = {}
-    for f in glob.glob(f"{CACHE}/{endpoint}/*.parquet"):
-        try:
-            df = pd.read_parquet(f, columns=need)
-        except Exception:
-            df = pd.read_parquet(f)
-            df = df[[c for c in need if c in df.columns]]
+    keys = ("ts_code", "end_date", "ann_date", "f_ann_date", "update_flag")
+    schema = pa.schema([pa.field(c, pa.string()) for c in keys]
+                       + [pa.field(c, pa.float64()) for c in cols])
+    directory = Path(CACHE) / endpoint
+    if not directory.is_dir():
+        return pd.DataFrame()
+    df = pads.dataset(str(directory), format="parquet", schema=schema).to_table().to_pandas()
+    if df.empty:
+        return pd.DataFrame()
+    df = restated_visibility(df)
+    if "ann_date" in df.columns:
+        df = df[df["ann_date"].astype(str) <= str(as_of)]   # PIT:只用 as_of 已公告的行
         if df.empty:
-            continue
-        df = restated_visibility(df)
-        if "ann_date" in df.columns:
-            df = df[df["ann_date"].astype(str) <= str(as_of)]   # PIT:只用 as_of 已公告的行
-            if df.empty:
-                continue
-        sort_keys = [k for k in ("end_date", "ann_date", "update_flag") if k in df.columns]
-        out[str(df.iloc[0]["ts_code"])] = df.sort_values(sort_keys, kind="mergesort").iloc[-1]
-    return pd.DataFrame(out).T
+            return pd.DataFrame()
+    sort_keys = [k for k in ("end_date", "ann_date", "update_flag") if k in df.columns]
+    df = df.sort_values(sort_keys, kind="mergesort")
+    out = df.groupby("ts_code", sort=False).tail(1).reset_index(drop=True)
+    out.index = pd.Index(out["ts_code"].astype(str).tolist())   # 与旧实现同形:无名索引 + 保留 ts_code 列
+    return out
 
 
 def _num(s: pd.Series) -> pd.Series:
@@ -208,7 +224,7 @@ def main(argv: list[str] | None = None) -> None:
     ret_p = daily_returns(ac_p).iloc[-IVOL_WINDOW:]
     ivol_s = ivol_capm(ret_p, ret_p.mean(axis=1), IVOL_WINDOW)
     max_s = max_daily_ret(ret_p, IVOL_WINDOW)
-    trend_s = trend_ma_distance(ac_p)      # 展示列(N=149 t-5.22 反转向,不入分)
+    trend_s = trend_ma_distance(ac_p)      # 展示列(N=139 t−5.67 反转向,不入分)
     db = fetch_market_day(pro, "daily_basic", as_of, CACHE).set_index("ts_code")  # 缓存版:全字段落盘,一份缓存服务所有下游
     sb = call_with_retry(lambda: pro.stock_basic(list_status="L", fields="ts_code,name,industry")).set_index("ts_code")
 
@@ -280,8 +296,8 @@ def main(argv: list[str] | None = None) -> None:
     df["f_IVOL"] = factor_percentile(df["IVOL"], ind, higher_is_better=False, logmv=logmv)  # 低波=高分(入分)
     df["f_MOM"] = factor_percentile(df["MOM"], ind, higher_is_better=True, logmv=logmv)   # 仅展示列
     # TREND 展示方向=原值(分位高=显著高于均线族=涨过头,判断层警惕加仓/追入);
-    # 回测证据方向为负(N=149 t-5.22 反转,多头腿+0.16%薄、与IVOL/彩票族0.38-0.45相关
-    # →不入分;CGO 与其0.81冗余淘汰,证据见 memory factor-backtest-a-share)
+    # 回测证据方向为负(N=139 t−5.67 反转,多头腿薄、与彩票族(IVOL 0.34/MAX 0.36)
+    # 相关 →不入分;CGO 与其0.81冗余淘汰,证据见 memory factor-backtest-a-share)
     df["f_TREND"] = factor_percentile(df["TREND"], ind, higher_is_better=True, logmv=logmv)
     # 三因子等权合成 EP+BP+IVOL负向(行业+市值双中性,与 factor_backtest 被验证的形态一致)。
     # ACC/ROE/GP/MOM 不入分(降级证据见 COMPOSITE_FACTORS 注),保留 f_ 列作展示/判断层参考。
@@ -303,7 +319,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"=== 横截面因子排序(EP+BP+IVOL 三因子入分·行业+市值双中性·ACC/ROE/GP/MOM 仅展示, as_of={as_of}, {len(df)}只)→ {OUT_DIR}/{as_of}_factor.json ===")
     # 这行每次跑排名都直接进用户视野,读数必须与 §5/§6 权威表同源——它曾长期停在
     # 2026-07-10 total_mv 缺期修复前的旧值,等于每天向用户复读一份已被推翻的证据
-    print("分位=双中性百分位(0-100);入分=12.5年实证+P0三修+五门门禁(EP/BP 真实净+0.66/+0.96%月;IVOL 负向 t−17.02 多头腿+0.29%,读数以 docs/methodology.md §5/§6 为准);距MA20=前复权口径")
+    print("分位=双中性百分位(0-100);入分=11.6年实证+P0三修+五门门禁(EP/BP 真实净+0.69/+0.96%月;IVOL 负向 t−16.36 多头腿+0.28%,读数以 docs/methodology.md §5/§6 为准);距MA20=前复权口径")
     print("⚡=近5日触涨停;🎰=投机拥挤(IVOL/MAX/近月涨停次数任一 top decile,腿分解定性:该族的钱在空头腿,散户规避即所得);趋势=MOM top decile")
     print(f"{'#':>2} {'D':>2} {'档':>2} {'票':<9}{'行业':<7}{'EP':>3}{'BP':>3}{'IVOL':>5}{'ROE':>4}{'ACC':>4}{'MOM':>4}{'PE':>5}{'市值亿':>7} {'位置/标签'}")
     pc = lambda x: f"{x*100:.0f}" if isinstance(x, (int, float)) and x == x else "—"

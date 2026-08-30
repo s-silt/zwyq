@@ -472,3 +472,94 @@ def test_snapshot_atomic_failure_preserves_existing_bytes(
 
     assert out_path.read_bytes() == old
     assert not list(out_path.parent.glob(".tmp_buy_decisions_*"))
+
+
+# ---------- X-14:B8 带保留成员状态机(生产候选池 = 当期 D10 ∪ 上期成员∩D8+) ----------
+
+def _two_overrides(tmp_path):
+    (tmp_path / "overrides.json").write_text(json.dumps({"overrides": [
+        {"ts_code": "600001.SH", "as_of": "20251201", "verdict": "clear",
+         "reason": "t", "expires_on": "20270101"},
+        {"ts_code": "600002.SH", "as_of": "20251201", "verdict": "clear",
+         "reason": "t", "expires_on": "20270101"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+
+
+def test_b8_band_member_from_state_becomes_buy(tmp_path, monkeypatch):
+    """上期成员当期 D9(带内)→ 消费为 BUY 候选,来源码 B8_BAND,状态原子推进。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[
+        _row("600001.SH"), _row("600002.SH", decile=9, score=0.8)])
+    _two_overrides(tmp_path)
+    (out_path.parent / "b8_state.json").write_text(json.dumps({
+        "schema": "b8_state.v1", "last_as_of": "20251231",
+        "prev_members": [], "members": ["600002.SH"]}), encoding="utf-8")
+    bl.main([])
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    d = {r["ts_code"]: r for r in out["decisions"]}
+    assert d["600002.SH"]["state"] == "BUY"
+    assert d["600002.SH"]["reason_codes"] == ["B8_BAND", "TIER_GREEN", "FACTCHECK_CLEAR"]
+    assert d["600002.SH"]["evidence"]["decile"] == 9
+    state = json.loads((out_path.parent / "b8_state.json").read_text(encoding="utf-8"))
+    assert state == {"schema": "b8_state.v1", "last_as_of": "20260101",
+                     "prev_members": ["600002.SH"],
+                     "members": ["600001.SH", "600002.SH"]}
+
+
+def test_b8_same_day_rerun_uses_prev_members_as_base(tmp_path, monkeypatch):
+    """同日重跑以 prev_members 为基数(幂等,不叠加推进):run1 新进 D10 的票在
+    run2 前跌到 D9 → 不被当作带成员保留(它不在上期基数里)。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("600001.SH")])
+    _two_overrides(tmp_path)
+    bl.main([])                      # 首跑:members=[600001.SH](D10 新进)
+    # 快照更新(同日):600001 跌到 D9
+    (tmp_path / "holdscore" / "20260101_factor.json").write_text(
+        json.dumps([_row("600001.SH", decile=9)], ensure_ascii=False), encoding="utf-8")
+    bl.main([])                      # 重跑:base=prev=[] → 600001 不保留
+    state = json.loads((out_path.parent / "b8_state.json").read_text(encoding="utf-8"))
+    assert state["members"] == []
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert all(r["ts_code"] != "600001.SH" or r["state"] != "BUY" for r in out["decisions"])
+
+
+def test_b8_dropped_out_of_band_member_is_not_consumed(tmp_path, monkeypatch):
+    """上期成员跌穿带(D7)→ 不进候选池,决策名单不含它(消费面=D10∪带∪持仓)。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[
+        _row("600001.SH"), _row("600002.SH", decile=7, score=0.3)])
+    _two_overrides(tmp_path)
+    (out_path.parent / "b8_state.json").write_text(json.dumps({
+        "schema": "b8_state.v1", "last_as_of": "20251231",
+        "prev_members": [], "members": ["600002.SH"]}), encoding="utf-8")
+    bl.main([])
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert all(r["ts_code"] != "600002.SH" for r in out["decisions"])
+    state = json.loads((out_path.parent / "b8_state.json").read_text(encoding="utf-8"))
+    assert state["members"] == ["600001.SH"]
+
+
+def test_b8_state_missing_seeds_from_d10(tmp_path, monkeypatch):
+    """无状态文件=未初始化:首跑成员=当期 D10(与旧口径一致),并落盘状态。"""
+    out_path = _setup(tmp_path, monkeypatch, rows=[
+        _row("600001.SH"), _row("600002.SH", decile=9, score=0.8)])
+    _two_overrides(tmp_path)
+    bl.main([])
+    out = json.loads(out_path.read_text(encoding="utf-8"))
+    assert {r["ts_code"] for r in out["decisions"]} == {"600001.SH"}
+    state = json.loads((out_path.parent / "b8_state.json").read_text(encoding="utf-8"))
+    assert state["members"] == ["600001.SH"] and state["prev_members"] == []
+
+
+def test_b8_as_of_regression_fails_loud(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("600001.SH")])
+    (out_path.parent / "b8_state.json").write_text(json.dumps({
+        "schema": "b8_state.v1", "last_as_of": "20260102",
+        "prev_members": [], "members": []}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="不可倒退"):
+        bl.main([])
+
+
+def test_b8_invalid_state_schema_fails_loud(tmp_path, monkeypatch):
+    out_path = _setup(tmp_path, monkeypatch, rows=[_row("600001.SH")])
+    (out_path.parent / "b8_state.json").write_text(json.dumps({
+        "schema": "other.v9", "members": []}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="schema 非法"):
+        bl.main([])

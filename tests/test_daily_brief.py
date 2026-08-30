@@ -397,6 +397,78 @@ def test_calm_day_exit_0(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     assert brief["exit_code"] == 0
 
 
+def _override_row(ts_code, *, as_of=AS_OF, verdict="clear", expires_on):
+    return {"ts_code": ts_code, "as_of": as_of, "verdict": verdict,
+            "expires_on": expires_on}
+
+
+def _ready_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """隔离用 readiness stub(同 calm-day 测试):排除与本断言无关的 blocker。"""
+    monkeypatch.setattr(db.svc, "healthcheck", lambda _root=None: {
+        "ok": True,
+        "recommendation_readiness": {
+            "ready": True, "status": "ready", "blockers": [], "warnings": [],
+            "as_of": AS_OF,
+            "components": {"eod": {"status": "ready", "as_of": AS_OF},
+                           "holdings": {"freshness": "aligned", "as_of": AS_OF}},
+        },
+    })
+
+
+def test_factcheck_expiring_soon_surfaced_as_action(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """持仓的 clear 覆盖 7 天内到期 → ⑬ 待办 + 明细,不写不续期。"""
+    _ready_stub(monkeypatch)
+    root = _setup_root(
+        tmp_path, decisions=[_decision("600000.SH", "HOLD", decile=9)],
+        holdings={"as_of": AS_OF, "cash": 10000,
+                  "positions": [{"ts_code": "600000.SH", "name": "浦发", "shares": 100,
+                                 "cost": 10.0, "bucket": "long", "industry": "银行",
+                                 "mv": 1050.0, "last": 10.5}]})
+    _dump(root / "data/holdscore/gate_baseline.json",
+          {"frozen_at": "2026-08-18T17:00:00+08:00", "factors": [], "composite": {}})
+    _dump(root / "data/factcheck_overrides.json",
+          {"overrides": [_override_row("600000.SH", expires_on="20260821")]})   # 还 3 天
+    brief = db.build_brief(root, now=NOW)
+    fx = brief["factcheck_expiry"]
+    assert fx["status"] == "OK"
+    assert [(r["ts_code"], r["days_left"]) for r in fx["expiring"]] == [("600000.SH", 3)]
+    assert any(a.startswith("⑬") and "600000.SH" in a for a in brief["next_actions"])
+    assert brief["exit_code"] == 2
+    text = db.render_text(brief)
+    assert "到期 20260821" in text
+
+
+def test_factcheck_expiry_far_or_irrelevant_is_quiet(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """窗口外到期、或票不在相关集合(持仓/BUY/待核/C2)→ 不出待办。"""
+    _ready_stub(monkeypatch)
+    root = _setup_root(
+        tmp_path, decisions=[_decision("600000.SH", "HOLD", decile=9)],
+        holdings={"as_of": AS_OF, "cash": 10000,
+                  "positions": [{"ts_code": "600000.SH", "name": "浦发", "shares": 100,
+                                 "cost": 10.0, "bucket": "long", "industry": "银行",
+                                 "mv": 1050.0, "last": 10.5}]})
+    _dump(root / "data/factcheck_overrides.json",
+          {"overrides": [_override_row("600000.SH", expires_on="20260915"),     # 28 天后
+                         _override_row("000001.SZ", expires_on="20260819")]})   # 无关票
+    brief = db.build_brief(root, now=NOW)
+    assert brief["factcheck_expiry"]["status"] == "OK"
+    assert brief["factcheck_expiry"]["expiring"] == []
+    assert not any(a.startswith("⑬") for a in brief["next_actions"])
+
+
+def test_factcheck_overrides_invalid_surfaced_not_swallowed(tmp_path: Path) -> None:
+    """覆盖文件非法(白名单外 verdict)→ INVALID 如实上报并出待办,不当"无覆盖"。"""
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])
+    _dump(root / "data/factcheck_overrides.json",
+          {"overrides": [_override_row("600000.SH", verdict="pending",
+                                       expires_on="20260821")]})
+    brief = db.build_brief(root, now=NOW)
+    assert brief["factcheck_expiry"]["status"] == "INVALID"
+    assert any(a.startswith("⑬") and "非法" in a for a in brief["next_actions"])
+
+
 def test_missing_gate_baseline_is_surfaced(tmp_path: Path) -> None:
     """门禁证据基线缺失/过期必须进待办——准入证据静默变旧是深读 R1 的头号缺口。"""
     root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)])

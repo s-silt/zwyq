@@ -5,6 +5,8 @@
 - **机器状态逐字来自冻结决策快照**(经 mcp_service._validate_decision_snapshot 校验),
   本层绝不重算 BUY/WAIT/EXIT,也绝不把 WAIT 提升为 BUY。
 - **股息只是展示叠加**(dv_ttm):不进 composite、不改机器状态、不当买卖信号。
+- **factcheck 到期预警只是提示**:读 overrides 的 expires_on 提前 7 天亮灯,
+  到期与否的判定权仍在 candidates.override_status/buy_list,本层不写不续期。
 - **fail-loud**:四核心 EOD 缺失/错位、或决策快照非法 → 退出码 1,绝不显示"今日无事";
   辅助数据(股息)不可用 → 标 UNAVAILABLE,不当 0/无分红。
 - 决策/持仓风险数字全部读已有机器产物(冻结快照 + holdings_watch 的 account_state 快照),
@@ -56,7 +58,7 @@ _PROFIT_TAKE_MULT = 1.25  # 长线 +25% 减半锁利提示线(展示,与 intrada
 
 # 诚实语境(P2:低波价值取舍),全部来自 docs/methodology.md 既有事实,非信号
 _ADVISORY = (
-    "组合超额薄且集中在跌市(§10:PROD NW t≈2.93@N=149),近年低波价值风格逆风"
+    "组合超额薄且集中在跌市(§10:PROD NW t≈2.91@N=139),近年低波价值风格逆风"
     "——对单只 BUY 别过度自信。",
     "前瞻验证样本未成熟(§10.1 X-09 insufficient_sample),尚无 OOS 证据证明"
     "决策链跑赢 D10 等权。",
@@ -99,6 +101,44 @@ def _gate_baseline_age(root: Path, now: datetime) -> dict:
             "detail": (f"门禁证据基线已 {days} 天未复核(≥{_GATE_STALE_DAYS} 天)"
                        "——按季复跑 factor_backtest/composite_backtest 后跑 gate_check"
                        if stale else f"门禁证据基线 {days} 天前冻结")}
+
+
+_FACTCHECK_HORIZON_DAYS = 7   # 提示窗口(日历日):先于过期暴露,避免到期静默回退 WAIT
+
+
+def _factcheck_expiry(root: Path, relevant: dict[str, str], ref_as_of: "str | None",
+                      now: datetime) -> dict:
+    """即将过期的 clear factcheck 覆盖(只读提示,不写 verdict、不重算状态)。
+
+    relevant: ts_code → 展示名,限定在"过期才有后果"的集合(持仓/BUY/待核/C2 观察)
+    ——无关股票的旧覆盖过期不产生噪音。到期判定复用 candidates.override_status
+    同一契约;窗口 = 决策日(缺省今天)起 N 个日历日内到期的**仍有效 clear**。
+    覆盖文件非法 → INVALID 如实上报并出待办(不当"无覆盖",也不吞错)。
+    """
+    from scripts.buy_list import load_overrides
+    from ashare_gauntlet.candidates import override_status
+
+    ref = ref_as_of or now.strftime("%Y%m%d")
+    ref_dt = datetime.strptime(ref, "%Y%m%d")
+    horizon = (ref_dt + timedelta(days=_FACTCHECK_HORIZON_DAYS)).strftime("%Y%m%d")
+    try:
+        overrides = load_overrides(str(root / "data/factcheck_overrides.json"))
+    except ValueError as exc:   # JSONDecodeError 是 ValueError 子类;行级契约违规同报
+        return {"status": "INVALID", "horizon_days": _FACTCHECK_HORIZON_DAYS,
+                "expiring": [], "error": str(exc)}
+    except OSError as exc:      # 与 _load_snapshot 同款:IO 异常降级为段内错误,不炸整份简报
+        return {"status": "INVALID", "horizon_days": _FACTCHECK_HORIZON_DAYS,
+                "expiring": [], "error": f"{type(exc).__name__}: {exc}"}
+    expiring: list[dict] = []
+    for code, ov in sorted(overrides.items()):
+        if code not in relevant or override_status(ov, ref) != "clear":
+            continue
+        expires_on = str(ov["expires_on"])
+        if ref <= expires_on <= horizon:
+            days = (datetime.strptime(expires_on, "%Y%m%d") - ref_dt).days
+            expiring.append({"ts_code": code, "name": relevant.get(code, code),
+                             "expires_on": expires_on, "days_left": days})
+    return {"status": "OK", "horizon_days": _FACTCHECK_HORIZON_DAYS, "expiring": expiring}
 
 
 def _latest_account_state(root: Path) -> dict | None:
@@ -412,6 +452,17 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
     pending_view = [{**_compact_decision(d), "dv_ttm": _dv(d.get("ts_code"))}
                     for d in buckets["pending"]]
 
+    # factcheck 到期预警的相关集合 = 持仓 + BUY + 待核 + C2 观察(过期才改变这些票的状态)
+    factcheck_relevant: dict[str, str] = {}
+    for p in (account or {}).get("positions", []):
+        if p.get("ts_code"):
+            factcheck_relevant[str(p["ts_code"])] = str(p.get("name") or p["ts_code"])
+    for d in [*buckets["buys"], *buckets["pending"]]:
+        factcheck_relevant[str(d.get("ts_code"))] = str(d.get("name") or d.get("ts_code"))
+    for row in c2_watch.get("members", []):
+        factcheck_relevant[str(row.get("ts_code"))] = str(row.get("name") or row.get("ts_code"))
+    factcheck_expiry = _factcheck_expiry(root, factcheck_relevant, decision_as_of, now)
+
     # —— next-actions(有序;每条指向"人跑的命令",从不代跑代判)——
     actions: list[str] = []
     holdings_fresh = holdings_comp.get("freshness")
@@ -451,6 +502,14 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
                        "——时间止损无法判定(多半缺 entry_date),补齐后再看")
     if gate_age["status"] in ("STALE", "MISSING"):
         actions.append(f"⑫ 门禁证据{gate_age['status']}——{gate_age['detail']}")
+    if factcheck_expiry["status"] == "INVALID":
+        actions.append(f"⑬ factcheck 覆盖文件非法——{factcheck_expiry['error']}"
+                       "(buy_list 会整场失败;修复后再荐股)")
+    elif factcheck_expiry["expiring"]:
+        names = ",".join(f"{r['name']}({r['ts_code']})还{r['days_left']}天"
+                         for r in factcheck_expiry["expiring"])
+        actions.append(f"⑬ factcheck 即将过期 {len(factcheck_expiry['expiring'])} 只({names})"
+                       "——到期自动回 WAIT;要保留资格的先重核(人工写 override)")
     if protection["status"] in ("UNVERIFIED", "INVALID", "NO_DETAIL") or protection["uncovered"]:
         actions.append(f"⑪ 破线保护未确认({protection['status']})——{protection['note']}")
     missing_stop = [r for r in stop_alerts if r["status"] == "MISSING_STOP"]
@@ -530,6 +589,7 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         "time_stop_check": time_stop_state,
         "breach_protection": protection,
         "gate_evidence": gate_age,
+        "factcheck_expiry": factcheck_expiry,
         "cache_freshness": cache_fresh,
         "dividends": {"as_of": div_as_of, "status": dividends.get("status"),
                       "reason": dividends.get("reason")},
@@ -640,6 +700,15 @@ def render_text(brief: dict) -> str:
                                 for c in c2["members"]))
     for p in brief["machine"]["pending_factcheck"]:
         lines.append(f"  待fact-check {_fmt(p.get('name'))}({_fmt(p.get('ts_code'))}) (仍WAIT)")
+    fx = brief.get("factcheck_expiry") or {}
+    if fx.get("status") == "INVALID":
+        lines.append(f"  ⚠ factcheck覆盖文件非法: {fx.get('error')}")
+    elif fx.get("expiring"):
+        lines.append(f"  factcheck将过期 {len(fx['expiring'])} 只"
+                     f"(窗口 {fx.get('horizon_days')} 天,到期自动回 WAIT):")
+        for r in fx["expiring"]:
+            lines.append(f"    {_fmt(r.get('name'))}({_fmt(r.get('ts_code'))})"
+                         f" 到期 {r.get('expires_on')}(还 {r.get('days_left')} 天)")
 
     lines.append("")
     lines.append("[今天该做什么]")

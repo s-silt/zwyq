@@ -179,6 +179,21 @@ def band_step(prev_members: "set[str]", d10: "set[str]", in_band: "set[str]",
     return set(d10) | keep
 
 
+def b8c2_step(prev_members: "set[str]", out_streak: dict[str, int], d10: "set[str]",
+              in_band: "set[str]", tradable: "set[str]",
+              ) -> "tuple[set[str], dict[str, int]]":
+    """X-15 生产混合等权近似: entry=B8 池, exit=C2 vs D10.
+    members = band_step(...) | c2_step(...)[0]
+    返回 (members, new_c2_streak)
+
+    C2 的 inside=当期 D10(非 D8+)。等权无席位下 D8/D9 经 B8 池留存,C2 只给
+    跌出 D8+(≤D7)的票多留 1 期——与 PROD_B8/PROD_C2 可比较的研究口径。
+    """
+    band_m = band_step(prev_members, d10, in_band, tradable)
+    c2_m, new_streak = c2_step(prev_members, out_streak, d10, tradable)
+    return band_m | c2_m, new_streak
+
+
 def tag_exit_step(prev_members: "set[str]", d10: "set[str]", flagged: "set[str]",
                   tradable: "set[str]") -> "set[str]":
     """X-07 标签触发退出单步(可单测):当期 D10 成员中带"涨过头"标签的一律不持有。
@@ -231,7 +246,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--dp", action="store_true",
                     help="X-10:把 DP=股息率(dv_ttm,正向)加入增量门评测(须配 --increments);"
                          "结果另存 composite_backtest_dp.json,不覆盖权威读数")
+    ap.add_argument("--b8c2", action="store_true",
+                    help="X-15:入场 B8 + 退出 C2 等权近似(PROD_B8C2);结果另存 "
+                         "composite_backtest_b8c2.json,不覆盖权威读数;与 --dp 互斥")
     a = ap.parse_args(argv)
+    if a.dp and a.b8c2:
+        raise SystemExit("--dp 与 --b8c2 互斥")
     if a.dp and not a.increments:
         raise SystemExit("--dp 须配合 --increments(DP 走 common-support 增量门评测)")
     incr_factors = INCR_FACTORS + (("DP",) if a.dp else ())
@@ -307,6 +327,8 @@ def main(argv: list[str] | None = None) -> None:
         ports += ["PROD_S", "PROD_M", "PROD_L"]
     if a.tag_exit:
         ports += ["PROD_XT", "PROD_XR", "PROD_XB"]
+    if a.b8c2:
+        ports += ["PROD_B8C2"]
     if a.increments:
         for x in incr_factors:
             ports += [f"CS3_{x}", f"P4_{x}"]   # 同池 3因子基线 / +x 的4因子(common-support 对)
@@ -318,6 +340,8 @@ def main(argv: list[str] | None = None) -> None:
     c2_out_streak: dict[str, int] = {}      # M3:跌出 D10 连续期数
     d10_hist: list[set[str]] = []           # M3:PROD_U3 近 3 期 D10 集合
     b8_prev: set[str] = set()               # X-14:PROD_B8 上期成员(排名带缓冲)
+    b8c2_prev: set[str] = set()             # X-15:PROD_B8C2 上期成员
+    b8c2_streak: dict[str, int] = {}        # X-15:C2 vs D10 跌出 streak
     for k, t in enumerate(rebal):
         it = di[t]
         codes = [str(c) for c in close_p.columns[close_p.loc[t].notna()] if board_of(str(c)) in MAIN]
@@ -489,6 +513,12 @@ def main(argv: list[str] | None = None) -> None:
             b8_members = band_step(b8_prev, d10_set, band8, tradable)
             b8_prev = b8_members
             members["PROD_B8"] = pd.Index(sorted(b8_members))
+            # X-15 入场 B8 + 退出 C2 等权近似(研究对照,不改生产)
+            if a.b8c2:
+                b8c2_members, b8c2_streak = b8c2_step(
+                    b8c2_prev, b8c2_streak, d10_set, band8, tradable)
+                b8c2_prev = b8c2_members
+                members["PROD_B8C2"] = pd.Index(sorted(b8c2_members))
             # X-08 市值三分位子组合(mv=total_mv 万元)。切桶在**剔 locked 之前**的
             # D10 全集上——桶界只用 t 日信息(ex-ante 可实施),选完桶再剔 T+1 锁定
             # 与不可交易,与 PROD"想买没买进"的被动语义一致(对抗验证 P1 修正;
@@ -586,14 +616,24 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("无有效换仓期(检查 --start / 缓存覆盖)")
     # 先落盘再报告:149 期逐日计算约数十分钟,报告层的任何 bug 不允许毁掉计算成果
     os.makedirs(HOLDSCORE_DIR, exist_ok=True)
-    cb_out = "composite_backtest_dp.json" if a.dp else "composite_backtest.json"
+    if a.dp:
+        cb_out = "composite_backtest_dp.json"
+    elif a.b8c2:
+        cb_out = "composite_backtest_b8c2.json"
+    else:
+        cb_out = "composite_backtest.json"
     res.to_json(f"{HOLDSCORE_DIR}/{cb_out}", orient="records", force_ascii=False, indent=2)
     # PROD 成员逐期落盘(M2 入场实验的 common-support 基础:入场规则只在已审计的
     # 生产 D10 成员上评测,不得另造候选口径——spec §6.2)
     import json as _json
-    # DP 实验跑另存,不污染权威成员表——它是 entry_backtest 的输入,被带 --dp/--start/
-    # --fwd 的实验跑覆盖会让后续入场实验建在非权威口径上(codex P2)
-    members_out = "composite_members_dp.json" if a.dp else "composite_members.json"
+    # DP/B8C2 实验跑另存,不污染权威成员表——它是 entry_backtest 的输入,被带
+    # --dp/--b8c2/--start/--fwd 的实验跑覆盖会让后续入场实验建在非权威口径上(codex P2)
+    if a.dp:
+        members_out = "composite_members_dp.json"
+    elif a.b8c2:
+        members_out = "composite_members_b8c2.json"
+    else:
+        members_out = "composite_members.json"
     with open(f"{HOLDSCORE_DIR}/{members_out}", "w", encoding="utf-8") as fh:
         _json.dump(members_log, fh, ensure_ascii=False)
     y = res["date"].str[:4]
@@ -719,6 +759,18 @@ def main(argv: list[str] | None = None) -> None:
         print(f"标签命中:🎰 均 {res['n_tag_crowd'].mean():.2f} 只/期、TREND顶格 均 "
               f"{res['n_tag_hot'].mean():.2f} 只/期(占 D10 {res['n_PROD'].mean():.0f} 只)")
         print("判据(预注册):三变体净超额均不优于基线 → 标签触发卖出被证伪,生产删除该规则")
+    if a.b8c2:
+        print("\n=== X-15 入场 B8 + 退出 C2 等权近似对照"
+              "(PROD / PROD_C2 / PROD_B8 / PROD_B8C2)===")
+        print(f"{'组合':>10}{'净超额%':>9}{'换手':>7}{'毛NW t':>8}{'年胜率':>7}")
+        for p in ("PROD", "PROD_C2", "PROD_B8", "PROD_B8C2"):
+            ex = res[f"ret_{p}"] - res["mkt_fwd"]
+            net = ex - res[f"TO_{p}"] * res["cost_rt"]
+            _, tnw, _ = newey_west_tstat(ex.dropna())
+            yr = net.groupby(y).mean().dropna()
+            print(f"{p:>10}{net.mean() * 100:>+8.3f}%{res[f'TO_{p}'].mean():>7.0%}"
+                  f"{tnw:>+8.2f}{(yr > 0).mean() * 100:>6.0f}%")
+        print("口径边界:等权无席位;D8/D9 经 B8 池留存;C2 只给 ≤D7 一期宽限")
     if a.increments:
         print(f"\n=== X-02/X-03 composite 增量(common-support:同池 4因子 − 3因子基线;"
               f"准入门=|NW t|>3 且经济意义为正)===")
@@ -738,7 +790,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"已知与生产的残余差异(评审三轮后口径):①退出顺延跨税改日时印花税取计划"
           f"退出日段(量级趋零);②⚡🎰/dma20 展示列不入分。(ST 已改 PIT 名称面板——"
           f"X-05;dedt TTM 构件严格 PIT 现算——R6)")
-    print("→ 明细 data/holdscore/composite_backtest.json(已在报告前落盘)")
+    print(f"→ 明细 data/holdscore/{cb_out}(已在报告前落盘)")
 
 
 if __name__ == "__main__":

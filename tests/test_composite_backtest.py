@@ -97,6 +97,38 @@ def test_band_step_state_machine():
     assert band_step(set(), {"A", "C"}, {"A", "C"}, tradable) == {"A", "C"}
 
 
+# ---------- b8c2_step:X-15 入场 B8 ∪ 退出 C2(vs D10)等权近似 ----------
+
+def test_b8c2_step_state_machine():
+    from scripts.composite_backtest import b8c2_step
+
+    tradable = {"A", "B", "C", "D"}
+    # a) D10 始终在(即使上期不在持仓)
+    m0, s0 = b8c2_step(set(), {}, {"A", "C"}, {"A", "C"}, tradable)
+    assert m0 == {"A", "C"} and s0 == {}
+    # b) D8/D9 两期仍在档外仍保留(经 B8 池)
+    m1, s1 = b8c2_step({"A", "B"}, {}, {"A"}, {"A", "B"}, tradable)
+    assert m1 == {"A", "B"}
+    m2, s2 = b8c2_step(m1, s1, {"A"}, {"A", "B"}, tradable)
+    assert m2 == {"A", "B"}
+    # c) ≤D7 第一期保留(C2 streak=1)、第二期移出
+    m3, s3 = b8c2_step({"A", "B"}, {}, {"A"}, {"A"}, tradable)
+    assert m3 == {"A", "B"} and s3 == {"B": 1}
+    m4, s4 = b8c2_step(m3, s3, {"A"}, {"A"}, tradable)
+    assert m4 == {"A"} and s4 == {}
+    # d) 不可交易不保留(带内但不可交易)
+    m5, s5 = b8c2_step({"A", "E"}, {}, {"A"}, {"A", "E"}, {"A"})
+    assert m5 == {"A"} and s5 == {}
+
+
+def test_b8c2_dp_mutex():
+    # 只测 argparse 后的互斥校验,不跑全市场回测
+    from scripts.composite_backtest import main
+
+    with pytest.raises(SystemExit, match="互斥"):
+        main(["--dp", "--b8c2"])
+
+
 # ---------- dedt_ttm_pit:扣非 TTM,构件严格 PIT(评审三轮 R6:不得用未来更正值) ----------
 
 def _fina(rows, code="000001.SZ"):

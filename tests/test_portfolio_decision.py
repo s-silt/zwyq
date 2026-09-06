@@ -190,3 +190,55 @@ def test_policy_sanity_fail_loud():
     with pytest.raises(ValueError):
         validate_policy(bad)
     validate_policy(POLICY)   # 合法不抛
+    # 生产口径 3 × 0.24 / 行业上限 0.25 必须合法
+    validate_policy({"policy_version": "1", "target_positions": 3,
+                     "target_weight": 0.24, "industry_cap": 0.25, "lot_size": 100})
+
+
+def test_validate_policy_rejects_missing_bool_string_and_nonfinite():
+    from ashare_gauntlet.portfolio_decision import validate_policy
+    import pytest
+
+    with pytest.raises(ValueError, match="缺字段"):
+        validate_policy({"target_positions": 3, "target_weight": 0.24})
+    with pytest.raises(ValueError, match="整数"):
+        validate_policy(dict(POLICY, target_positions=True))
+    with pytest.raises(ValueError, match="整数"):
+        validate_policy(dict(POLICY, target_positions="3"))
+    with pytest.raises(ValueError, match="整数"):
+        validate_policy(dict(POLICY, lot_size=100.0))
+    with pytest.raises(ValueError, match="有限数"):
+        validate_policy(dict(POLICY, target_weight="0.24"))
+    with pytest.raises(ValueError, match="有限数"):
+        validate_policy(dict(POLICY, industry_cap=float("nan")))
+    with pytest.raises(ValueError, match="有限数"):
+        validate_policy(dict(POLICY, target_weight=float("inf")))
+    with pytest.raises(ValueError, match="非法"):
+        validate_policy(dict(POLICY, target_positions=0))
+    with pytest.raises(ValueError, match="非法"):
+        validate_policy(dict(POLICY, industry_cap=0))
+    with pytest.raises(ValueError, match=r"industry_cap=.*>1"):
+        validate_policy(dict(POLICY, industry_cap=1.5))
+    validate_policy(dict(POLICY, industry_cap=1.0))
+    with pytest.raises(ValueError, match="有限数") as overflow_cap:
+        validate_policy(dict(POLICY, industry_cap=10 ** 400))
+    assert isinstance(overflow_cap.value.__cause__, OverflowError)
+    with pytest.raises(ValueError, match="有限数") as overflow_w:
+        validate_policy(dict(POLICY, target_weight=10 ** 400))
+    assert isinstance(overflow_w.value.__cause__, OverflowError)
+    with pytest.raises(ValueError) as overflow_n:
+        validate_policy(dict(POLICY, target_positions=10 ** 400, target_weight=0.24,
+                             industry_cap=1.0))
+    assert isinstance(overflow_n.value.__cause__, OverflowError)
+
+
+def test_held_overweight_stays_hold_not_exit():
+    """已有持仓超 target_weight / industry_cap 不得擅自转 EXIT。"""
+    policy = {"policy_version": "1", "target_positions": 3, "target_weight": 0.24,
+              "industry_cap": 0.25, "lot_size": 100, "min_cash": 0}
+    ds = decide_states([_a("600001.SH", eligible=True, industry="化工原料")],
+                       {"600001.SH": _held("600001.SH", mv=50_000, industry="化工原料")},
+                       policy, account_value=100_000.0, cash=50_000.0)
+    row = next(d for d in ds if d["ts_code"] == "600001.SH")
+    assert row["state"] == "HOLD"
+    assert "EXIT" != row["state"]

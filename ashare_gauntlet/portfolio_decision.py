@@ -16,15 +16,57 @@ import math
 
 
 def validate_policy(policy: dict) -> None:
-    """policy 参数自洽性(spec §11):矛盾即 ValueError,不静默修正。"""
-    n, w = int(policy["target_positions"]), float(policy["target_weight"])
-    cap, lot = float(policy["industry_cap"]), int(policy["lot_size"])
-    if n <= 0 or w <= 0 or lot <= 0:
-        raise ValueError(f"policy 非法:target_positions={n} target_weight={w} lot={lot}")
-    if n * w > 1.0 + 1e-9:
-        raise ValueError(f"policy 矛盾:目标持仓×单票权重={n * w:.2f}>100%")
+    """policy 参数自洽性(spec §11):矛盾即 ValueError,不静默修正。
+
+    整数字段拒绝 bool / 数值字符串 / 3.0 这类小数整数;权重与上限必须是有限数。
+    已有持仓超重不在本函数处理,decide_states 不得因此擅自转 EXIT。
+    """
+    if not isinstance(policy, dict):
+        raise ValueError(f"policy 必须是对象,得到 {type(policy).__name__}")
+    required = ("target_positions", "target_weight", "industry_cap", "lot_size")
+    missing = [key for key in required if key not in policy]
+    if missing:
+        raise ValueError(f"policy 缺字段 {missing}")
+
+    n = policy["target_positions"]
+    lot = policy["lot_size"]
+    w = policy["target_weight"]
+    cap = policy["industry_cap"]
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ValueError(f"policy 非法:target_positions 必须是整数,得到 {n!r}")
+    if isinstance(lot, bool) or not isinstance(lot, int):
+        raise ValueError(f"policy 非法:lot_size 必须是整数,得到 {lot!r}")
+    w = _finite_policy_number(w, "target_weight")
+    cap = _finite_policy_number(cap, "industry_cap")
+    if n <= 0 or w <= 0 or lot <= 0 or cap <= 0:
+        raise ValueError(
+            f"policy 非法:target_positions={n} target_weight={w} lot={lot} industry_cap={cap}")
+    if cap > 1.0 + 1e-9:
+        raise ValueError(f"policy 矛盾:industry_cap={cap}>1")
+    try:
+        exposure = n * w
+    except OverflowError as exc:
+        raise ValueError(
+            f"policy 矛盾:目标持仓×单票权重无法表示为有限数"
+            f"(target_positions={n} target_weight={w})"
+        ) from exc
+    if exposure > 1.0 + 1e-9:
+        raise ValueError(f"policy 矛盾:目标持仓×单票权重={exposure:.2f}>100%")
     if w > cap + 1e-9:
         raise ValueError(f"policy 矛盾:单票权重 {w} 超过行业上限 {cap}")
+
+
+def _finite_policy_number(value: object, field: str) -> float:
+    """权重/上限必须是有限数;超大整数转 float 的 OverflowError 统一为 ValueError。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"policy 非法:{field} 必须是有限数,得到 {value!r}")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"policy 非法:{field} 必须是有限数,得到 {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"policy 非法:{field} 必须是有限数,得到 {value!r}")
+    return number
 
 
 def _exec(shares: int, weight: "float | None") -> dict:

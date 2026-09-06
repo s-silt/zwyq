@@ -13,9 +13,12 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from ashare_gauntlet.screen import board_of
+
+_DATE8 = re.compile(r"^\d{8}$")
 
 MAIN = ("沪主板", "深主板")
 
@@ -35,7 +38,7 @@ HARD_VETO_CODES = frozenset(c for c in _CHECKS if not c.startswith("FACTCHECK_")
 
 
 def _date8(value: object, field: str) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not _DATE8.fullmatch(value):
         raise ValueError(f"{field} 必须是真实 YYYYMMDD,得到 {value!r}")
     try:
         datetime.strptime(value, "%Y%m%d")
@@ -55,8 +58,12 @@ def override_status(override: "dict | None", as_of: str) -> str:
         return "missing"
     if not isinstance(override, dict):
         raise ValueError("factcheck 覆盖必须是对象")
-    v = str(override["verdict"])
-    if v not in ("clear", "red"):
+    required = ("verdict", "as_of", "expires_on")
+    missing = [key for key in required if key not in override]
+    if missing:
+        raise ValueError(f"factcheck 覆盖缺字段 {missing}")
+    v = override["verdict"]
+    if not isinstance(v, str) or v not in ("clear", "red"):
         raise ValueError(f"factcheck 覆盖 verdict={v!r} 不在白名单 {{clear,red}}——请修正覆盖文件")
     override_as_of = _date8(override["as_of"], "factcheck as_of")
     expires_on = _date8(override["expires_on"], "factcheck expires_on")

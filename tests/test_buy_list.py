@@ -306,6 +306,35 @@ def test_load_overrides_rejects_duplicate_or_malformed_rows(tmp_path):
         bl.load_overrides(str(path))
 
 
+def test_load_overrides_rejects_unpadded_and_impossible_dates(tmp_path):
+    path = tmp_path / "overrides.json"
+    row = {"ts_code": "600001.SH", "as_of": "20260101",
+           "verdict": "clear", "expires_on": "20270101"}
+    path.write_text(json.dumps({"overrides": [dict(row, expires_on="202695")]}),
+                    encoding="utf-8")
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        bl.load_overrides(str(path))
+
+    path.write_text(json.dumps({"overrides": [dict(row, as_of="20260230")]}),
+                    encoding="utf-8")
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        bl.load_overrides(str(path))
+
+    path.write_text(json.dumps({"overrides": [dict(row, expires_on="20251231")]}),
+                    encoding="utf-8")
+    with pytest.raises(ValueError, match="不能早于"):
+        bl.load_overrides(str(path))
+
+    path.write_text(json.dumps({"overrides": [dict(row, verdict=True)]}),
+                    encoding="utf-8")
+    with pytest.raises(ValueError, match="白名单"):
+        bl.load_overrides(str(path))
+
+    path.write_text(json.dumps({"overrides": [row]}), encoding="utf-8")
+    loaded = bl.load_overrides(str(path))
+    assert loaded["600001.SH"]["verdict"] == "clear"
+
+
 def test_holdings_missing_industry_fails_loud(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch, rows=[_row()], holdings={
         "positions": [{"ts_code": "600009.SH", "name": "乙", "shares": 100,

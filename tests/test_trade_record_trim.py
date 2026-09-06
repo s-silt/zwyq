@@ -132,21 +132,49 @@ def test_trim_rejects_when_mv_cannot_be_recomputed(tmp_path):
         assert _read(jp)["trades"] == []          # journal 侧亦零副作用
 
 
-def test_trim_rejects_stale_sell_conditional_order(tmp_path):
-    """codex P1-2:减仓后 active SELL 条件单股数 > 剩余持仓 = 账本自相矛盾。"""
+def test_trim_does_not_require_conditional_orders(tmp_path):
     hp, jp, cache = _setup(tmp_path)
+    assert _trim(hp, jp, cache)["remaining"] == 600
+
+
+def test_trim_records_when_conditional_orders_unsynced(tmp_path):
+    """条件单不是落账门禁:挂单股数大于剩余持仓仍按成交事实落账。"""
+    hp, jp, cache = _setup(tmp_path)
+    leftover = {
+        "schema_version": 2,
+        "orders": [{
+            "order_id": "ord-001", "ts_code": "600001.SH", "side": "SELL",
+            "condition": {"field": "close", "operator": "<="},
+            "price": 20.9, "shares": 1200,
+            "valid_from": "20260801", "valid_until": "20261231", "status": "active",
+        }],
+    }
     h = _read(hp)
-    h["conditional_orders"] = [
-        {"ts_code": "600001.SH", "side": "SELL", "shares": 1200,
-         "status": "active", "trigger": 20.9}]
+    h["conditional_orders"] = leftover
     open(hp, "w", encoding="utf-8").write(json.dumps(h, ensure_ascii=False))
-    before = open(hp, encoding="utf-8").read()
-    with pytest.raises(SystemExit, match="条件单"):
-        _trim(hp, jp, cache)                      # 卖 600 后剩 600 < 挂单 1200
-    assert open(hp, encoding="utf-8").read() == before
-    # 挂单股数 ≤ 剩余 → 放行
-    h["conditional_orders"][0]["shares"] = 600
-    open(hp, "w", encoding="utf-8").write(json.dumps(h, ensure_ascii=False))
+    assert _trim(hp, jp, cache)["remaining"] == 600
+    after = _read(hp)
+    assert after["conditional_orders"] == leftover
+    assert after["positions"][0]["shares"] == 600
+
+
+def test_trim_second_write_failure_rolls_back_bytes(tmp_path, monkeypatch):
+    hp, jp, cache = _setup(tmp_path)
+    from pathlib import Path
+    h0, j0 = Path(hp).read_bytes(), Path(jp).read_bytes()
+    real_replace = tr.os.replace
+
+    def fail_holdings(src, dst):
+        if str(dst).endswith("holdings.json"):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(tr.os, "replace", fail_holdings)
+    with pytest.raises(SystemExit, match="回滚到写入前字节"):
+        _trim(hp, jp, cache)
+    assert Path(hp).read_bytes() == h0
+    assert Path(jp).read_bytes() == j0
+    monkeypatch.setattr(tr.os, "replace", real_replace)
     assert _trim(hp, jp, cache)["remaining"] == 600
 
 

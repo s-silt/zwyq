@@ -17,11 +17,13 @@
 reason 枚举(P-04 整改代码化:规则动作不得写成人工判断):
     C2=系统规则(C2)  STOP=系统规则(止损)  MANUAL=人工判断
 
-事务边界(codex 复审后的明确取舍):两个 JSON 各自原子替换(tempfile+
-os.replace),写前对**两份完整 payload 预序列化并校验**(allow_nan=False),
-故序列化/校验失败零副作用;残余风险仅剩两次 os.replace 之间的进程级中断,
-发生时脚本打印精确恢复指引。跨文件单事务(SQLite 账本)= 改变全仓存储契约,
-登记为后续独立任务,不在本工具内偷做。运行期持排他锁文件,禁止并发落账。
+事务边界:两个 JSON 各自 tempfile+os.replace。写前预序列化并校验
+(allow_nan=False),序列化失败零副作用。journal 先写、holdings 后写;第二写
+若以**普通异常**失败,同一把账本锁内尝试把 journal 恢复为写入前字节。
+回滚成功则可重试;回滚失败 fail-loud,两文件可能不一致,禁止盲目重跑。
+进程被杀 / KeyboardInterrupt 不保证回滚——**不是跨文件原子,也不崩溃安全**。
+不写额外恢复文件(避免进入真实账本协议)。跨文件单事务(SQLite)=改变全仓
+存储契约,登记为后续独立任务。运行期持排他锁文件,禁止并发落账。
 """
 from __future__ import annotations
 
@@ -179,6 +181,91 @@ def _atomic_write(path: str, text: str) -> None:
         raise
 
 
+def _restore_file_bytes(path: str, original: bytes) -> None:
+    """把 path 恢复为写入前字节(tempfile+os.replace)。不是崩溃安全。"""
+    target = Path(path)
+    fd, tmp_name = tempfile.mkstemp(suffix=".json", prefix=f".tmp_{target.stem}_rb_",
+                                    dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _commit_journal_then_holdings(
+    journal_path: str, journal_text: str,
+    holdings_path: str, holdings_text: str,
+    *, context: str, recovery_hint: str,
+) -> None:
+    """先写 journal 再写 holdings。普通异常时在同一把账本锁内回滚 journal。
+
+    不宣称跨文件原子或崩溃安全。不写额外恢复文件。调用方必须已持 account_lock。
+    """
+    journal_file = Path(journal_path)
+    holdings_file = Path(holdings_path)
+    journal_orig = journal_file.read_bytes()
+    holdings_orig = holdings_file.read_bytes()
+    _atomic_write(journal_path, journal_text)
+    try:
+        _atomic_write(holdings_path, holdings_text)
+    except Exception as exc:
+        rollback_error: Exception | None = None
+        try:
+            _restore_file_bytes(journal_path, journal_orig)
+            restored = journal_file.read_bytes()
+            if restored != journal_orig:
+                raise OSError(
+                    f"journal 回滚后字节不一致: 期望 {len(journal_orig)} 字节,"
+                    f"实际 {len(restored)} 字节")
+        except Exception as rollback_exc:
+            rollback_error = rollback_exc
+        holdings_read_error: Exception | None = None
+        holdings_changed = False
+        try:
+            holdings_now = holdings_file.read_bytes()
+            holdings_changed = holdings_now != holdings_orig
+        except Exception as holdings_read_exc:
+            holdings_read_error = holdings_read_exc
+        if holdings_read_error is not None:
+            rb = (f"{type(rollback_error).__name__}: {rollback_error}"
+                  if rollback_error is not None else "journal 回滚尝试已结束,holdings 未能核验")
+            raise TradeRecordError(
+                f"{context}: 第二文件写入失败且 holdings 状态未知——"
+                f"写失败={type(exc).__name__}: {exc}; "
+                f"回滚={rb}; "
+                f"holdings 状态未知({type(holdings_read_error).__name__}: {holdings_read_error})。"
+                f"两文件可能不一致;不要盲目重跑(journal 可能已含本笔而 holdings 未改,"
+                f"重跑会撞重复落账,无法靠重跑补完 holdings)。"
+                f"恢复指引:{recovery_hint}。"
+                "本路径不是跨文件原子,也不崩溃安全。"
+            ) from holdings_read_error
+        if rollback_error is not None or holdings_changed:
+            rb = (f"{type(rollback_error).__name__}: {rollback_error}"
+                  if rollback_error is not None else "journal 已回滚但 holdings 偏离写入前字节")
+            raise TradeRecordError(
+                f"{context}: 第二文件写入失败且 journal 回滚失败——"
+                f"写失败={type(exc).__name__}: {exc}; "
+                f"回滚失败={rb}; "
+                f"holdings 是否已变={holdings_changed}。"
+                f"两文件可能不一致;不要盲目重跑(journal 可能已含本笔而 holdings 未改,"
+                f"重跑会撞重复落账,无法靠重跑补完 holdings)。"
+                f"恢复指引:{recovery_hint}。"
+                "本路径不是跨文件原子,也不崩溃安全。"
+            ) from (rollback_error or exc)
+        raise TradeRecordError(
+            f"{context}: 第二文件写入失败({type(exc).__name__}: {exc});"
+            f"已在锁内把 journal 回滚到写入前字节,两文件恢复为原样,可重试。"
+        ) from exc
+
+
 def _validate_holdings(holdings: dict, path: str) -> None:
     if not isinstance(holdings.get("positions"), list):
         raise TradeRecordError(f"{path} 缺 positions 列表——不落账")
@@ -233,20 +320,6 @@ def record_sell(ts_code: str, *, date: str, net: float, exit_px: float,
                 raise TradeRecordError(
                     f"journal 已有 {ts_code} exit_date={exit_date} {shares}股@{exit_px} "
                     "的同一笔流水——重复落账被拒绝")
-        # 清仓后若仍留着该股的 active SELL 条件单,重新买入时旧单会再次生效造成误卖
-        # (codex P1:record_sell 此前完全不查条件单)
-        _co_s = holdings.get("conditional_orders")
-        _orders_s = (_co_s.get("orders") if isinstance(_co_s, dict)
-                     else (_co_s if isinstance(_co_s, list) else None))
-        if isinstance(_orders_s, list):
-            stale = [str(o.get("order_id") or o.get("ts_code")) for o in _orders_s
-                     if isinstance(o, dict) and o.get("ts_code") == ts_code
-                     and str(o.get("side", "")).upper() == "SELL"
-                     and str(o.get("status", "")).lower() == "active"]
-            if stale:
-                raise TradeRecordError(
-                    f"{ts_code} 清仓但仍有 active SELL 条件单 {stale}——先在券商撤单并更新"
-                    "holdings.conditional_orders 再落账(留着会在重新建仓后误触发)")
         gross = shares * exit_px
         # 方向性护栏(codex P1):卖出净回款只会被费用削减,不可能高于 gross
         if not (gross * (1 - NET_TOLERANCE) <= net <= gross):
@@ -280,14 +353,13 @@ def record_sell(ts_code: str, *, date: str, net: float, exit_px: float,
         # 预序列化两份 payload(allow_nan=False):序列化失败零副作用(codex P0)
         journal_text = json.dumps(new_journal, ensure_ascii=False, indent=2, allow_nan=False)
         holdings_text = json.dumps(new_holdings, ensure_ascii=False, indent=2, allow_nan=False)
-        _atomic_write(journal_path, journal_text)
-        try:
-            _atomic_write(holdings_path, holdings_text)
-        except BaseException:
-            print(f"!!! journal 已写入但 holdings 替换失败——中间态!恢复指引:"
-                  f"删除 {journal_path} 中 code={ts_code} exit_date={exit_date} 的最后一行,"
-                  f"或手工完成 holdings 修改(移除 {ts_code},cash+={net})后勿重跑")
-            raise
+        _commit_journal_then_holdings(
+            journal_path, journal_text, holdings_path, holdings_text,
+            context=f"SELL {ts_code} {exit_date}",
+            recovery_hint=(
+                f"删除 {journal_path} 中 code={ts_code} exit_date={exit_date} 的最后一行,"
+                f"或手工完成 holdings 修改(移除 {ts_code},cash+={net})后勿重跑"),
+        )
     return {"side": "SELL", "ts_code": ts_code, "shares": shares, "net": net,
             "pnl_pct": pnl_pct, "cash": new_holdings["cash"],
             "positions": len(new_holdings["positions"])}
@@ -356,25 +428,6 @@ def record_trim(ts_code: str, *, date: str, shares: int, net: float, exit_px: fl
         has_mv = "mv" in position
         last_px = (_positive(position.get("last"), f"持仓 {ts_code} last(mv 需据其重算)")
                    if has_mv else None)
-        # 减仓使既有 SELL 条件单股数大于剩余持仓 = 账本自相矛盾(挂单卖 1200 只剩 600),
-        # 且条件单核验是 BUY 门禁的前置;fail-loud 要求先在券商改/撤单再落账(codex P1-2)
-        # 权威格式是 {schema_version:2, orders:[...]}(account_state.validate_conditional_
-        # orders_v2);此前只处理顶层裸 list,真实 structured_v2 会完全绕过守卫(codex P1)
-        _co = holdings.get("conditional_orders")
-        orders = _co.get("orders") if isinstance(_co, dict) else (_co if isinstance(_co, list) else None)
-        if isinstance(orders, list):
-            for o in orders:
-                if not isinstance(o, dict) or o.get("ts_code") != ts_code:
-                    continue
-                if str(o.get("status", "active")).lower() != "active":
-                    continue
-                if str(o.get("side", "")).upper() != "SELL":
-                    continue
-                osh = o.get("shares")
-                if isinstance(osh, int) and not isinstance(osh, bool) and osh > remaining:
-                    raise TradeRecordError(
-                        f"{ts_code} 存在 active SELL 条件单 {osh} 股 > 减仓后剩余 {remaining} 股"
-                        "——先在券商改/撤该单并更新 holdings.conditional_orders 再落账")
         # 同日多腿(上午减半锁利 + 下午跌破止损)是真实合法序列,不能只按 (code,date)
         # 判重;但只按 (code,date,shares,px) 判重又会放过"同一笔重复录入、价格误敲一点"
         # (codex P1)。没有券商成交编号时,真正守住账务的是**股数守恒**而非键去重:
@@ -437,16 +490,15 @@ def record_trim(ts_code: str, *, date: str, shares: int, net: float, exit_px: fl
         # 预序列化两份 payload(allow_nan=False):序列化失败零副作用
         journal_text = json.dumps(new_journal, ensure_ascii=False, indent=2, allow_nan=False)
         holdings_text = json.dumps(new_holdings, ensure_ascii=False, indent=2, allow_nan=False)
-        _atomic_write(journal_path, journal_text)
-        try:
-            _atomic_write(holdings_path, holdings_text)
-        except BaseException:
-            mv_hint = (f"、mv→{round(remaining * last_px, 2)}" if last_px is not None else "")
-            print(f"!!! journal 已写入但 holdings 替换失败——中间态!恢复指引:"
-                  f"删除 {journal_path} 中 code={ts_code} exit_date={exit_date} 的最后一行,"
-                  f"或手工完成 holdings 修改({ts_code} shares→{remaining}{mv_hint},"
-                  f"cash+={net})后勿重跑")
-            raise
+        mv_hint = (f"、mv→{round(remaining * last_px, 2)}" if last_px is not None else "")
+        _commit_journal_then_holdings(
+            journal_path, journal_text, holdings_path, holdings_text,
+            context=f"TRIM {ts_code} {exit_date}",
+            recovery_hint=(
+                f"删除 {journal_path} 中 code={ts_code} exit_date={exit_date} 的最后一行,"
+                f"或手工完成 holdings 修改({ts_code} shares→{remaining}{mv_hint},"
+                f"cash+={net})后勿重跑"),
+        )
     return {"side": "TRIM", "ts_code": ts_code, "shares": shares_out,
             "remaining": remaining, "net": net, "pnl_pct": pnl_pct,
             "cash": new_holdings["cash"], "positions": len(new_holdings["positions"])}

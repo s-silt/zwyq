@@ -108,6 +108,32 @@ def test_factcheck_dates_fail_loud_when_invalid_or_reversed():
         candidate_assessment(_row(), reversed_window, AS_OF)
 
 
+def test_override_status_direct_whitelist_and_dates():
+    import pytest
+    from ashare_gauntlet.candidates import override_status
+
+    assert override_status(None, AS_OF) == "missing"
+    assert override_status(_ov(), AS_OF) == "clear"
+    assert override_status(_ov(verdict="red"), AS_OF) == "red"
+    assert override_status(_ov(expires="20260710"), AS_OF) == "expired"
+    future = _ov()
+    future["as_of"] = "20260809"
+    assert override_status(future, "20260807") == "future"
+
+    with pytest.raises(ValueError, match="白名单"):
+        override_status(_ov(verdict="Red"), AS_OF)
+    with pytest.raises(ValueError, match="白名单"):
+        override_status({**_ov(), "verdict": True}, AS_OF)
+    with pytest.raises(ValueError, match="缺字段"):
+        override_status({"ts_code": "600001.SH", "verdict": "clear"}, AS_OF)
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        override_status(_ov(expires="202695"), AS_OF)   # strptime 会把未补零当成 2026-09-05
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        override_status(_ov(expires="2026-07-01"), AS_OF)
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        override_status({**_ov(), "as_of": 20260701}, AS_OF)
+
+
 def test_reason_codes_deterministic_order():
     from ashare_gauntlet.candidates import candidate_assessment
 

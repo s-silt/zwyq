@@ -47,3 +47,4 @@ _yake_*.txt
 # Understand Anything 默认不启用；生成物可能包含语义化源码摘要
 .ua/
 .understand-anything/
+.codex/

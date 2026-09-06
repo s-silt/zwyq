@@ -195,8 +195,9 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
         holdings_as_of = str(account.get("as_of")) if account.get("as_of") else None
         account_status = account["data_status"]
         short_slot = account["short_slot"]
+        # 条件单只解析展示,missing/invalid/legacy 一律不挡荐股/配股/落账,
+        # 也不得把未核验状态伪报为 verified。
         order_status = account["conditional_orders"]["status"]
-        order_format = account["conditional_orders"].get("format")
         if account_status != "complete":
             blockers.append("ACCOUNT_STATE_INCOMPLETE")
         # 严格 freshness 必须以本次机器决策日期重算；账户查询本身不预设日期。
@@ -208,10 +209,6 @@ def _recommendation_readiness(root: Path) -> dict[str, Any]:
             blockers.append(holdings_freshness)
         if short_slot["violation"]:
             blockers.append("SHORT_SLOT_VIOLATION")
-        if order_status == "invalid":
-            blockers.append("CONDITIONAL_ORDERS_INVALID")
-        elif order_status not in ("verified",):
-            blockers.append("CONDITIONAL_ORDERS_UNVERIFIED")
     except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
         blockers.append("ACCOUNT_STATE_UNAVAILABLE")
 

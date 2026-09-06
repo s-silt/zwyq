@@ -33,13 +33,12 @@ from ashare_gauntlet.dividends import (
     dividend_yields,
     indicative_ttm_cash,
 )
-from ashare_gauntlet.account_state import normalize_account_state, normalize_bucket
+from ashare_gauntlet.account_state import normalize_bucket
 from ashare_gauntlet.candidates import HARD_VETO_CODES
 from ashare_gauntlet.freshness import classify_cache_freshness
 from ashare_gauntlet.stop_policy import (
     check_positions,
     check_time_stops,
-    conditional_order_coverage,
     needs_attention,
 )
 _C2_CODE = "EXIT_RULE_C2_MONTHLY"
@@ -420,19 +419,6 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
     time_stops = time_stop_state["hits"]
     # EOD 缓存挂钟新鲜度:防"决策建在上周价格上"的静默降级
     cache_fresh = classify_cache_freshness(eod_comp.get("as_of"), now.strftime("%Y%m%d"))
-    # 破线保护覆盖:盘中哨兵已停用(2026-08-19 拍板),条件单是唯一防线且系统无法
-    # 验证券商端——必须如实显示"未确认/未覆盖",不能沉默着看起来安全
-    # 覆盖判定需要订单明细,而 account_snapshot 按 MCP 约定隐藏 raw orders(codex P1);
-    # 这里就地用 include_raw_orders=True 重新归一一次(纯读、不改文件)。取不到就如实
-    # 走 NO_DETAIL,绝不因拿不到明细而谎称已覆盖。
-    account_with_orders = account
-    try:
-        raw_holdings = svc.read_json("data/holdings.json", root)
-        if isinstance(raw_holdings, dict):
-            account_with_orders = normalize_account_state(raw_holdings, include_raw_orders=True)
-    except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
-        pass
-    protection = conditional_order_coverage(account_with_orders or {})
     # 门禁证据年龄:准入证据(五门/组合 t)是一次性复跑的结论,不在 eod_ops 里,
     # 会静默变旧。这里只读基线的冻结时间,提醒按季复核(gate_check),不重算。
     gate_age = _gate_baseline_age(root, now)
@@ -510,8 +496,6 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
                          for r in factcheck_expiry["expiring"])
         actions.append(f"⑬ factcheck 即将过期 {len(factcheck_expiry['expiring'])} 只({names})"
                        "——到期自动回 WAIT;要保留资格的先重核(人工写 override)")
-    if protection["status"] in ("UNVERIFIED", "INVALID", "NO_DETAIL") or protection["uncovered"]:
-        actions.append(f"⑪ 破线保护未确认({protection['status']})——{protection['note']}")
     missing_stop = [r for r in stop_alerts if r["status"] == "MISSING_STOP"]
     if missing_stop:
         names = ",".join(r["ts_code"] for r in missing_stop)
@@ -522,7 +506,7 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         names = ",".join(f"{r['ts_code']}({r['status']})" for r in other_stop)
         actions.append(f"⑨ 止损与双仓制政策不符 {len(other_stop)} 只({names})"
                        "——人工核对是否抄错/写反(工具只提示不改)")
-    # readiness 其余 blocker(数据/条件单等)如实列出
+    # readiness 其余 blocker(数据日期/账户/机器状态等)如实列出
     _surfaced = {
         "ACCOUNT_STATE_INCOMPLETE",
         "DECISION_NOT_ALIGNED",
@@ -587,7 +571,6 @@ def build_brief(root: Path | None = None, *, now: datetime | None = None,
         "stop_policy": {"checks": stop_checks, "alerts": stop_alerts},
         "time_stops": time_stops,
         "time_stop_check": time_stop_state,
-        "breach_protection": protection,
         "gate_evidence": gate_age,
         "factcheck_expiry": factcheck_expiry,
         "cache_freshness": cache_fresh,
@@ -645,15 +628,6 @@ def render_text(brief: dict) -> str:
         lines.append(base)
     if not brief["holdings_risk"]:
         lines.append("  (无持仓)")
-
-    prot = brief.get("breach_protection") or {}
-    if prot.get("status") and prot["status"] != "NO_POSITIONS":
-        lines.append("")
-        icon = "✅" if prot["status"] == "VERIFIED" and not prot.get("uncovered") else "⚠"
-        lines.append(f"[破线保护] {icon} {prot['status']}(盘中无自动监控,条件单为唯一防线)")
-        lines.append(f"  {prot.get('note')}")
-        if prot.get("uncovered"):
-            lines.append(f"  无 active SELL 单: {', '.join(prot['uncovered'])}")
 
     ts_state = brief.get("time_stop_check") or {}
     tstops = brief.get("time_stops") or []

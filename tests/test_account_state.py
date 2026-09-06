@@ -487,6 +487,57 @@ def test_v2_orders_no_schema_version():
     assert result["status"] == "unverified"
 
 
+def test_structured_v2_include_raw_feeds_conditional_order_coverage():
+    """normalize(include_raw=True) 必须把 orders 提到 coverage 能读的键上。
+
+    MCP 默认 include_raw=False 仍不得暴露明细(NO_DETAIL,未知不解释为已覆盖)。
+    """
+    from ashare_gauntlet.stop_policy import conditional_order_coverage
+
+    sell = {
+        "order_id": "ord-sell",
+        "ts_code": "000001.SZ",
+        "side": "SELL",
+        "condition": {"field": "close", "operator": "<="},
+        "price": 10.5,
+        "shares": 1000,
+        "valid_from": "20260801",
+        "valid_until": "20261231",
+        "status": "active",
+    }
+    raw = _legacy_holdings(
+        as_of="20260818",
+        positions=[{
+            "ts_code": "000001.SZ", "name": "平安银行", "industry": "银行",
+            "shares": 1000, "cost": 12.5, "mv": 12500.0, "bucket": "长线",
+        }],
+        conditional_orders={"schema_version": 2, "orders": [sell]},
+    )
+    hidden = normalize_account_state(raw)
+    assert hidden["conditional_orders"]["status"] == "verified"
+    assert "orders" not in hidden["conditional_orders"]
+    assert "raw" not in hidden["conditional_orders"]
+    hidden_cov = conditional_order_coverage(hidden)
+    assert hidden_cov["status"] == "NO_DETAIL"
+    assert hidden_cov["uncovered"] == ["000001.SZ"]
+    assert hidden_cov["covered"] == []
+
+    shown = normalize_account_state(raw, include_raw_orders=True)
+    assert shown["conditional_orders"]["orders"] == [sell]
+    shown_cov = conditional_order_coverage(shown)
+    assert shown_cov["status"] == "VERIFIED"
+    assert shown_cov["covered"] == ["000001.SZ"]
+    assert shown_cov["uncovered"] == []
+
+    take_profit = {**sell, "condition": {"field": "close", "operator": ">="}}
+    raw_tp = dict(raw, conditional_orders={"schema_version": 2, "orders": [take_profit]})
+    tp_cov = conditional_order_coverage(
+        normalize_account_state(raw_tp, include_raw_orders=True))
+    assert tp_cov["status"] == "VERIFIED"
+    assert tp_cov["covered"] == []
+    assert tp_cov["uncovered"] == ["000001.SZ"]
+
+
 # ── EOD valuation ──
 
 def test_eod_valuation_shares_times_close():

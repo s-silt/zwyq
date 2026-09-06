@@ -648,7 +648,8 @@ def test_healthcheck_separates_operational_from_recommendation_readiness(tmp_pat
     readiness = result["recommendation_readiness"]
     assert readiness["ready"] is False
     assert "ACCOUNT_AS_OF_STALE" in readiness["blockers"]
-    assert "CONDITIONAL_ORDERS_UNVERIFIED" in readiness["blockers"]
+    assert "CONDITIONAL_ORDERS_UNVERIFIED" not in readiness["blockers"]
+    assert "CONDITIONAL_ORDERS_INVALID" not in readiness["blockers"]
 
 
 def test_healthcheck_blocks_review_blocked_c2_snapshot(tmp_path: Path) -> None:
@@ -1073,8 +1074,26 @@ def test_readiness_strict_freshness_blocker(tmp_path: Path) -> None:
     assert any("FUTURE" in b or "NOT_ALIGNED" in b for b in readiness["blockers"])
 
 
-def test_readiness_conditional_orders_invalid_blocker(tmp_path: Path) -> None:
-    """CONDITIONAL_ORDERS_INVALID 新增 blocker。"""
+_INVALID_CONDITIONAL_ORDERS_V2 = {
+    "schema_version": 2,
+    "orders": [{"order_id": "x", "ts_code": "bad", "side": "HOLD",
+                "condition": {}, "price": -1, "shares": 0,
+                "valid_from": "x", "valid_until": "y", "status": "x"}],
+}
+
+
+@pytest.mark.parametrize(
+    ("conditional_orders", "expected_status"),
+    [
+        (None, "missing"),
+        ("待核对", "unverified"),
+        (_INVALID_CONDITIONAL_ORDERS_V2, "invalid"),
+    ],
+)
+def test_readiness_ignores_missing_invalid_legacy_conditional_orders(
+    tmp_path: Path, conditional_orders: object, expected_status: str,
+) -> None:
+    """缺失/invalid/legacy 条件单不影响 recommendation readiness。"""
     for endpoint in ("daily", "adj_factor", "daily_basic", "stk_limit"):
         path = tmp_path / "data/cache" / endpoint / "20260807.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1084,20 +1103,20 @@ def test_readiness_conditional_orders_invalid_blocker(tmp_path: Path) -> None:
         "as_of": "20260807", "data_status": "complete",
         "c2_state": _c2_not_initialized(), "decisions": [],
     })
-    dump(tmp_path / "data/holdings.json", {
-        "as_of": "20260807", "cash": 0, "positions": [],
-        "conditional_orders": {
-            "schema_version": 2,
-            "orders": [{"order_id": "x", "ts_code": "bad", "side": "HOLD",
-                        "condition": {}, "price": -1, "shares": 0,
-                        "valid_from": "x", "valid_until": "y", "status": "x"}],
-        },
-    })
+    holdings: dict = {"as_of": "20260807", "cash": 0, "positions": []}
+    if conditional_orders is not None:
+        holdings["conditional_orders"] = conditional_orders
+    dump(tmp_path / "data/holdings.json", holdings)
     dump(tmp_path / "data/trading_policy.json", {})
     dump(tmp_path / "data/profile.json", {})
     dump(tmp_path / "data/factcheck_overrides.json", {"overrides": []})
     readiness = svc._recommendation_readiness(tmp_path)
-    assert "CONDITIONAL_ORDERS_INVALID" in readiness["blockers"]
+    assert readiness["ready"] is True
+    assert readiness["blockers"] == []
+    assert "CONDITIONAL_ORDERS_INVALID" not in readiness["blockers"]
+    assert "CONDITIONAL_ORDERS_UNVERIFIED" not in readiness["blockers"]
+    assert readiness["components"]["conditional_orders"]["status"] == expected_status
+    assert expected_status != "verified"
 
 
 def test_generate_daily_analysis_supports_new_account_shape(tmp_path: Path, monkeypatch) -> None:

@@ -628,6 +628,9 @@ def _normalize_conditional_orders(
             result = validate_conditional_orders_v2(value)
             if include_raw:
                 result["raw"] = value
+                # conditional_order_coverage 只认 co["orders"];仅在带明细的
+                # 视图提升(MCP 默认视图 include_raw_orders=False 不暴露)
+                result["orders"] = value.get("orders")
             return result
         else:
             sv_str = repr(sv)

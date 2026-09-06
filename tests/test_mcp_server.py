@@ -64,6 +64,7 @@ def test_daily_prompt_uses_readiness_and_bounded_decision_calls() -> None:
     assert "summary_only=true" in prompt
     assert 'states=["BUY","EXIT"]' in prompt
     assert "不能把 WAIT 提升为 BUY" in prompt
+    assert "条件单缺失、未核验或非法不是 blockers" in prompt
 
 
 def test_check_governance_mcp_returns_structured_local_payload(tmp_path, monkeypatch) -> None:

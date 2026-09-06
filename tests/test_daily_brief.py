@@ -528,3 +528,57 @@ def test_stale_snapshot_marks_not_checked(tmp_path: Path) -> None:
           {"as_of": AS_OF, "positions": []})      # 无 data_status
     brief = db.build_brief(root, now=NOW)
     assert brief["time_stop_check"]["status"] == "NOT_CHECKED"
+
+
+_INVALID_CONDITIONAL_ORDERS_V2 = {
+    "schema_version": 2,
+    "orders": [{"order_id": "x", "ts_code": "bad", "side": "HOLD",
+                "condition": {}, "price": -1, "shares": 0,
+                "valid_from": "x", "valid_until": "y", "status": "x"}],
+}
+
+
+@pytest.mark.parametrize("conditional_orders", [
+    None,
+    "待核对",
+    _INVALID_CONDITIONAL_ORDERS_V2,
+])
+def test_brief_has_no_conditional_order_todos(
+    tmp_path: Path, conditional_orders: object,
+) -> None:
+    """缺失/invalid/legacy 条件单不产生催挂/核验待办,也不展示破线保护。"""
+    holdings: dict = {
+        "as_of": AS_OF, "cash": 10000,
+        "positions": [{
+            "ts_code": "600000.SH", "name": "甲", "mv": 9000, "cost": 10.0,
+            "shares": 900, "industry": "电气设备", "bucket": "长线", "stop": 8.6,
+        }],
+    }
+    if conditional_orders is not None:
+        holdings["conditional_orders"] = conditional_orders
+    root = _setup_root(tmp_path, decisions=[_decision("600000.SH", "WAIT", decile=5)],
+                       holdings=holdings)
+    _dump(root / f"data/account_state/{AS_OF}_account_state.json", {
+        "as_of": AS_OF, "data_status": "complete", "valuation": {"status": "complete"},
+        "positions": [{"ts_code": "600000.SH", "name": "甲", "bucket": "长线",
+                       "shares": 900, "cost": 10.0, "stop": 8.6, "close": 10.2,
+                       "pnl_pct": 2.0, "dist_stop_pct": 15.7, "ma20": 10.0,
+                       "held_days": 3, "stop_warn": None, "error": None}],
+    })
+    _dump(root / "data/holdscore/gate_baseline.json",
+          {"frozen_at": "2026-08-18T17:00:00+08:00", "factors": [], "composite": {}})
+
+    brief = db.build_brief(root, now=NOW)
+    text = db.render_text(brief)
+
+    assert "CONDITIONAL_ORDERS_INVALID" not in brief["readiness"]["blockers"]
+    assert "CONDITIONAL_ORDERS_UNVERIFIED" not in brief["readiness"]["blockers"]
+    assert "breach_protection" not in brief
+    assert not any(
+        "条件单" in item or "破线保护" in item or item.startswith("⑪")
+        for item in brief["next_actions"]
+    )
+    assert "[破线保护]" not in text
+    assert "条件单" not in text
+    assert "催挂" not in text
+    assert "核验条件单" not in "".join(brief["next_actions"])

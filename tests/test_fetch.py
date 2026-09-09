@@ -7,11 +7,14 @@ import requests
 from ashare_gauntlet.data.fetch import (
     EmptyCoreTableError,
     EmptyMarketDayError,
+    MARKET_ENDPOINTS,
+    OPTIONAL_MARKET_ENDPOINTS,
     TokenExpiredError,
     call_with_retry,
     fetch_market_day,
     fetch_symbol_history,
     fetch_symbol_table,
+    refresh_market_endpoints,
     trading_days_from_cal,
 )
 
@@ -286,12 +289,33 @@ def test_fetch_market_day_returns_non_empty_full_market(tmp_path):
 
 def test_fetch_market_day_allows_empty_non_guarded_endpoint(tmp_path):
     # 不在 "必非空" 守卫范围内的端点(如 hk_hold 北向持股, 可能合法为空)照常缓存返回, 不抛。
-    pro = _MarketPro({"hk_hold": pd.DataFrame()})
+    # 合法空是"有 schema、0 行";零列是响应不可用,另案 fail-loud。
+    empty = pd.DataFrame(columns=["ts_code", "trade_date"])
+    pro = _MarketPro({"hk_hold": empty})
 
     out = fetch_market_day(pro, "hk_hold", "20260622", tmp_path)
 
     assert out.empty
+    assert list(out.columns) == ["ts_code", "trade_date"]
     assert (tmp_path / "hk_hold" / "20260622.parquet").exists()
+
+
+def test_fetch_market_day_raises_on_zero_column_non_core(tmp_path):
+    from ashare_gauntlet.data.tushare_source import TushareDataUnavailable
+
+    pro = _MarketPro({"hk_hold": pd.DataFrame()})
+
+    with pytest.raises(TushareDataUnavailable, match="零列"):
+        fetch_market_day(pro, "hk_hold", "20260622", tmp_path)
+
+    assert not (tmp_path / "hk_hold" / "20260622.parquet").exists()
+
+
+def test_refresh_market_endpoints_core_first():
+    ordered = refresh_market_endpoints()
+    assert ordered[:len(MARKET_ENDPOINTS)] == MARKET_ENDPOINTS
+    assert ordered[-len(OPTIONAL_MARKET_ENDPOINTS):] == OPTIONAL_MARKET_ENDPOINTS
+    assert "hk_hold" not in ordered[:len(MARKET_ENDPOINTS)]
 
 
 # --- 源 "上游数据源暂时不可用" 是瞬时抖动 -> 应重试, 不能一次就抛 ---

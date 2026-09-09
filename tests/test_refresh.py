@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from ashare_gauntlet.data.fetch import TokenExpiredError
+from ashare_gauntlet.data.fetch import MARKET_ENDPOINTS, TokenExpiredError
 from scripts import refresh
 from scripts.backfill import TradeCalendarUnavailableError
 from scripts.c2_review import _is_month_end
@@ -76,7 +76,7 @@ def test_refresh_persists_full_month_calendar_without_fetching_future_market_day
         if day.weekday() < 5
     ]
     assert market_calls == [
-        (endpoint, day) for day in expected_days for endpoint in refresh.ENDPOINTS
+        (endpoint, day) for endpoint in refresh.ENDPOINTS for day in expected_days
     ]
 
 
@@ -110,7 +110,7 @@ def test_early_month_refresh_preserves_cross_month_market_lookback(
         if day.weekday() < 5
     ]
     assert market_calls == [
-        (endpoint, day) for day in expected_days for endpoint in refresh.ENDPOINTS
+        (endpoint, day) for endpoint in refresh.ENDPOINTS for day in expected_days
     ]
 
     market_calls.clear()
@@ -123,7 +123,7 @@ def test_early_month_refresh_preserves_cross_month_market_lookback(
         if day.weekday() < 5
     ]
     assert market_calls == [
-        (endpoint, day) for day in expected_days for endpoint in refresh.ENDPOINTS
+        (endpoint, day) for endpoint in refresh.ENDPOINTS for day in expected_days
     ]
 
 
@@ -169,3 +169,112 @@ def test_refresh_token_expiry_exits_nonzero(
 
     assert exc.value.code == 1
     assert "token 耗尽" in capsys.readouterr().out
+
+
+def _patch_refresh_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    calendar: pd.DataFrame,
+    fetch_impl,
+) -> list[tuple[str, str]]:
+    pro = _FakePro(calendar)
+    market_calls: list[tuple[str, str]] = []
+
+    def _fetch(_pro, endpoint, day, cache_dir):
+        market_calls.append((endpoint, day))
+        return fetch_impl(endpoint, day)
+
+    monkeypatch.setattr(refresh, "tushare_pro", lambda: pro)
+    monkeypatch.setattr(refresh, "fetch_market_day", _fetch)
+    return market_calls
+
+
+def test_refresh_core_endpoint_failure_is_fail_loud(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fetch_impl(endpoint: str, day: str) -> None:
+        if endpoint == "daily_basic":
+            raise RuntimeError("simulated core failure")
+
+    market_calls = _patch_refresh_fetch(monkeypatch, _january_calendar(), fetch_impl)
+
+    with pytest.raises(SystemExit) as exc:
+        refresh.main(1, str(tmp_path / "data/cache"), today=dt.date(2026, 1, 5))
+
+    assert exc.value.code == 1
+    called_endpoints = [endpoint for endpoint, _day in market_calls]
+    assert "daily_basic" in called_endpoints
+    assert "stk_limit" in called_endpoints
+    assert "hk_hold" in called_endpoints
+    out = capsys.readouterr().out
+    assert "核心失败" in out
+    assert "daily_basic" in out
+    assert "refresh done" not in out
+
+
+def test_refresh_non_core_failure_does_not_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fetch_impl(endpoint: str, day: str) -> None:
+        if endpoint == "hk_hold":
+            raise RuntimeError("simulated hk_hold zero-column")
+
+    market_calls = _patch_refresh_fetch(monkeypatch, _january_calendar(), fetch_impl)
+
+    refresh.main(1, str(tmp_path / "data/cache"), today=dt.date(2026, 1, 5))
+
+    called_endpoints = [endpoint for endpoint, _day in market_calls]
+    for endpoint in MARKET_ENDPOINTS:
+        assert endpoint in called_endpoints
+    assert "hk_hold" in called_endpoints
+    assert "moneyflow_hsgt" in called_endpoints
+    out = capsys.readouterr().out
+    assert "非核心失败" in out
+    assert "hk_hold" in out
+    assert "refresh done" not in out
+    assert "核心完成" in out
+
+
+def test_refresh_core_endpoints_run_before_optional(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    market_calls = _patch_refresh_fetch(
+        monkeypatch, _january_calendar(), lambda endpoint, day: None,
+    )
+
+    refresh.main(10, str(tmp_path / "data/cache"), today=dt.date(2026, 1, 16))
+
+    core = set(MARKET_ENDPOINTS)
+    optional = [endpoint for endpoint in refresh.ENDPOINTS if endpoint not in core]
+    last_core = max(i for i, (endpoint, _day) in enumerate(market_calls) if endpoint in core)
+    first_optional = min(
+        i for i, (endpoint, _day) in enumerate(market_calls) if endpoint in set(optional)
+    )
+    assert last_core < first_optional
+    unique_order = list(dict.fromkeys(endpoint for endpoint, _day in market_calls))
+    assert unique_order[:len(MARKET_ENDPOINTS)] == list(MARKET_ENDPOINTS)
+    assert refresh.ENDPOINTS[:len(MARKET_ENDPOINTS)] == MARKET_ENDPOINTS
+
+
+def test_refresh_all_endpoints_fail_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fetch_impl(endpoint: str, day: str) -> None:
+        raise RuntimeError(f"simulated {endpoint} failure")
+
+    market_calls = _patch_refresh_fetch(monkeypatch, _january_calendar(), fetch_impl)
+
+    with pytest.raises(SystemExit) as exc:
+        refresh.main(1, str(tmp_path / "data/cache"), today=dt.date(2026, 1, 5))
+
+    assert exc.value.code == 1
+    assert {endpoint for endpoint, _day in market_calls} == set(refresh.ENDPOINTS)
+    out = capsys.readouterr().out
+    assert "全部端点失败" in out
+    assert "refresh done" not in out

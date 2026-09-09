@@ -68,16 +68,55 @@ class EmptyMarketDayError(RuntimeError):
     hand. Raise loudly and refuse to cache, so the next run simply retries.
     """
 
-# Endpoints pulled per trade date. "daily_basic" / "stk_limit" carry the
-# turnover and price-limit fields used by the tradability filters.
+# Four core EOD endpoints pulled per trade date. "daily_basic" / "stk_limit"
+# carry the turnover and price-limit fields used by the tradability filters.
+# Any miss or failure here must fail-loud — never a silent partial cache.
 MARKET_ENDPOINTS: tuple[str, ...] = ("daily", "adj_factor", "daily_basic", "stk_limit")
+
+# Nightly refresh extras (北向持股 / 北向成交额). Not part of the four core EOD
+# endpoints: a zero-column or other failure must be reported, but must not
+# abort daily/adj_factor/daily_basic/stk_limit or the remaining extras.
+OPTIONAL_MARKET_ENDPOINTS: tuple[str, ...] = ("hk_hold", "moneyflow_hsgt")
 
 # Full-market endpoints whose *emptiness* on an open trading day is never real
 # (the whole market is ~5000 rows) -> raise instead of caching the empty pull.
-# "hk_hold" (北向持股) is intentionally excluded: it can legitimately be empty.
-NONEMPTY_MARKET_ENDPOINTS: frozenset[str] = frozenset(
-    {"daily", "adj_factor", "daily_basic", "stk_limit"}
-)
+# "hk_hold" (北向持股) is intentionally excluded: a *schema-bearing* empty
+# frame can be a real "no holdings" day. Zero-column replies are still
+# unavailable (see ``_reject_zero_column_frame``).
+NONEMPTY_MARKET_ENDPOINTS: frozenset[str] = frozenset(MARKET_ENDPOINTS)
+
+
+def refresh_market_endpoints(
+    extra: Sequence[str] = OPTIONAL_MARKET_ENDPOINTS,
+) -> tuple[str, ...]:
+    """Core EOD endpoints first, then optional extras (no duplicates)."""
+    extra_tail = tuple(ep for ep in extra if ep not in MARKET_ENDPOINTS)
+    return MARKET_ENDPOINTS + extra_tail
+
+
+def _reject_zero_column_frame(
+    df: pd.DataFrame,
+    endpoint: str,
+    trade_date: str,
+    *,
+    cached: bool = False,
+) -> None:
+    """Zero-column replies are unavailable data, never 'today has no rows'.
+
+    Core endpoints already fail via ``EmptyMarketDayError`` (0 rows). Optional
+    endpoints may be legitimately empty *with* a schema; a 0-column frame is
+    the SDK/mirror 'swallowed HTTP / no schema' case and must not be cached.
+    """
+    if len(df.columns) != 0:
+        return
+    if endpoint in NONEMPTY_MARKET_ENDPOINTS:
+        return
+    from .tushare_source import TushareDataUnavailable
+    prefix = "cached " if cached else ""
+    raise TushareDataUnavailable(
+        f"{prefix}market endpoint {endpoint!r} trade_date={trade_date!r} 为零列 DataFrame"
+        "——响应不可用,拒绝当作今日无数据"
+    )
 
 # Per-symbol full-history tables whose *emptiness* is meaningful vs. fatal:
 #   - core financial statements: 0 rows is never a real value -> raise loudly.
@@ -170,6 +209,7 @@ def fetch_market_day(
     def _pull() -> pd.DataFrame:
         method = getattr(pro, endpoint)
         df = method(trade_date=trade_date, fields=fields) if fields else method(trade_date=trade_date)
+        _reject_zero_column_frame(df, endpoint, trade_date)
         # 镜像怪癖(实测 20160630):个别日期不带 fields 会返回退化 schema(只有 pe/pb/dv_ttm,
         # 缺 total_mv/pe_ttm)。必需列缺失 → 显式 fields 重试一次(实测显式请求可拿全),
         # 仍缺才 raise——退化 schema 落盘会让下游 KeyError 或静默用错列。
@@ -192,6 +232,7 @@ def fetch_market_day(
         return df
 
     df = read_or_fetch(path, lambda: call_with_retry(_pull))
+    _reject_zero_column_frame(df, endpoint, trade_date, cached=True)
     # Also guard the cache-hit path: a legacy empty parquet (written before this
     # guard, or by an earlier pre-publish pull) is just as poisonous — surface it
     # so the date refetches once the stale file is gone, instead of serving 0 rows.
